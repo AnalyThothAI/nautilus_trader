@@ -1905,6 +1905,317 @@ fn test_liquidity_consumption_shares_trade_size_across_limits(
     );
 }
 
+/// A clean Cache alone is not a matching-engine checkpoint: unchanged displayed size still
+/// carries consumption in the original engine, including across a fresh quote timestamp.
+#[rstest]
+#[case::continuous(false, false, 0)]
+#[case::new_client_with_same_cache(true, false, 1)]
+#[case::restored_liquidity(true, true, 0)]
+fn test_consumed_liquidity_survives_an_explicit_restore(
+    #[case] restart: bool,
+    #[case] restore: bool,
+    #[case] expected_second_fills: usize,
+    #[values(BookType::L1_MBP, BookType::L2_MBP)] book_type: BookType,
+    trader_id: TraderId,
+    account_id: AccountId,
+    instrument: InstrumentAny,
+) {
+    use nautilus_model::{
+        data::{BookOrder, OrderBookDelta, OrderBookDeltas},
+        enums::{BookAction, RecordFlag},
+    };
+
+    setup_order_event_handler();
+    let venue = instrument.id().venue;
+    let mut context = create_test_context_with(trader_id, account_id, venue, |config| {
+        config.liquidity_consumption = true;
+        config.book_type = book_type;
+        config.queue_position = true;
+    });
+    context
+        .cache
+        .borrow_mut()
+        .add_instrument(instrument.clone())
+        .unwrap();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ExecutionEvent>();
+    nautilus_common::live::runner::replace_exec_event_sender(tx);
+    context.client.start().unwrap();
+
+    for phase in 1..=3u64 {
+        context
+            .test_clock
+            .borrow_mut()
+            .set_time(UnixNanos::from(phase));
+        if phase == 2 && restart {
+            let state = serde_json::to_vec(&context.client.matching_state()).unwrap();
+            context.client.stop().unwrap();
+            let mut config = create_config(trader_id, account_id, venue);
+            config.liquidity_consumption = true;
+            config.book_type = book_type;
+            config.queue_position = true;
+            let core = ExecutionClientCore::new(
+                trader_id,
+                ClientId::new("SANDBOX"),
+                config.venue,
+                config.oms_type,
+                config.account_id,
+                config.account_type,
+                config.base_currency,
+                context.cache.clone(),
+            );
+            context.client = SandboxExecutionClient::new(
+                core,
+                config,
+                context.test_clock.clone(),
+                context.cache.clone(),
+            )
+            .unwrap();
+            if restore {
+                let mut invalid: serde_json::Value = serde_json::from_slice(&state).unwrap();
+                invalid["engines"][0]["asks"][0]["consumed"] = serde_json::json!("2.000");
+                assert!(
+                    context
+                        .client
+                        .restore_matching_state(serde_json::from_value(invalid).unwrap())
+                        .is_err()
+                );
+                context
+                    .client
+                    .restore_matching_state(serde_json::from_slice(&state).unwrap())
+                    .unwrap();
+            }
+            context.client.start().unwrap();
+        }
+        let ask_size = Quantity::from(if phase == 3 { "2.000" } else { "1.000" });
+
+        if book_type == BookType::L1_MBP {
+            context
+                .client
+                .process_quote_tick(&QuoteTick::new(
+                    instrument.id(),
+                    Price::from("1000.00"),
+                    Price::from("1001.00"),
+                    Quantity::from("1.000"),
+                    ask_size,
+                    UnixNanos::from(phase),
+                    UnixNanos::from(phase),
+                ))
+                .unwrap();
+        } else {
+            context
+                .client
+                .process_order_book_deltas(&OrderBookDeltas::new(
+                    instrument.id(),
+                    vec![
+                        OrderBookDelta::clear(instrument.id(), phase, phase.into(), phase.into()),
+                        OrderBookDelta::new(
+                            instrument.id(),
+                            BookAction::Add,
+                            BookOrder::new(
+                                OrderSide::Buy,
+                                Price::from("1000.00"),
+                                Quantity::from("1.000"),
+                                0,
+                            ),
+                            RecordFlag::F_SNAPSHOT as u8,
+                            phase,
+                            phase.into(),
+                            phase.into(),
+                        ),
+                        OrderBookDelta::new(
+                            instrument.id(),
+                            BookAction::Add,
+                            BookOrder::new(OrderSide::Sell, Price::from("1001.00"), ask_size, 0),
+                            RecordFlag::F_SNAPSHOT as u8 | RecordFlag::F_LAST as u8,
+                            phase,
+                            phase.into(),
+                            phase.into(),
+                        ),
+                    ],
+                ))
+                .unwrap();
+        }
+        let order = OrderTestBuilder::new(OrderType::Limit)
+            .trader_id(trader_id)
+            .instrument_id(instrument.id())
+            .client_order_id(ClientOrderId::new(format!("CONSUMED-{phase}")))
+            .side(OrderSide::Buy)
+            .price(Price::from("1001.00"))
+            .quantity(Quantity::from("1.000"))
+            .time_in_force(TimeInForce::Ioc)
+            .submit(true)
+            .build();
+        context
+            .cache
+            .borrow_mut()
+            .add_order(order.clone(), None, Some(context.client.client_id()), false)
+            .unwrap();
+        context
+            .client
+            .submit_order(SubmitOrder::from_order(
+                &order,
+                trader_id,
+                Some(context.client.client_id()),
+                None,
+                UUID4::new(),
+                UnixNanos::from(phase),
+            ))
+            .unwrap();
+        let events = apply_order_events_from_channel(&context.cache, &mut rx);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, OrderEventAny::Filled(_)))
+                .count(),
+            if phase == 2 { expected_second_fills } else { 1 },
+        );
+
+        if phase == 3 {
+            let fill = events
+                .iter()
+                .find_map(|event| match event {
+                    OrderEventAny::Filled(fill) => Some(fill),
+                    _ => None,
+                })
+                .unwrap();
+            assert!(
+                fill.trade_id.as_str().ends_with("-002"),
+                "restoration must retain the fill counter: {}",
+                fill.trade_id
+            );
+        }
+        assert!(
+            context
+                .cache
+                .borrow()
+                .order(&order.client_order_id())
+                .unwrap()
+                .is_closed()
+        );
+    }
+    context.client.stop().unwrap();
+}
+
+/// Status actions are transitions, not assignments: after Halt, Pause is ignored. A checkpoint
+/// must preserve the resulting Closed state, rather than replaying only the last raw action.
+#[rstest]
+#[case::continuous(false, false, true)]
+#[case::new_client_with_same_cache(true, false, false)]
+#[case::restored_market_status(true, true, true)]
+fn test_matching_restore_preserves_market_status(
+    #[case] restart: bool,
+    #[case] restore: bool,
+    #[case] rejected: bool,
+    trader_id: TraderId,
+    account_id: AccountId,
+    instrument: InstrumentAny,
+) {
+    setup_order_event_handler();
+    let venue = instrument.id().venue;
+    let mut context = create_test_context(trader_id, account_id, venue);
+    context
+        .cache
+        .borrow_mut()
+        .add_instrument(instrument.clone())
+        .unwrap();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ExecutionEvent>();
+    nautilus_common::live::runner::replace_exec_event_sender(tx);
+    context.client.start().unwrap();
+
+    for action in [MarketStatusAction::Halt, MarketStatusAction::Pause] {
+        let status = InstrumentStatus::new(
+            instrument.id(),
+            action,
+            1.into(),
+            1.into(),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        msgbus::publish_any(
+            nautilus_common::msgbus::switchboard::get_instrument_status_topic(instrument.id()),
+            &status,
+        );
+    }
+
+    if restart {
+        let state = serde_json::to_vec(&context.client.matching_state()).unwrap();
+        context.client.stop().unwrap();
+        let config = create_config(trader_id, account_id, venue);
+        let core = ExecutionClientCore::new(
+            trader_id,
+            ClientId::new("SANDBOX"),
+            config.venue,
+            config.oms_type,
+            config.account_id,
+            config.account_type,
+            config.base_currency,
+            context.cache.clone(),
+        );
+        context.client = SandboxExecutionClient::new(
+            core,
+            config,
+            context.test_clock.clone(),
+            context.cache.clone(),
+        )
+        .unwrap();
+
+        if restore {
+            context
+                .client
+                .restore_matching_state(serde_json::from_slice(&state).unwrap())
+                .unwrap();
+        }
+        context.client.start().unwrap();
+    }
+    context
+        .client
+        .process_quote_tick(&create_quote_tick(instrument.id(), 1000.0, 1001.0))
+        .unwrap();
+    let order = OrderTestBuilder::new(OrderType::Limit)
+        .trader_id(trader_id)
+        .instrument_id(instrument.id())
+        .client_order_id(ClientOrderId::new("STATUS-RESTORED"))
+        .side(OrderSide::Buy)
+        .price(Price::from("1001.00"))
+        .quantity(Quantity::from("1.000"))
+        .time_in_force(TimeInForce::Ioc)
+        .submit(true)
+        .build();
+    context
+        .cache
+        .borrow_mut()
+        .add_order(order.clone(), None, Some(context.client.client_id()), false)
+        .unwrap();
+    context
+        .client
+        .submit_order(SubmitOrder::from_order(
+            &order,
+            trader_id,
+            Some(context.client.client_id()),
+            None,
+            UUID4::new(),
+            2.into(),
+        ))
+        .unwrap();
+    let events = apply_order_events_from_channel(&context.cache, &mut rx);
+    assert_eq!(
+        events
+            .iter()
+            .any(|event| matches!(event, OrderEventAny::Rejected(_))),
+        rejected
+    );
+    assert_eq!(
+        events
+            .iter()
+            .any(|event| matches!(event, OrderEventAny::Filled(_))),
+        !rejected
+    );
+    context.client.stop().unwrap();
+}
+
 #[rstest]
 fn test_fill_model_can_block_limit_touch_fills(
     trader_id: TraderId,
@@ -2120,6 +2431,92 @@ fn test_seeded_fill_model_is_shared_across_instruments(
     assert_eq!(test_context.client.matching_engine_count(), 2);
     assert_eq!(observed, expected_shared);
     assert_ne!(observed, expected_independent);
+}
+
+#[rstest]
+fn test_runtime_fill_model_preserves_state_across_clients(
+    trader_id: TraderId,
+    account_id: AccountId,
+    instrument: InstrumentAny,
+) {
+    setup_order_event_handler();
+
+    let seed = (0u64..64)
+        .find(|&seed| first_two_shared_limit_fills(seed) == [false, true])
+        .expect("a seed in 0..64 must distinguish a resumed model from a reset model");
+    let mut reference = DefaultFillModel::new(0.5, 0.0, Some(seed)).unwrap();
+    assert!(!reference.is_limit_filled().unwrap());
+    let expected = [
+        reference.is_limit_filled().unwrap(),
+        reference.is_limit_filled().unwrap(),
+    ];
+    let mut model = FillModelHandle::new(DefaultFillModel::new(0.5, 0.0, Some(seed)).unwrap());
+    assert!(!model.is_limit_filled().unwrap());
+
+    for (index, expected_filled) in expected.into_iter().enumerate() {
+        let cache = Rc::new(RefCell::new(Cache::default()));
+        let test_clock = Rc::new(RefCell::new(VirtualClock::new()));
+        let mut config = create_config(trader_id, account_id, instrument.id().venue);
+        config.trade_execution = true;
+        config.fee_model = None;
+        config.fill_model = Some(FillModelAny::Default(
+            DefaultFillModel::new(0.0, 0.0, Some(seed)).unwrap(),
+        ));
+
+        let core = ExecutionClientCore::new(
+            trader_id,
+            ClientId::new("SANDBOX"),
+            config.venue,
+            config.oms_type,
+            config.account_id,
+            config.account_type,
+            config.base_currency,
+            cache.clone(),
+        );
+        let client = SandboxExecutionClient::new_with_models(
+            core,
+            config,
+            test_clock.clone(),
+            cache.clone(),
+            model.clone(),
+            FeeModelHandle::new(MakerTakerFeeModel::zero()),
+        )
+        .unwrap();
+        let mut context = TestContext {
+            client,
+            cache,
+            test_clock,
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ExecutionEvent>();
+        nautilus_common::live::runner::replace_exec_event_sender(tx);
+        context.client.start().unwrap();
+        let order_id = format!("RUNTIME-FILL-{index}");
+
+        let filled = process_limit_touch_fill(
+            &context,
+            trader_id,
+            &instrument,
+            &order_id,
+            &format!("T-RUNTIME-{index}"),
+            &mut rx,
+        );
+
+        assert_eq!(filled, expected_filled, "client {index}");
+        assert_eq!(
+            context
+                .cache
+                .borrow()
+                .order(&ClientOrderId::from(order_id.as_str()))
+                .unwrap()
+                .status(),
+            if expected_filled {
+                OrderStatus::Filled
+            } else {
+                OrderStatus::Accepted
+            },
+        );
+        context.client.stop().unwrap();
+    }
 }
 
 #[rstest]
@@ -8259,10 +8656,11 @@ fn test_cancel_all_after_first_duplicate_submit_receipt(
 }
 
 #[rstest]
-#[case::configured(false)]
-#[case::runtime(true)]
+#[case::configured("configured")]
+#[case::runtime_fee("runtime_fee")]
+#[case::runtime_models("runtime_models")]
 fn test_constructor_rejects_duplicate_balances(
-    #[case] runtime: bool,
+    #[case] constructor: &str,
     trader_id: TraderId,
     account_id: AccountId,
     venue: Venue,
@@ -8283,13 +8681,30 @@ fn test_constructor_rejects_duplicate_balances(
         cache.clone(),
     );
 
-    let result = if runtime {
-        config.fee_model = None;
-        let model = MakerTakerFeeModel::zero();
-        let fee_model = FeeModelHandle::new(model);
-        SandboxExecutionClient::new_with_fee_model(core, config, clock, cache, fee_model)
-    } else {
-        SandboxExecutionClient::new(core, config, clock, cache)
+    let result = match constructor {
+        "configured" => SandboxExecutionClient::new(core, config, clock, cache),
+        "runtime_fee" => {
+            config.fee_model = None;
+            SandboxExecutionClient::new_with_fee_model(
+                core,
+                config,
+                clock,
+                cache,
+                FeeModelHandle::new(MakerTakerFeeModel::zero()),
+            )
+        }
+        "runtime_models" => {
+            config.fee_model = None;
+            SandboxExecutionClient::new_with_models(
+                core,
+                config,
+                clock,
+                cache,
+                FillModelHandle::default(),
+                FeeModelHandle::new(MakerTakerFeeModel::zero()),
+            )
+        }
+        other => panic!("unknown constructor {other}"),
     };
 
     let error = result.unwrap_err();

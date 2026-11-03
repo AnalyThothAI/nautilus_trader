@@ -44,7 +44,7 @@ use nautilus_core::{DurationNanos, Params, UUID4, UnixNanos, WeakCell};
 use nautilus_execution::{
     client::core::ExecutionClientCore,
     matching_engine::{
-        OrderMatchingEngine,
+        MatchingState, OrderMatchingEngine,
         inflight::InflightOrders,
         orders::{MatchingOrders, OtoCommand},
     },
@@ -65,12 +65,29 @@ use nautilus_model::{
     reports::{ExecutionMassStatus, FillReport, OrderStatusReport, PositionStatusReport},
     types::{AccountBalance, MarginBalance, Money},
 };
+use serde::{Deserialize, Serialize};
 use ustr::Ustr;
 
 use crate::config::SandboxExecutionClientConfig;
 
 // Bounds retained state for quote-only instruments that expire without event-driven cleanup
 const EXPIRED_ENGINE_SWEEP_INTERVAL: DurationNanos = DurationNanos::from_mins(1);
+
+/// Matching state retained between clean sandbox runs. Account and order history belongs to
+/// Cache; callers retain fill model state separately and supply fresh market data before orders.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SandboxState {
+    next_engine_raw_id: u32,
+    engines: Vec<MatchingState>,
+}
+
+impl SandboxState {
+    /// Returns the instruments whose native specifications must be available before restoration.
+    pub fn instrument_ids(&self) -> impl Iterator<Item = InstrumentId> + '_ {
+        self.engines.iter().map(MatchingState::instrument_id)
+    }
+}
 
 /// A sandbox execution client for paper trading against live market data.
 ///
@@ -161,18 +178,38 @@ impl SandboxExecutionClient {
         cache: Rc<RefCell<Cache>>,
         fee_model: FeeModelHandle,
     ) -> anyhow::Result<Self> {
+        let fill_model = config
+            .fill_model
+            .clone()
+            .map(FillModelHandle::from)
+            .unwrap_or_default();
+
+        Self::new_with_models(core, config, clock, cache, fill_model, fee_model)
+    }
+
+    /// Creates a sandbox execution client with runtime fill and fee models.
+    ///
+    /// The supplied handles take precedence over the configured models and are
+    /// shared across all matching engines for this client. Their current state
+    /// is retained; callers control whether handles are shared across clients.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if starting balances repeat a currency.
+    pub fn new_with_models(
+        core: ExecutionClientCore,
+        config: SandboxExecutionClientConfig,
+        clock: Rc<RefCell<dyn Clock>>,
+        cache: Rc<RefCell<Cache>>,
+        fill_model: FillModelHandle,
+        fee_model: FeeModelHandle,
+    ) -> anyhow::Result<Self> {
         config.validate()?;
 
         let mut balances = AHashMap::new();
         for money in &config.starting_balances {
             balances.insert(money.currency.code.to_string(), *money);
         }
-
-        let fill_model = config
-            .fill_model
-            .clone()
-            .map(FillModelHandle::from)
-            .unwrap_or_default();
 
         let inner = Rc::new_cyclic(|weak: &std::rc::Weak<RefCell<SandboxInner>>| {
             RefCell::new(SandboxInner {
@@ -223,6 +260,71 @@ impl SandboxExecutionClient {
     #[must_use]
     pub fn matching_engine_count(&self) -> usize {
         self.inner.borrow().matching_engines.len()
+    }
+
+    /// Returns market status, identifier counters and consumed liquidity for each matching engine.
+    ///
+    /// This is one part of simulation recovery, not a complete checkpoint. It excludes account
+    /// and order state, pending commands, and fill model state.
+    #[must_use]
+    pub fn matching_state(&self) -> SandboxState {
+        let inner = self.inner.borrow();
+        let mut engines: Vec<_> = inner
+            .matching_engines
+            .values()
+            .map(OrderMatchingEngine::matching_state)
+            .collect();
+        engines.sort_by_key(MatchingState::instrument_id);
+        SandboxState {
+            next_engine_raw_id: inner.next_engine_raw_id,
+            engines,
+        }
+    }
+
+    /// Restores matching state before the client starts or receives market data.
+    ///
+    /// Instruments must already be in Cache. Fresh market data supplies the new books; unchanged
+    /// displayed sizes retain their consumption under the matching engine's ordinary rule.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the client has started, queued commands or matching engines, an
+    /// instrument is missing, a state names another venue or duplicate instrument, or its engine
+    /// rejects it. A rejected restoration leaves the client's matching state unchanged.
+    pub fn restore_matching_state(&mut self, state: SandboxState) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !self.core.borrow().is_started(),
+            "restore matching state before client start"
+        );
+        let mut inner = self.inner.borrow_mut();
+        anyhow::ensure!(
+            inner.inbound_queue.is_empty() && inner.matching_engines.is_empty(),
+            "restore matching state only into a new client"
+        );
+        let mut engines = AHashMap::new();
+        for state in state.engines {
+            let id = state.instrument_id();
+            anyhow::ensure!(
+                id.venue == self.config.venue,
+                "matching state venue mismatch"
+            );
+            anyhow::ensure!(
+                !engines.contains_key(&id),
+                "duplicate matching instrument {id}"
+            );
+            let instrument = self
+                .cache
+                .borrow()
+                .instrument(&id)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("missing matching state instrument {id}"))?;
+            let mut engine = inner.create_matching_engine(&instrument, state.raw_id());
+            engine.restore_matching_state(state)?;
+            engines.insert(id, engine);
+        }
+        inner.matching_engines = engines;
+        inner.next_engine_raw_id = state.next_engine_raw_id;
+        Ok(())
     }
 
     fn dispatch_order_event(&self, event: OrderEventAny) {
@@ -1015,35 +1117,38 @@ impl SandboxInner {
 
     fn ensure_matching_engine(&mut self, instrument: &InstrumentAny) {
         let instrument_id = instrument.id();
-
         if !self.matching_engines.contains_key(&instrument_id) {
-            let engine_config = self.config.to_matching_engine_config();
-            let fill_model = self.fill_model.clone();
-            let fee_model = self.fee_model.clone();
             let raw_id = self.next_engine_raw_id;
             self.next_engine_raw_id = self.next_engine_raw_id.wrapping_add(1);
-
-            let mut engine = OrderMatchingEngine::new(
-                instrument.clone(),
-                raw_id,
-                fill_model,
-                fee_model,
-                self.config.book_type,
-                self.config.oms_type,
-                self.config.account_type,
-                self.clock.clone(),
-                self.cache.clone(),
-                engine_config,
-            );
-
-            if let Some(handler) = &self.event_handler {
-                engine.set_event_handler(handler.clone());
-            }
-
-            engine.set_inflight_orders(self.inflight_orders.clone());
-            engine.set_matching_orders(self.matching_orders.clone());
+            let engine = self.create_matching_engine(instrument, raw_id);
             self.matching_engines.insert(instrument_id, engine);
         }
+    }
+
+    fn create_matching_engine(
+        &self,
+        instrument: &InstrumentAny,
+        raw_id: u32,
+    ) -> OrderMatchingEngine {
+        let mut engine = OrderMatchingEngine::new(
+            instrument.clone(),
+            raw_id,
+            self.fill_model.clone(),
+            self.fee_model.clone(),
+            self.config.book_type,
+            self.config.oms_type,
+            self.config.account_type,
+            self.clock.clone(),
+            self.cache.clone(),
+            self.config.to_matching_engine_config(),
+        );
+
+        if let Some(handler) = &self.event_handler {
+            engine.set_event_handler(handler.clone());
+        }
+        engine.set_inflight_orders(self.inflight_orders.clone());
+        engine.set_matching_orders(self.matching_orders.clone());
+        engine
     }
 
     fn process_quote_tick(&mut self, quote: &QuoteTick) {

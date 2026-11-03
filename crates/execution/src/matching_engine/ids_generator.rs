@@ -24,6 +24,16 @@ use nautilus_model::{
     identifiers::{PositionId, TradeId, Venue, VenueOrderId},
     orders::{Order, OrderAny},
 };
+use serde::{Deserialize, Serialize};
+
+/// Counters retained when a clean simulation continues in a new matching engine.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct IdsState {
+    positions: usize,
+    orders: usize,
+    executions: usize,
+}
 
 // FNV-1a 64-bit constants (see http://www.isthe.com/chongo/tech/comp/fnv/).
 const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
@@ -54,6 +64,21 @@ impl Debug for IdsGenerator {
 }
 
 impl IdsGenerator {
+    pub(super) fn state(&self) -> IdsState {
+        IdsState {
+            positions: self.position_count,
+            orders: self.order_count,
+            executions: self.execution_count,
+        }
+    }
+
+    pub(super) fn restore_state(&mut self, raw_id: u32, state: IdsState) {
+        self.raw_id = raw_id;
+        self.position_count = state.positions;
+        self.order_count = state.orders;
+        self.execution_count = state.executions;
+    }
+
     /// Creates a new identifier generator.
     pub const fn new(
         venue: Venue,

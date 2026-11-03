@@ -21,6 +21,9 @@ pub mod inflight;
 pub mod orders;
 
 mod settlement;
+mod state;
+
+pub use state::MatchingState;
 
 #[cfg(test)]
 mod tests;
