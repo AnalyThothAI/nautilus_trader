@@ -87,8 +87,8 @@ use nautilus_model::{
         PositionSide, TimeInForce, TriggerType,
     },
     events::{
-        AccountState, OrderAccepted, OrderEventAny, OrderFilled, OrderInitialized, OrderSubmitted,
-        OrderUpdated,
+        AccountState, OrderAccepted, OrderEventAny, OrderEventType, OrderFilled, OrderInitialized,
+        OrderSubmitted, OrderUpdated,
     },
     identifiers::{
         AccountId, ClientOrderId, InstrumentId, OrderListId, StrategyId, Symbol, TradeId, TraderId,
@@ -97,7 +97,7 @@ use nautilus_model::{
     instruments::{CryptoPerpetual, InstrumentAny},
     orders::{LimitOrder, MarketOrder, Order, OrderAny, OrderList, StopMarketOrder},
     reports::{FillReport, OrderStatusReport},
-    types::{AccountBalance, Currency, Money, Price, Quantity},
+    types::{AccountBalance, Currency, MarginBalance, Money, Price, Quantity},
 };
 use nautilus_network::{
     http::{HttpClient, Method},
@@ -155,6 +155,7 @@ struct TestServerState {
     /// Fail `userFills` info calls with a non-retryable error (400) while positive,
     /// decrementing once per call.
     fail_user_fills_count: Arc<AtomicUsize>,
+    fail_historical_orders_count: Arc<AtomicUsize>,
     /// Optional override for `userFills` info responses; defaults to `[]`.
     user_fills_response: Arc<tokio::sync::Mutex<Option<Value>>>,
     /// Optional override for `historicalOrders` info responses; defaults to `[]`.
@@ -208,6 +209,7 @@ impl Default for TestServerState {
             perp_clearinghouse_dex_responses: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             last_clearinghouse_user: Arc::new(tokio::sync::Mutex::new(None)),
             fail_user_fills_count: Arc::new(AtomicUsize::new(0)),
+            fail_historical_orders_count: Arc::new(AtomicUsize::new(0)),
             user_fills_response: Arc::new(tokio::sync::Mutex::new(None)),
             historical_orders_response: Arc::new(tokio::sync::Mutex::new(None)),
             all_perp_metas_response: Arc::new(tokio::sync::Mutex::new(None)),
@@ -454,6 +456,18 @@ async fn handle_info(State(state): State<TestServerState>, body: axum::body::Byt
         }
         "userFills" => handle_info_user_fills(&state).await,
         "historicalOrders" => {
+            if state
+                .fail_historical_orders_count
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
+                .is_ok()
+            {
+                return (
+                    axum::http::StatusCode::BAD_REQUEST,
+                    Json(json!({"error": "historical orders rejected"})),
+                )
+                    .into_response();
+            }
+
             if let Some(body) = state.historical_orders_response.lock().await.clone() {
                 Json(body).into_response()
             } else {
@@ -955,13 +969,20 @@ async fn send_ws_subscription_response(
         return true;
     }
 
-    let response = json!({
-        "channel": "subscriptionResponse",
-        "data": {
-            "method": "subscribe",
-            "subscription": payload["subscription"],
-        },
-    });
+    let response = if payload["subscription"]["type"] == "spotState" {
+        let mut response =
+            load_json("ws_account_states.json")["spot_subscription_response"].clone();
+        response["data"]["subscription"]["user"] = payload["subscription"]["user"].clone();
+        response
+    } else {
+        json!({
+            "channel": "subscriptionResponse",
+            "data": {
+                "method": "subscribe",
+                "subscription": payload["subscription"],
+            },
+        })
+    };
 
     if socket
         .send(Message::Text(response.to_string().into()))
@@ -2478,6 +2499,54 @@ async fn test_execution_info_retry_configuration(
     assert_eq!(attempts, expected_attempts);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_exec_client_fetches_instruments_once_across_reconnect() {
+    let state = TestServerState::default();
+    let addr = start_mock_server(state.clone()).await;
+    let (mut client, mut rx, cache) = create_test_execution_client(addr);
+    add_test_account_to_cache(&cache, AccountId::from("HYPERLIQUID-001"));
+
+    client.start().unwrap();
+    client.connect().await.unwrap();
+    client.disconnect().await.unwrap();
+    *state.frame_after_user_events_ack.lock().await = Some(json!({
+        "channel": "user",
+        "data": {"fills": [user_fill("BTC", 101)]},
+    }));
+    client.connect().await.unwrap();
+
+    let fill = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let ExecutionEvent::Report(ExecutionReport::Fill(fill)) = rx.recv().await.unwrap() {
+                break fill;
+            }
+        }
+    })
+    .await
+    .expect("reconnected WebSocket must resolve fills from its retained instruments");
+
+    client.disconnect().await.unwrap();
+    let requests = state.info_requests.lock().await;
+
+    assert_eq!(
+        fill.instrument_id,
+        InstrumentId::from(HYPERLIQUID_TEST_INSTRUMENT)
+    );
+    assert_eq!(fill.venue_order_id, VenueOrderId::from("101"));
+    assert_eq!(fill.last_px, Price::from("100.0"));
+    assert_eq!(fill.last_px.precision, 1);
+    assert_eq!(fill.last_qty, Quantity::from("0.10000"));
+    assert_eq!(fill.last_qty.precision, 5);
+
+    for kind in ["allPerpMetas", "spotMeta", "outcomeMeta"] {
+        assert_eq!(
+            requests.iter().filter(|r| r["type"] == kind).count(),
+            1,
+            "{kind}"
+        );
+    }
+}
+
 #[rstest]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_exec_client_connect_disconnect() {
@@ -2933,13 +3002,25 @@ async fn test_reconnect_reads_history_after_subscription_wait_times_out() {
 }
 
 #[rstest]
+#[case::follow_up(1, false)]
+#[case::later_reconnect(2, false)]
+#[case::historical_orders(2, true)]
 #[tokio::test(flavor = "multi_thread")]
-async fn test_reconnect_recovers_after_failed_history_read() {
-    // A failed history read leaves the stream running, so the next reconnect
-    // recovers the fill the first attempt could not read.
+async fn test_reconnect_recovers_after_failed_history_read(
+    #[case] failed_reads: usize,
+    #[case] fail_orders: bool,
+) {
     let state = TestServerState::default();
     let user_fills = state.user_fills_response.clone();
-    let fail_user_fills_count = state.fail_user_fills_count.clone();
+    let historical_orders = state.historical_orders_response.clone();
+    let failures = if fail_orders {
+        state.fail_historical_orders_count.clone()
+    } else {
+        state.fail_user_fills_count.clone()
+    };
+
+    let stream_frames = state.stream_frames.clone();
+    let frame_after_user_events_ack = state.frame_after_user_events_ack.clone();
     let addr = start_mock_server(state).await;
     let registry = SocketReconnectRegistry::default();
     let (mut client, mut rx, cache) = registry.scope(|| create_test_execution_client(addr));
@@ -2948,27 +3029,272 @@ async fn test_reconnect_recovers_after_failed_history_read() {
     client.connect().await.unwrap();
     let order = submit_resting_limit_order(&client, &mut rx, &cache, "O-RECONNECT-003").await;
 
+    let ts_ms = get_atomic_clock_realtime().get_time_ns().as_millis();
+    let cloid = Cloid::from_client_order_id(order.client_order_id()).to_hex();
     let mut fill = user_fill("BTC", 12345);
     fill["px"] = json!("56730.0");
-    fill["sz"] = json!("0.0001");
-    fill["time"] = json!(get_atomic_clock_realtime().get_time_ns().as_millis());
-    fill["cloid"] = json!(Cloid::from_client_order_id(order.client_order_id()).to_hex());
+    fill["sz"] = json!("0.00005");
+    fill["time"] = json!(ts_ms);
+    fill["cloid"] = json!(cloid);
+    let mut canceled = historical_order("BTC", 12345);
+    canceled["order"]["limitPx"] = json!("56730.0");
+    canceled["order"]["origSz"] = json!("0.0001");
+    canceled["order"]["sz"] = json!("0.00005");
+    canceled["order"]["timestamp"] = json!(ts_ms - 1);
+    canceled["order"]["cloid"] = json!(cloid);
+    canceled["status"] = json!("canceled");
+    canceled["statusTimestamp"] = json!(ts_ms + 1);
     *user_fills.lock().await = Some(json!([fill]));
-    fail_user_fills_count.store(1, Ordering::Relaxed);
+    *historical_orders.lock().await = Some(json!([canceled]));
+    failures.store(failed_reads, Ordering::Relaxed);
 
     request_user_streams_reconnect(&registry);
     wait_until_async(
         || {
-            let fail_user_fills_count = fail_user_fills_count.clone();
-            async move { fail_user_fills_count.load(Ordering::Relaxed) == 0 }
+            let failures = failures.clone();
+            async move { failures.load(Ordering::Relaxed) == failed_reads - 1 }
         },
         Duration::from_secs(10),
     )
     .await;
 
+    // A later stream report advances the cursor beyond the recovery margin
+    stream_frames
+        .send(order_updates_frame(&[external_canceled_order(
+            998,
+            ts_ms + 60_000,
+        )]))
+        .unwrap();
+    let before_recovery = recv_order_report(&mut rx, "998").await;
+
+    if failed_reads == 2 {
+        wait_until_async(
+            || {
+                let failures = failures.clone();
+                async move { failures.load(Ordering::Relaxed) == 0 }
+            },
+            Duration::from_secs(10),
+        )
+        .await;
+
+        request_user_streams_reconnect(&registry);
+    }
+
+    let events =
+        recv_order_events_until(&mut rx, |event| matches!(event, OrderEventAny::Canceled(_))).await;
+
+    // A marker queued behind the next recovery bounds the duplicate check
+    *frame_after_user_events_ack.lock().await =
+        Some(order_updates_frame(&[external_canceled_order(
+            999,
+            ts_ms + 60_001,
+        )]));
+    request_user_streams_reconnect(&registry);
+    let replayed = recv_order_report(&mut rx, "999").await;
+
+    let [
+        OrderEventAny::Accepted(accepted),
+        OrderEventAny::Filled(filled),
+        OrderEventAny::Canceled(canceled),
+    ] = events.as_slice()
+    else {
+        panic!("unexpected recovered events: {events:?}");
+    };
+
+    assert_eq!(before_recovery, vec![]);
+    assert_eq!(accepted.client_order_id, order.client_order_id());
+    assert_eq!(filled.client_order_id, order.client_order_id());
+    assert_eq!(filled.venue_order_id, VenueOrderId::from("12345"));
+    assert_eq!(
+        filled.last_qty.as_decimal(),
+        rust_decimal_macros::dec!(0.00005)
+    );
+    assert_eq!(
+        filled.last_px.as_decimal(),
+        rust_decimal_macros::dec!(56730)
+    );
+    assert_eq!(canceled.client_order_id, order.client_order_id());
+    assert_eq!(canceled.venue_order_id, Some(VenueOrderId::from("12345")));
+    assert_eq!(replayed, vec![]);
+
+    client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_reconnect_follow_up_recovers_retained_window_after_lagging_initial_read() {
+    let state = TestServerState::default();
+    let addr = start_mock_server(state.clone()).await;
+    let registry = SocketReconnectRegistry::default();
+    let (mut client, mut rx, cache) = registry.scope(|| create_test_execution_client(addr));
+    add_test_account_to_cache(&cache, AccountId::from("HYPERLIQUID-001"));
+    client.start().unwrap();
+    client.connect().await.unwrap();
+    let order = submit_resting_limit_order(&client, &mut rx, &cache, "O-RECONNECT-RETAINED").await;
+    let ts_ms = get_atomic_clock_realtime().get_time_ns().as_millis();
+
+    *state.frame_after_user_events_ack.lock().await =
+        Some(order_updates_frame(&[external_canceled_order(996, ts_ms)]));
+    state.pause_next_user_fills.store(true, Ordering::Release);
+    request_user_streams_reconnect(&registry);
+    tokio::time::timeout(Duration::from_secs(10), state.info_started.notified())
+        .await
+        .unwrap();
+
+    // Arm the follow-up pause before letting the empty initial read succeed
+    state.pause_next_user_fills.store(true, Ordering::Release);
+    state.info_release.notify_one();
+    let initial = recv_order_report(&mut rx, "996").await;
+    tokio::time::timeout(Duration::from_secs(10), state.info_started.notified())
+        .await
+        .unwrap();
+    state.fail_user_fills_count.store(2, Ordering::Relaxed);
+    state.info_release.notify_one();
+    wait_until_async(
+        || async { state.fail_user_fills_count.load(Ordering::Relaxed) == 1 },
+        Duration::from_secs(10),
+    )
+    .await;
+
+    state
+        .stream_frames
+        .send(order_updates_frame(&[external_canceled_order(
+            998,
+            ts_ms + 60_000,
+        )]))
+        .unwrap();
+    let before_recovery = recv_order_report(&mut rx, "998").await;
+    let mut fill = user_fill("BTC", 12345);
+    fill["px"] = json!("56730.0");
+    fill["sz"] = json!("0.0001");
+    fill["time"] = json!(ts_ms);
+    fill["cloid"] = json!(Cloid::from_client_order_id(order.client_order_id()).to_hex());
+    *state.user_fills_response.lock().await = Some(json!([fill]));
+
+    // The reused window must survive another initial failure and reach its follow-up
+    request_user_streams_reconnect(&registry);
+    wait_until_async(
+        || async { state.fail_user_fills_count.load(Ordering::Relaxed) == 0 },
+        Duration::from_secs(10),
+    )
+    .await;
+    let events =
+        recv_order_events_until(&mut rx, |event| matches!(event, OrderEventAny::Filled(_))).await;
+    *state.frame_after_user_events_ack.lock().await =
+        Some(order_updates_frame(&[external_canceled_order(
+            999,
+            ts_ms + 60_001,
+        )]));
+    request_user_streams_reconnect(&registry);
+    let replayed = recv_order_report(&mut rx, "999").await;
+
+    let [
+        OrderEventAny::Accepted(accepted),
+        OrderEventAny::Filled(filled),
+    ] = events.as_slice()
+    else {
+        panic!("unexpected recovered events: {events:?}");
+    };
+
+    assert_eq!(initial, vec![]);
+    assert_eq!(before_recovery, vec![]);
+    assert_eq!(accepted.client_order_id, order.client_order_id());
+    assert_eq!(filled.client_order_id, order.client_order_id());
+    assert_eq!(filled.venue_order_id, VenueOrderId::from("12345"));
+    assert_eq!(
+        filled.last_qty.as_decimal(),
+        rust_decimal_macros::dec!(0.0001)
+    );
+    assert_eq!(
+        filled.last_px.as_decimal(),
+        rust_decimal_macros::dec!(56730)
+    );
+    assert_eq!(replayed, vec![]);
+
+    client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_reconnect_older_follow_up_preserves_newer_failed_window() {
+    let state = TestServerState::default();
+    let addr = start_mock_server(state.clone()).await;
+    let registry = SocketReconnectRegistry::default();
+    let (mut client, mut rx, cache) = registry.scope(|| create_test_execution_client(addr));
+    add_test_account_to_cache(&cache, AccountId::from("HYPERLIQUID-001"));
+    client.start().unwrap();
+    client.connect().await.unwrap();
+    let order = submit_resting_limit_order(&client, &mut rx, &cache, "O-RECONNECT-OVERLAP").await;
+    let ts_ms = get_atomic_clock_realtime().get_time_ns().as_millis();
+    state.fail_user_fills_count.store(1, Ordering::Relaxed);
+    request_user_streams_reconnect(&registry);
+    wait_until_async(
+        || async { state.fail_user_fills_count.load(Ordering::Relaxed) == 0 },
+        Duration::from_secs(10),
+    )
+    .await;
+
+    // Hold the older follow-up after its order snapshot, then fail both newer reads
+    *state.historical_orders_response.lock().await =
+        Some(json!([external_canceled_order(998, ts_ms + 60_000),]));
+    state.pause_next_user_fills.store(true, Ordering::Release);
+    tokio::time::timeout(Duration::from_secs(10), state.info_started.notified())
+        .await
+        .unwrap();
+    state
+        .stream_frames
+        .send(order_updates_frame(&[external_canceled_order(
+            997,
+            ts_ms + 60_001,
+        )]))
+        .unwrap();
+    recv_order_report(&mut rx, "997").await;
+    state.fail_user_fills_count.store(2, Ordering::Relaxed);
+    request_user_streams_reconnect(&registry);
+    wait_until_async(
+        || async { state.fail_user_fills_count.load(Ordering::Relaxed) == 0 },
+        Duration::from_secs(10),
+    )
+    .await;
+    state.info_release.notify_one();
+    recv_order_report(&mut rx, "998").await;
+
+    let mut fill = user_fill("BTC", 12345);
+    fill["px"] = json!("56730.0");
+    fill["sz"] = json!("0.0001");
+    fill["time"] = json!(ts_ms);
+    fill["cloid"] = json!(Cloid::from_client_order_id(order.client_order_id()).to_hex());
+    *state.user_fills_response.lock().await = Some(json!([fill]));
+    *state.historical_orders_response.lock().await = Some(json!([]));
     request_user_streams_reconnect(&registry);
     let events =
         recv_order_events_until(&mut rx, |event| matches!(event, OrderEventAny::Filled(_))).await;
+
+    // A report unique to this follow-up proves it applies before the next reconnect
+    *state.historical_orders_response.lock().await =
+        Some(json!([external_canceled_order(999, ts_ms + 60_002),]));
+    recv_order_report(&mut rx, "999").await;
+    *state.historical_orders_response.lock().await =
+        Some(json!([external_canceled_order(1000, ts_ms + 1),]));
+    *state.frame_after_user_events_ack.lock().await =
+        Some(order_updates_frame(&[external_canceled_order(
+            1001,
+            ts_ms + 60_003,
+        )]));
+    request_user_streams_reconnect(&registry);
+    let mut replayed = Vec::new();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while let Some(event) = rx.recv().await {
+            if let ExecutionEvent::Report(ExecutionReport::Order(report)) = event {
+                replayed.push(report.venue_order_id);
+                if report.venue_order_id == VenueOrderId::from("1001") {
+                    break;
+                }
+            }
+        }
+    })
+    .await
+    .unwrap();
 
     let [
         OrderEventAny::Accepted(accepted),
@@ -2985,6 +3311,11 @@ async fn test_reconnect_recovers_after_failed_history_read() {
         filled.last_qty.as_decimal(),
         rust_decimal_macros::dec!(0.0001)
     );
+    assert_eq!(
+        filled.last_px.as_decimal(),
+        rust_decimal_macros::dec!(56730)
+    );
+    assert_eq!(replayed, vec![VenueOrderId::from("1001")]);
 
     client.disconnect().await.unwrap();
 }
@@ -4532,6 +4863,337 @@ async fn test_connect_fails_when_user_abstraction_unreadable() {
 
 #[rstest]
 #[tokio::test(flavor = "multi_thread")]
+async fn test_account_state_stream_updates_without_query(
+    #[values("disabled", "unifiedAccount", "portfolioMargin")] abstraction: &str,
+    #[values(false, true)] reconnect: bool,
+) {
+    let state = TestServerState::default();
+    *state.user_abstraction_response.lock().await = Some(json!(abstraction));
+    let addr = start_mock_server(state.clone()).await;
+    let registry = SocketReconnectRegistry::default();
+    let (mut client, mut rx, cache) = registry.scope(|| create_test_execution_client(addr));
+    add_test_account_to_cache(&cache, AccountId::from("HYPERLIQUID-001"));
+    client.start().unwrap();
+    client.connect().await.unwrap();
+
+    let initial = rx.recv().await.unwrap();
+    assert!(matches!(initial, ExecutionEvent::Account(_)));
+
+    wait_until_async(
+        || async { state.ws_subscriptions.lock().await.len() == 4 },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    if reconnect {
+        request_user_streams_reconnect(&registry);
+        wait_until_async(
+            || async { state.ws_subscriptions.lock().await.len() == 8 },
+            Duration::from_secs(5),
+        )
+        .await;
+    }
+
+    let subscriptions = state.ws_subscriptions.lock().await.clone();
+    let spot_subscriptions: Vec<_> = subscriptions
+        .iter()
+        .filter(|subscription| subscription["type"] == "spotState")
+        .collect();
+    assert_eq!(spot_subscriptions.len(), if reconnect { 2 } else { 1 });
+    assert_eq!(
+        spot_subscriptions
+            .iter()
+            .map(|subscription| subscription["isPortfolioMargin"].clone())
+            .collect::<Vec<_>>(),
+        vec![json!(abstraction == "portfolioMargin"); spot_subscriptions.len()],
+    );
+
+    let account_requests = |requests: &[Value]| {
+        requests
+            .iter()
+            .filter(|request| {
+                matches!(
+                    request["type"].as_str(),
+                    Some("clearinghouseState" | "spotClearinghouseState" | "userAbstraction")
+                )
+            })
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+
+    let requests_before = account_requests(&state.info_requests.lock().await);
+    let frames = load_json("ws_account_states.json");
+    for (channel, has_spot) in [("perp", false), ("spot", true), ("perp", true)] {
+        state.stream_frames.send(frames[channel].clone()).unwrap();
+        let event = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("account stream must emit without QueryAccount")
+            .unwrap();
+
+        let ExecutionEvent::Account(account) = event else {
+            panic!("expected account state, was {event:?}");
+        };
+
+        let usdc = account
+            .balances
+            .iter()
+            .find(|b| b.currency == Currency::USDC())
+            .unwrap();
+        let spot_collateral = abstraction != "disabled";
+
+        let (total, locked, free, margin) = match (has_spot, spot_collateral) {
+            (false, true) => (dec!(0), dec!(0), dec!(0), None),
+            (true, true) => (dec!(456.78), dec!(23.45), dec!(433.33), Some(dec!(23.45))),
+            (_, false) => (dec!(1229.34), dec!(73.68), dec!(1155.66), Some(dec!(78.9))),
+        };
+
+        assert_eq!(account.account_id, AccountId::from("HYPERLIQUID-001"));
+        assert_eq!(account.account_type, AccountType::Margin);
+        assert_eq!(account.base_currency, None);
+        assert!(account.is_reported);
+        assert_eq!(usdc.total.as_decimal(), total);
+        assert_eq!(usdc.locked.as_decimal(), locked);
+        assert_eq!(usdc.free.as_decimal(), free);
+        assert_eq!(account.margins.len(), usize::from(margin.is_some()));
+
+        if let Some(margin) = margin {
+            assert_eq!(account.margins[0].initial.as_decimal(), margin);
+            assert_eq!(account.margins[0].maintenance.as_decimal(), margin);
+            assert_eq!(account.margins[0].currency, Currency::USDC());
+            assert_eq!(account.margins[0].instrument_id, None);
+        }
+
+        assert_eq!(account.balances.len(), if has_spot { 2 } else { 1 });
+
+        if has_spot {
+            let hype = account
+                .balances
+                .iter()
+                .find(|b| b.currency.code == "HYPE")
+                .unwrap();
+            assert_eq!(hype.total.as_decimal(), dec!(6.54));
+            assert_eq!(hype.locked.as_decimal(), dec!(1.23));
+            assert_eq!(hype.free.as_decimal(), dec!(5.31));
+        }
+
+        cache.borrow_mut().update_account_state(&account).unwrap();
+        let cache = cache.borrow();
+        let cached = cache.account(&account.account_id).unwrap();
+        assert_eq!(cached.balances()[&Currency::USDC()], *usdc);
+    }
+
+    assert_eq!(
+        account_requests(&state.info_requests.lock().await),
+        requests_before
+    );
+    client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_account_state_stream_clears_zero_spot_balances(
+    #[values("disabled", "unifiedAccount", "portfolioMargin")] abstraction: &str,
+) {
+    let frames = load_json("ws_account_states.json");
+    let state = TestServerState::default();
+    *state.user_abstraction_response.lock().await = Some(json!(abstraction));
+    *state.perp_clearinghouse_response.lock().await =
+        Some(frames["perp"]["data"]["clearinghouseState"].clone());
+    *state.spot_clearinghouse_response.lock().await =
+        Some(frames["spot"]["data"]["spotState"].clone());
+    let addr = start_mock_server(state.clone()).await;
+    let (mut client, mut rx, cache) = create_test_execution_client(addr);
+    add_test_account_to_cache(&cache, AccountId::from("HYPERLIQUID-001"));
+    client.start().unwrap();
+    client.connect().await.unwrap();
+
+    let ExecutionEvent::Account(initial) = rx.recv().await.unwrap() else {
+        panic!("expected initial account state");
+    };
+
+    cache.borrow_mut().update_account_state(&initial).unwrap();
+
+    state
+        .stream_frames
+        .send(frames["spot_zero"].clone())
+        .unwrap();
+    let event = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+        .await
+        .expect("zero spot balances must emit an account update")
+        .unwrap();
+
+    let ExecutionEvent::Account(account) = event else {
+        panic!("expected account state, was {event:?}");
+    };
+
+    let usdc = if abstraction == "disabled" {
+        AccountBalance::new(
+            Money::from("1229.34 USDC"),
+            Money::from("73.68 USDC"),
+            Money::from("1155.66 USDC"),
+        )
+    } else {
+        let zero = Money::zero(Currency::USDC());
+        AccountBalance::new(zero, zero, zero)
+    };
+
+    let hype_zero = Money::from("0 HYPE");
+    let hype = AccountBalance::new(hype_zero, hype_zero, hype_zero);
+
+    let margins = if abstraction == "disabled" {
+        let margin = Money::from("78.9 USDC");
+        vec![MarginBalance::new(margin, margin, None)]
+    } else {
+        vec![]
+    };
+
+    assert_eq!(account.balances, vec![usdc, hype]);
+    assert_eq!(account.margins, margins);
+    cache.borrow_mut().update_account_state(&account).unwrap();
+    let balances = cache
+        .borrow()
+        .account(&account.account_id)
+        .unwrap()
+        .balances();
+    assert_eq!(balances[&Currency::USDC()], usdc);
+    assert_eq!(balances[&hype.currency], hype);
+    client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_account_state_stream_accepts_empty_spot_balances() {
+    let state = TestServerState::default();
+    *state.user_abstraction_response.lock().await = Some(json!("unifiedAccount"));
+    let addr = start_mock_server(state.clone()).await;
+    let (mut client, mut rx, cache) = create_test_execution_client(addr);
+    add_test_account_to_cache(&cache, AccountId::from("HYPERLIQUID-001"));
+    client.start().unwrap();
+    client.connect().await.unwrap();
+    assert!(matches!(
+        rx.recv().await.unwrap(),
+        ExecutionEvent::Account(_)
+    ));
+
+    let mut frame = load_json("ws_account_states.json")["spot"].clone();
+    frame["data"]["spotState"]["balances"]
+        .as_array_mut()
+        .unwrap()
+        .clear();
+    state.stream_frames.send(frame).unwrap();
+    let event = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+        .await
+        .expect("an explicitly empty balance list must emit an account update")
+        .unwrap();
+
+    let ExecutionEvent::Account(account) = event else {
+        panic!("expected account state, was {event:?}");
+    };
+
+    let zero = Money::zero(Currency::USDC());
+    let balance = AccountBalance::new(zero, zero, zero);
+
+    assert_eq!(account.balances, vec![balance]);
+    assert_eq!(account.margins, vec![]);
+    cache.borrow_mut().update_account_state(&account).unwrap();
+    assert_eq!(
+        cache
+            .borrow()
+            .account(&account.account_id)
+            .unwrap()
+            .balances()[&Currency::USDC()],
+        balance
+    );
+    client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[case::invalid_spot_decimal("spot", "unifiedAccount", "/data/spotState/balances/0/total", Some(json!("not-a-decimal")))]
+#[case::missing_spot_balances("spot", "unifiedAccount", "/data/spotState/balances", None)]
+#[case::spot_conversion_failure("spot", "unifiedAccount", "/data/spotState/balances/0/total", Some(json!("99999999999999999999.99")))]
+#[case::perp_conversion_failure("perp", "disabled", "/data/clearinghouseState/crossMarginSummary/totalRawUsd", Some(json!("99999999999999999999.99")))]
+#[case::empty_perp_state("perp", "disabled", "/data/clearinghouseState", Some(json!({})))]
+#[case::missing_cross_summary(
+    "perp",
+    "disabled",
+    "/data/clearinghouseState/crossMarginSummary",
+    None
+)]
+#[case::null_cross_summary(
+    "perp",
+    "disabled",
+    "/data/clearinghouseState/crossMarginSummary",
+    Some(Value::Null)
+)]
+#[case::missing_withdrawable("perp", "disabled", "/data/clearinghouseState/withdrawable", None)]
+#[case::null_withdrawable(
+    "perp",
+    "disabled",
+    "/data/clearinghouseState/withdrawable",
+    Some(Value::Null)
+)]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_account_state_stream_retains_valid_snapshots(
+    #[case] channel: &str,
+    #[case] abstraction: &str,
+    #[case] pointer: &str,
+    #[case] invalid_value: Option<Value>,
+) {
+    let frames = load_json("ws_account_states.json");
+    let state = TestServerState::default();
+    *state.user_abstraction_response.lock().await = Some(json!(abstraction));
+    *state.perp_clearinghouse_response.lock().await =
+        Some(frames["perp"]["data"]["clearinghouseState"].clone());
+    *state.spot_clearinghouse_response.lock().await =
+        Some(frames["spot"]["data"]["spotState"].clone());
+    let addr = start_mock_server(state.clone()).await;
+    let (mut client, mut rx, cache) = create_test_execution_client(addr);
+    add_test_account_to_cache(&cache, AccountId::from("HYPERLIQUID-001"));
+    client.start().unwrap();
+    client.connect().await.unwrap();
+
+    let ExecutionEvent::Account(initial) = rx.recv().await.unwrap() else {
+        panic!("expected initial account state");
+    };
+
+    let mut invalid = frames[channel].clone();
+    if let Some(value) = invalid_value {
+        *invalid.pointer_mut(pointer).unwrap() = value;
+    } else {
+        let (parent, field) = pointer.rsplit_once('/').unwrap();
+        invalid
+            .pointer_mut(parent)
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .remove(field);
+    }
+
+    let next_channel = if channel == "perp" { "spot" } else { "perp" };
+
+    state.stream_frames.send(invalid).unwrap();
+    state
+        .stream_frames
+        .send(frames[next_channel].clone())
+        .unwrap();
+    let event = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+        .await
+        .expect("stream must continue after an invalid snapshot")
+        .unwrap();
+
+    let ExecutionEvent::Account(account) = event else {
+        panic!("expected account state, was {event:?}");
+    };
+
+    assert_eq!(account.balances, initial.balances);
+    assert_eq!(account.margins, initial.margins);
+    assert_ne!(account.event_id, initial.event_id);
+    assert!(rx.try_recv().is_err());
+    client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_connect_unified_account_emits_spot_usdc() {
     let state = TestServerState::default();
     set_unified_account_state(&state).await;
@@ -4993,7 +5655,7 @@ async fn test_modify_order_uses_cached_cloid_target_without_venue_order_id() {
 
 #[rstest]
 #[tokio::test(flavor = "multi_thread")]
-async fn test_modify_order_rejects_cloid_target_before_venue_order_id_known() {
+async fn test_modify_order_denies_cloid_target_before_venue_order_id_known() {
     let state = TestServerState::default();
     let exchange_count = state.exchange_request_count.clone();
     let addr = start_mock_server(state).await;
@@ -5019,8 +5681,13 @@ async fn test_modify_order_rejects_cloid_target_before_venue_order_id_known() {
 
     client.modify_order(make_modify_cmd(&order, None)).unwrap();
 
-    let events = drain_modify_rejected_events(&mut rx, Duration::from_millis(250)).await;
-    assert_eq!(events.len(), 1, "expected one OrderModifyRejected");
+    let events = drain_command_refusals(
+        &mut rx,
+        OrderEventType::ModifyDenied,
+        Duration::from_millis(250),
+    )
+    .await;
+    assert_eq!(events.len(), 1, "expected one OrderModifyDenied");
     assert_eq!(events[0].0, order.client_order_id());
     assert!(
         events[0].1.contains("cached venue_order_id"),
@@ -5065,7 +5732,7 @@ async fn test_modify_order_falls_back_to_cached_oid_without_cached_cloid() {
 
 #[rstest]
 #[tokio::test(flavor = "multi_thread")]
-async fn test_modify_order_rejects_without_venue_id_or_cached_cloid() {
+async fn test_modify_order_denies_without_venue_id_or_cached_cloid() {
     let state = TestServerState::default();
     let exchange_count = state.exchange_request_count.clone();
     let addr = start_mock_server(state).await;
@@ -5083,8 +5750,13 @@ async fn test_modify_order_rejects_without_venue_id_or_cached_cloid() {
 
     client.modify_order(make_modify_cmd(&order, None)).unwrap();
 
-    let events = drain_modify_rejected_events(&mut rx, Duration::from_millis(250)).await;
-    assert_eq!(events.len(), 1, "expected one OrderModifyRejected");
+    let events = drain_command_refusals(
+        &mut rx,
+        OrderEventType::ModifyDenied,
+        Duration::from_millis(250),
+    )
+    .await;
+    assert_eq!(events.len(), 1, "expected one OrderModifyDenied");
     assert_eq!(events[0].0, order.client_order_id());
     assert!(
         events[0].1.contains("unique cached CLOID"),
@@ -5155,7 +5827,12 @@ async fn test_modify_order_rejection_does_not_mark_pending_modify() {
         "failed modify must not leave a pending-modify marker",
     );
 
-    let events = drain_modify_rejected_events(&mut rx, Duration::from_millis(250)).await;
+    let events = drain_command_refusals(
+        &mut rx,
+        OrderEventType::ModifyRejected,
+        Duration::from_millis(250),
+    )
+    .await;
     assert_eq!(
         events,
         vec![(
@@ -5222,7 +5899,12 @@ async fn test_modify_order_inner_error_clears_pending_modify() {
         "inner-error modify must not leave a pending-modify marker",
     );
 
-    let events = drain_modify_rejected_events(&mut rx, Duration::from_millis(250)).await;
+    let events = drain_command_refusals(
+        &mut rx,
+        OrderEventType::ModifyRejected,
+        Duration::from_millis(250),
+    )
+    .await;
     assert_eq!(
         events,
         vec![(
@@ -5277,7 +5959,12 @@ async fn test_modify_order_post_error_preserves_pending_modify() {
     )
     .await;
 
-    let events = drain_modify_rejected_events(&mut rx, Duration::from_millis(250)).await;
+    let events = drain_command_refusals(
+        &mut rx,
+        OrderEventType::ModifyRejected,
+        Duration::from_millis(250),
+    )
+    .await;
     assert_eq!(
         client
             .ws_dispatch_state()
@@ -5820,16 +6507,19 @@ fn make_cancel_entry(coid: ClientOrderId, voi: VenueOrderId) -> CancelOrder {
     )
 }
 
-async fn drain_cancel_rejected_events(
+async fn drain_command_refusals(
     rx: &mut tokio::sync::mpsc::UnboundedReceiver<ExecutionEvent>,
+    event_type: OrderEventType,
     timeout: Duration,
 ) -> Vec<(ClientOrderId, String)> {
     let mut out = Vec::new();
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
         match tokio::time::timeout_at(deadline, rx.recv()).await {
-            Ok(Some(ExecutionEvent::Order(OrderEventAny::CancelRejected(event)))) => {
-                out.push((event.client_order_id, event.reason.to_string()));
+            Ok(Some(ExecutionEvent::Order(event))) if event.event_type() == event_type => {
+                if let Some(reason) = event.message() {
+                    out.push((event.client_order_id(), reason.to_string()));
+                }
             }
             Ok(Some(_)) => {}
             Ok(None) | Err(_) => break,
@@ -5889,7 +6579,12 @@ async fn test_batch_cancel_orders_per_item_error_emits_cancel_rejected() {
     )
     .await;
 
-    let events = drain_cancel_rejected_events(&mut rx, Duration::from_millis(250)).await;
+    let events = drain_command_refusals(
+        &mut rx,
+        OrderEventType::CancelRejected,
+        Duration::from_millis(250),
+    )
+    .await;
     assert_eq!(
         events.len(),
         1,
@@ -5946,7 +6641,12 @@ async fn test_batch_cancel_orders_short_statuses_emit_no_cancel_rejected() {
     )
     .await;
 
-    let events = drain_cancel_rejected_events(&mut rx, Duration::from_millis(250)).await;
+    let events = drain_command_refusals(
+        &mut rx,
+        OrderEventType::CancelRejected,
+        Duration::from_millis(250),
+    )
+    .await;
     assert!(
         events.is_empty(),
         "short status arrays are ambiguous and should not reject individual cancels: {events:?}",
@@ -5993,7 +6693,12 @@ async fn test_batch_cancel_orders_post_error_emits_no_cancel_rejected() {
     )
     .await;
 
-    let events = drain_cancel_rejected_events(&mut rx, Duration::from_millis(250)).await;
+    let events = drain_command_refusals(
+        &mut rx,
+        OrderEventType::CancelRejected,
+        Duration::from_millis(250),
+    )
+    .await;
     assert!(
         events.is_empty(),
         "whole-request cancel failure should remain unresolved: {events:?}",
@@ -6004,7 +6709,7 @@ async fn test_batch_cancel_orders_post_error_emits_no_cancel_rejected() {
 
 #[rstest]
 #[tokio::test(flavor = "multi_thread")]
-async fn test_batch_cancel_orders_missing_asset_index_rejects_only_invalid_entry() {
+async fn test_batch_cancel_orders_missing_asset_index_denies_only_invalid_entry() {
     // No trading action should happen for an entry whose instrument symbol
     // is unknown. The valid entry should still dispatch.
     let state = TestServerState::default();
@@ -6052,7 +6757,12 @@ async fn test_batch_cancel_orders_missing_asset_index_rejects_only_invalid_entry
     )
     .await;
 
-    let events = drain_cancel_rejected_events(&mut rx, Duration::from_millis(250)).await;
+    let events = drain_command_refusals(
+        &mut rx,
+        OrderEventType::CancelDenied,
+        Duration::from_millis(250),
+    )
+    .await;
     assert_eq!(
         events,
         vec![(
@@ -6067,7 +6777,7 @@ async fn test_batch_cancel_orders_missing_asset_index_rejects_only_invalid_entry
 
 #[rstest]
 #[tokio::test(flavor = "multi_thread")]
-async fn test_batch_cancel_orders_invalid_venue_id_rejects_only_invalid_entry() {
+async fn test_batch_cancel_orders_invalid_venue_id_denies_only_invalid_entry() {
     let state = TestServerState::default();
     let addr = start_mock_server(state.clone()).await;
     let (mut client, mut rx, cache) = create_test_execution_client(addr);
@@ -6113,7 +6823,12 @@ async fn test_batch_cancel_orders_invalid_venue_id_rejects_only_invalid_entry() 
     )
     .await;
 
-    let events = drain_cancel_rejected_events(&mut rx, Duration::from_millis(250)).await;
+    let events = drain_command_refusals(
+        &mut rx,
+        OrderEventType::CancelDenied,
+        Duration::from_millis(250),
+    )
+    .await;
     assert_eq!(
         events,
         vec![(invalid_coid, "Invalid venue order ID format".to_string())]
@@ -6250,7 +6965,12 @@ async fn test_cancel_all_orders_per_item_error_emits_cancel_rejected() {
     )
     .await;
 
-    let events = drain_cancel_rejected_events(&mut rx, Duration::from_millis(250)).await;
+    let events = drain_command_refusals(
+        &mut rx,
+        OrderEventType::CancelRejected,
+        Duration::from_millis(250),
+    )
+    .await;
     assert_eq!(
         events.len(),
         1,
@@ -6303,7 +7023,12 @@ async fn test_cancel_all_orders_short_statuses_emit_no_cancel_rejected() {
     )
     .await;
 
-    let events = drain_cancel_rejected_events(&mut rx, Duration::from_millis(250)).await;
+    let events = drain_command_refusals(
+        &mut rx,
+        OrderEventType::CancelRejected,
+        Duration::from_millis(250),
+    )
+    .await;
     assert!(
         events.is_empty(),
         "short status arrays are ambiguous and should not reject open orders: {events:?}",
@@ -6341,7 +7066,12 @@ async fn test_cancel_all_orders_post_error_emits_no_cancel_rejected() {
     )
     .await;
 
-    let events = drain_cancel_rejected_events(&mut rx, Duration::from_millis(250)).await;
+    let events = drain_command_refusals(
+        &mut rx,
+        OrderEventType::CancelRejected,
+        Duration::from_millis(250),
+    )
+    .await;
     assert!(
         events.is_empty(),
         "whole-request cancel-all failure should remain unresolved: {events:?}",
@@ -6352,7 +7082,7 @@ async fn test_cancel_all_orders_post_error_emits_no_cancel_rejected() {
 
 #[rstest]
 #[tokio::test(flavor = "multi_thread")]
-async fn test_cancel_all_orders_missing_asset_index_rejects_each_order() {
+async fn test_cancel_all_orders_missing_asset_index_denies_each_order() {
     // Instrument symbol is not registered with the asset-index map, so
     // no trading action happens.
     const UNKNOWN_INSTRUMENT: &str = "NOPE-USD-PERP.HYPERLIQUID";
@@ -6445,7 +7175,12 @@ async fn test_cancel_all_orders_missing_asset_index_rejects_each_order() {
     )
     .await;
 
-    let events = drain_cancel_rejected_events(&mut rx, Duration::from_millis(250)).await;
+    let events = drain_command_refusals(
+        &mut rx,
+        OrderEventType::CancelDenied,
+        Duration::from_millis(250),
+    )
+    .await;
     assert_eq!(
         events,
         vec![
@@ -6499,7 +7234,12 @@ async fn test_cancel_order_post_error_emits_no_cancel_rejected() {
     )
     .await;
 
-    let events = drain_cancel_rejected_events(&mut rx, Duration::from_millis(250)).await;
+    let events = drain_command_refusals(
+        &mut rx,
+        OrderEventType::CancelRejected,
+        Duration::from_millis(250),
+    )
+    .await;
     assert!(
         events.is_empty(),
         "ambiguous single cancel failure should remain unresolved: {events:?}",
@@ -6511,7 +7251,7 @@ async fn test_cancel_order_post_error_emits_no_cancel_rejected() {
 
 #[rstest]
 #[tokio::test(flavor = "multi_thread")]
-async fn test_cancel_order_missing_asset_index_emits_cancel_rejected() {
+async fn test_cancel_order_missing_asset_index_emits_cancel_denied() {
     let state = TestServerState::default();
     let addr = start_mock_server(state.clone()).await;
     let (mut client, mut rx, cache) = create_test_execution_client(addr);
@@ -6540,7 +7280,12 @@ async fn test_cancel_order_missing_asset_index_emits_cancel_rejected() {
     )
     .await;
 
-    let events = drain_cancel_rejected_events(&mut rx, Duration::from_millis(250)).await;
+    let events = drain_command_refusals(
+        &mut rx,
+        OrderEventType::CancelDenied,
+        Duration::from_millis(250),
+    )
+    .await;
     assert_eq!(
         events,
         vec![(
@@ -6555,7 +7300,7 @@ async fn test_cancel_order_missing_asset_index_emits_cancel_rejected() {
 
 #[rstest]
 #[tokio::test(flavor = "multi_thread")]
-async fn test_cancel_order_invalid_venue_id_emits_cancel_rejected() {
+async fn test_cancel_order_invalid_venue_id_emits_cancel_denied() {
     let state = TestServerState::default();
     let addr = start_mock_server(state.clone()).await;
     let (mut client, mut rx, cache) = create_test_execution_client(addr);
@@ -6584,7 +7329,12 @@ async fn test_cancel_order_invalid_venue_id_emits_cancel_rejected() {
     )
     .await;
 
-    let events = drain_cancel_rejected_events(&mut rx, Duration::from_millis(250)).await;
+    let events = drain_command_refusals(
+        &mut rx,
+        OrderEventType::CancelDenied,
+        Duration::from_millis(250),
+    )
+    .await;
     assert_eq!(
         events,
         vec![(
@@ -6644,7 +7394,12 @@ async fn test_cancel_order_missing_emits_cancel_rejected() {
     )
     .await;
 
-    let events = drain_cancel_rejected_events(&mut rx, Duration::from_millis(250)).await;
+    let events = drain_command_refusals(
+        &mut rx,
+        OrderEventType::CancelRejected,
+        Duration::from_millis(250),
+    )
+    .await;
     assert_eq!(
         events.len(),
         1,
@@ -8143,24 +8898,6 @@ async fn drain_rejected_events(
     out
 }
 
-async fn drain_modify_rejected_events(
-    rx: &mut tokio::sync::mpsc::UnboundedReceiver<ExecutionEvent>,
-    timeout: Duration,
-) -> Vec<(ClientOrderId, String)> {
-    let mut out = Vec::new();
-    let deadline = tokio::time::Instant::now() + timeout;
-    loop {
-        match tokio::time::timeout_at(deadline, rx.recv()).await {
-            Ok(Some(ExecutionEvent::Order(OrderEventAny::ModifyRejected(rejected)))) => {
-                out.push((rejected.client_order_id, rejected.reason.to_string()));
-            }
-            Ok(Some(_)) => {}
-            Ok(None) | Err(_) => break,
-        }
-    }
-    out
-}
-
 fn make_limit_order_on_instrument(id: &str, instrument_id: InstrumentId) -> OrderAny {
     OrderAny::Limit(LimitOrder::new(
         TraderId::from("TESTER-001"),
@@ -8487,7 +9224,7 @@ async fn test_submit_order_raw_price_at_decimal_cap_dispatches() {
 
 #[rstest]
 #[tokio::test(flavor = "multi_thread")]
-async fn test_modify_order_raw_price_excess_decimals_emits_modify_rejected() {
+async fn test_modify_order_raw_price_excess_decimals_emits_modify_denied() {
     // The modify overwrite applies command prices after the conversion guard,
     // so it must re-validate the effective replacement price: an over-cap
     // modify is rejected locally instead of dispatching an unsignable payload.
@@ -8513,7 +9250,12 @@ async fn test_modify_order_raw_price_excess_decimals_emits_modify_rejected() {
         Duration::from_secs(5),
     )
     .await;
-    let rejected = drain_modify_rejected_events(&mut rx, Duration::from_millis(250)).await;
+    let rejected = drain_command_refusals(
+        &mut rx,
+        OrderEventType::ModifyDenied,
+        Duration::from_millis(250),
+    )
+    .await;
     assert_eq!(rejected.len(), 1);
     assert_eq!(rejected[0].0, order.client_order_id());
     assert!(
@@ -8558,7 +9300,12 @@ async fn test_modify_order_raw_price_at_decimal_cap_dispatches() {
         Duration::from_secs(5),
     )
     .await;
-    let rejected = drain_modify_rejected_events(&mut rx, Duration::from_millis(250)).await;
+    let rejected = drain_command_refusals(
+        &mut rx,
+        OrderEventType::ModifyRejected,
+        Duration::from_millis(250),
+    )
+    .await;
     assert!(rejected.is_empty(), "unexpected rejection: {rejected:?}");
     assert_eq!(*exchange_count.lock().await, 1);
 
@@ -9252,7 +9999,7 @@ async fn test_submit_order_quote_quantity_zero_price_quote_emits_denied() {
 
 #[rstest]
 #[tokio::test(flavor = "multi_thread")]
-async fn test_modify_order_quote_quantity_emits_rejected() {
+async fn test_modify_order_quote_quantity_emits_denied() {
     // A modify replaces a base-denominated size, which a quote target cannot
     // reconcile against, so the modify must be rejected locally.
     let state = TestServerState::default();
@@ -9273,8 +10020,13 @@ async fn test_modify_order_quote_quantity_emits_rejected() {
         .modify_order(make_modify_cmd(&order, Some(VenueOrderId::from("12345"))))
         .unwrap();
 
-    let events = drain_modify_rejected_events(&mut rx, Duration::from_millis(250)).await;
-    assert_eq!(events.len(), 1, "expected one OrderModifyRejected");
+    let events = drain_command_refusals(
+        &mut rx,
+        OrderEventType::ModifyDenied,
+        Duration::from_millis(250),
+    )
+    .await;
+    assert_eq!(events.len(), 1, "expected one OrderModifyDenied");
     assert_eq!(events[0].0, order.client_order_id());
     assert_eq!(
         events[0].1,
@@ -9433,7 +10185,7 @@ fn open_limit_order_with_filled_qty(
 
 #[rstest]
 #[tokio::test(flavor = "multi_thread")]
-async fn test_modify_order_qty_at_filled_emits_modify_rejected() {
+async fn test_modify_order_qty_at_filled_emits_modify_denied() {
     // Modify command with `target_total <= filled` must be rejected without
     // dispatching any trading action. A regression that drops the guard would amend a
     // venue order to `quantity = 0`, which the venue interprets as a cancel
@@ -9472,8 +10224,13 @@ async fn test_modify_order_qty_at_filled_emits_modify_rejected() {
 
     client.modify_order(cmd).unwrap();
 
-    let events = drain_modify_rejected_events(&mut rx, Duration::from_millis(250)).await;
-    assert_eq!(events.len(), 1, "expected one OrderModifyRejected");
+    let events = drain_command_refusals(
+        &mut rx,
+        OrderEventType::ModifyDenied,
+        Duration::from_millis(250),
+    )
+    .await;
+    assert_eq!(events.len(), 1, "expected one OrderModifyDenied");
     assert_eq!(events[0].0, order.client_order_id());
     assert!(
         events[0].1.contains("not greater than filled"),
@@ -10805,7 +11562,7 @@ async fn test_generate_fill_reports_recognizes_position_fills_after_order_purge(
     )
     .await;
     let applied = apply_query_events(&mut engine, &mut rx);
-    cache.borrow_mut().purge_order(native_id);
+    cache.borrow_mut().purge_order(native_id, false).unwrap();
 
     let cmd = GenerateFillReports::new(
         UUID4::new(),
@@ -11189,6 +11946,10 @@ async fn test_generate_mass_status_falls_back_for_saturated_history(
         !mass.reports_complete(),
         "a venue-capped history response cannot prove coverage",
     );
+    assert_eq!(
+        mass.lookback_start(),
+        (!saturate_historical_orders).then_some(UnixNanos::from(1_700_000_000_000_000_000)),
+    );
     assert!(
         mass.order_reports()
             .contains_key(&VenueOrderId::from("9999"))
@@ -11225,6 +11986,220 @@ async fn test_generate_mass_status_falls_back_for_saturated_history(
 }
 
 #[rstest]
+#[case::fills_below_cap(false, 1_999)]
+#[case::fills_at_cap(false, 2_000)]
+#[case::historical_orders_below_cap(true, 1_999)]
+#[case::historical_orders_at_cap(true, 2_000)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_generate_mass_status_declares_capped_history_window(
+    #[case] saturate_historical_orders: bool,
+    #[case] response_len: u64,
+    #[values(false, true)] usable_edge: bool,
+) {
+    let state = TestServerState::default();
+    let edge_ms = 1_754_000_000_001u64;
+
+    let fill_count = if saturate_historical_orders {
+        4
+    } else {
+        response_len
+    };
+
+    let mut fills: Vec<_> = (1..=fill_count)
+        .map(|oid| {
+            let mut fill = user_fill("BTC", oid);
+            fill["time"] = json!(edge_ms + 20);
+            fill
+        })
+        .collect();
+
+    for fill in &mut fills[1..3] {
+        fill["time"] = json!(edge_ms);
+        if !usable_edge {
+            fill["coin"] = json!("NOCOIN");
+        }
+    }
+
+    let history_count = if saturate_historical_orders {
+        response_len
+    } else {
+        4
+    };
+
+    let historical_orders: Vec<_> = (1..=history_count)
+        .map(|oid| {
+            let mut order = historical_order("BTC", oid);
+            order["statusTimestamp"] = json!(edge_ms + 20);
+            order
+        })
+        .collect();
+
+    *state.user_fills_response.lock().await = Some(Value::Array(fills));
+    *state.historical_orders_response.lock().await = Some(Value::Array(historical_orders));
+
+    let addr = start_mock_server(state).await;
+    let (mut client, _rx, cache) = create_test_execution_client(addr);
+    add_test_account_to_cache(&cache, AccountId::from("HYPERLIQUID-001"));
+    client.connect().await.unwrap();
+    let mass = client.generate_mass_status(None).await.unwrap().unwrap();
+    client.disconnect().await.unwrap();
+
+    let edge = UnixNanos::from(1_754_000_000_001_000_000);
+    let fill_reports = mass.fill_reports();
+    let order_reports = mass.order_reports();
+    let spanning_order = &order_reports[&VenueOrderId::from("1")];
+    let capped = response_len == 2_000;
+
+    assert_eq!(mass.lookback_start(), capped.then_some(edge));
+    assert_eq!(mass.reports_complete(), !capped && usable_edge);
+    assert_eq!(
+        fill_reports.values().map(Vec::len).sum::<usize>(),
+        usize::try_from(fill_count).unwrap() - if usable_edge { 0 } else { 2 },
+    );
+    assert_eq!(
+        fill_reports
+            .values()
+            .flatten()
+            .filter(|fill| fill.ts_event == edge)
+            .count(),
+        if usable_edge { 2 } else { 0 },
+    );
+    assert_eq!(spanning_order.order_status, OrderStatus::Filled);
+    assert_eq!(spanning_order.filled_qty, Quantity::from("0.10000"));
+    assert_eq!(
+        spanning_order.ts_accepted,
+        UnixNanos::from(1_700_000_000_000_000_000),
+    );
+    assert_eq!(
+        spanning_order.ts_last,
+        UnixNanos::from(1_754_000_000_021_000_000),
+    );
+}
+
+#[rstest]
+#[case::complete(false, false, false)]
+#[case::capped(true, false, false)]
+#[case::complete_cached(false, true, false)]
+#[case::capped_cached(true, true, false)]
+#[case::capped_cached_flat(true, true, true)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_generate_mass_status_capped_history_projects_fills_order_only(
+    #[case] capped: bool,
+    #[case] cached: bool,
+    #[case] explicit_flat: bool,
+) {
+    let state = TestServerState::default();
+    let mut opening_order = historical_order("BTC", 1);
+    opening_order["order"]["orderType"] = json!("Market");
+    opening_order["order"]["tif"] = json!("Ioc");
+    *state.user_fills_response.lock().await = Some(json!([user_fill("BTC", 1)]));
+    *state.historical_orders_response.lock().await = Some(json!([opening_order.clone()]));
+    *state.perp_clearinghouse_response.lock().await = Some(clearinghouse_position("BTC"));
+
+    let addr = start_mock_server(state.clone()).await;
+    let (mut client, _rx, cache) = create_test_execution_client(addr);
+    add_test_account_to_cache(&cache, AccountId::from("HYPERLIQUID-001"));
+    add_test_perp_instrument_to_cache(&cache);
+    client.connect().await.unwrap();
+    let initial_mass = if cached {
+        client.generate_mass_status(None).await.unwrap()
+    } else {
+        None
+    };
+
+    let mut closing_fill = user_fill("BTC", 2);
+    closing_fill["side"] = json!("A");
+    closing_fill["time"] = json!(1_700_000_001_000u64);
+    closing_fill["startPosition"] = json!("0.10000");
+    closing_fill["dir"] = json!("Close Long");
+    let mut closing_order = historical_order("BTC", 2);
+    closing_order["order"]["side"] = json!("A");
+    closing_order["order"]["orderType"] = json!("Market");
+    closing_order["order"]["tif"] = json!("Ioc");
+    closing_order["statusTimestamp"] = json!(1_700_000_001_001u64);
+    let mut fills = vec![closing_fill];
+    let mut orders = vec![closing_order];
+
+    if capped {
+        fills.extend((3..2_002).map(|oid| {
+            let mut fill = user_fill("ETH", oid);
+            fill["time"] = json!(1_700_000_002_000u64);
+            fill
+        }));
+    } else {
+        fills.insert(0, user_fill("BTC", 1));
+        orders.insert(0, opening_order);
+    }
+
+    *state.user_fills_response.lock().await = Some(Value::Array(fills));
+    *state.historical_orders_response.lock().await = Some(Value::Array(orders));
+
+    *state.perp_clearinghouse_response.lock().await = if explicit_flat {
+        let mut position = clearinghouse_position("BTC");
+        position["assetPositions"][0]["position"]["szi"] = json!("0");
+        Some(position)
+    } else {
+        None
+    };
+
+    let mass = client.generate_mass_status(None).await.unwrap().unwrap();
+    client.disconnect().await.unwrap();
+    let clock = Rc::new(RefCell::new(VirtualClock::new()));
+    let mut engine = ExecutionEngine::new(clock.clone(), cache.clone(), None);
+    engine.register_client(Box::new(client)).unwrap();
+    let engine = RefCell::new(engine);
+    let mut manager =
+        ExecutionManager::new(clock, cache.clone(), ExecutionManagerConfig::default()).unwrap();
+
+    if let Some(initial_mass) = initial_mass {
+        let result = manager.reconcile_execution_mass_status(&initial_mass, &engine);
+        assert!(result.unresolved_positions.is_empty());
+        assert_eq!(
+            cache
+                .borrow()
+                .positions_open(None, None, None, None, None)
+                .len(),
+            1,
+        );
+    }
+
+    let result = manager.reconcile_execution_mass_status(&mass, &engine);
+    let cache = cache.borrow();
+    let order = cache.order(&ClientOrderId::from("2")).unwrap();
+    let positions = cache.positions(None, None, None, None, None);
+    let retains_position = capped && cached && !explicit_flat;
+
+    assert_eq!(positions.len(), usize::from(cached || !capped));
+    assert_eq!(
+        mass.lookback_start(),
+        capped.then_some(UnixNanos::from(1_700_000_001_000_000_000)),
+    );
+    assert_eq!(mass.reports_complete(), !capped);
+    assert!(result.unresolved_positions.is_empty());
+    assert_eq!(order.status(), OrderStatus::Filled);
+    assert_eq!(order.filled_qty(), Quantity::from("0.10000"));
+
+    for position in positions {
+        assert_eq!(
+            position.side,
+            if retains_position {
+                PositionSide::Long
+            } else {
+                PositionSide::Flat
+            },
+        );
+        assert_eq!(
+            position.quantity,
+            if retains_position {
+                Quantity::from("0.10000")
+            } else {
+                Quantity::zero(5)
+            },
+        );
+    }
+}
+
+#[rstest]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_generate_mass_status_propagates_saturated_dex_discovery_error() {
     let state = TestServerState::default();
@@ -11253,7 +12228,9 @@ async fn test_generate_mass_status_propagates_saturated_dex_discovery_error() {
 
 #[rstest]
 #[tokio::test(flavor = "multi_thread")]
-async fn test_generate_mass_status_lookback_filters_only_fills() {
+async fn test_generate_mass_status_lookback_filters_only_fills(
+    #[values(false, true)] capped: bool,
+) {
     // generate_mass_status applies the lookback only to fills. Open orders and
     // positions must always be returned in full so reconciliation has the
     // complete current state. A regression that applies the cutoff to other
@@ -11265,7 +12242,7 @@ async fn test_generate_mass_status_lookback_filters_only_fills() {
             "oid": 200001u64, "timestamp": 1u64, "origSz": "0.001",
         },
     ]));
-    *state.user_fills_response.lock().await = Some(json!([
+    let fills = json!([
         {
             "coin": "BTC", "px": "50000.0", "sz": "0.001", "side": "B",
             "time": 1u64, "startPosition": "0",
@@ -11273,7 +12250,11 @@ async fn test_generate_mass_status_lookback_filters_only_fills() {
             "oid": 200001u64, "crossed": true, "fee": "0.01", "tid": 1u64,
             "feeToken": "USDC",
         },
-    ]));
+    ]);
+    let fill = fills[0].clone();
+
+    let fill_count = if capped { 2_000 } else { 1 };
+    *state.user_fills_response.lock().await = Some(Value::Array(vec![fill; fill_count]));
     let addr = start_mock_server(state).await;
     let (mut client, _rx, cache) = create_test_execution_client(addr);
     add_test_account_to_cache(&cache, AccountId::from("HYPERLIQUID-001"));
@@ -11296,6 +12277,11 @@ async fn test_generate_mass_status_lookback_filters_only_fills() {
         mass.fill_reports().is_empty(),
         "old fills must be excluded from the lookback window",
     );
+    assert_eq!(
+        mass.lookback_start(),
+        Some(UnixNanos::from(mass.ts_init.as_u64() - 60_000_000_000)),
+    );
+    assert_eq!(mass.reports_complete(), !capped);
 
     client.disconnect().await.unwrap();
 }
@@ -11555,6 +12541,40 @@ async fn test_generate_mass_status_leaves_other_filled_shortfalls_unclamped(
     assert_eq!(report.filled_qty, Quantity::from(expected_filled));
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_generate_mass_status_uses_instruments_before_connect() {
+    let state = TestServerState::default();
+    *state.frontend_open_orders_response.lock().await = Some(json!([frontend_order("BTC", 101)]));
+    *state.user_fills_response.lock().await = Some(json!([user_fill("BTC", 101)]));
+    *state.perp_clearinghouse_response.lock().await = Some(clearinghouse_position("BTC"));
+    let addr = start_mock_server(state.clone()).await;
+    let (mut client, _rx, cache) = create_test_execution_client(addr);
+    add_test_perp_instrument_to_cache(&cache);
+    let instrument_id = InstrumentId::from(HYPERLIQUID_TEST_INSTRUMENT);
+    let instrument = cache.borrow().instrument(&instrument_id).unwrap().clone();
+    client.on_instrument(instrument);
+
+    let mass = client.generate_mass_status(None).await.unwrap().unwrap();
+    let orders = mass.order_reports();
+    let fills = mass.fill_reports();
+    let positions = mass.position_reports();
+    let venue_order_id = VenueOrderId::from("101");
+
+    assert!(!client.is_connected());
+    assert!(mass.reports_complete());
+    assert_eq!(orders.len(), 1);
+    assert_eq!(orders[&venue_order_id].instrument_id, instrument_id);
+    assert_eq!(fills.len(), 1);
+    assert_eq!(fills[&venue_order_id].len(), 1);
+    assert_eq!(fills[&venue_order_id][0].instrument_id, instrument_id);
+    assert_eq!(fills[&venue_order_id][0].last_px.precision, 2);
+    assert_eq!(fills[&venue_order_id][0].last_qty.precision, 5);
+    assert_eq!(positions.len(), 1);
+    assert_eq!(positions[&instrument_id].len(), 1);
+    assert_eq!(positions[&instrument_id][0].instrument_id, instrument_id);
+    assert_eq!(state.ws_connections.load(Ordering::Relaxed), 0);
+}
+
 #[rstest]
 #[case::unbounded(None)]
 #[case::bounded(Some(60u64))]
@@ -11637,6 +12657,7 @@ async fn test_generate_mass_status_marks_unusable_fill_row_incomplete() {
         !mass.reports_complete(),
         "an unresolvable fill row must mark the snapshot incomplete",
     );
+    assert_eq!(mass.lookback_start(), None);
 
     client.disconnect().await.unwrap();
 }
@@ -11699,6 +12720,7 @@ async fn test_generate_mass_status_preserves_valid_rows_when_rows_unusable() {
         !mass.reports_complete(),
         "an unresolvable row must mark the snapshot incomplete",
     );
+    assert_eq!(mass.lookback_start(), None);
 
     client.disconnect().await.unwrap();
 }
@@ -11732,6 +12754,7 @@ async fn test_generate_mass_status_marks_unusable_historical_row_incomplete() {
         !mass.reports_complete(),
         "an unresolvable historical row must mark the snapshot incomplete",
     );
+    assert_eq!(mass.lookback_start(), None);
 
     client.disconnect().await.unwrap();
 }
@@ -11811,6 +12834,7 @@ async fn test_generate_mass_status_marks_unusable_spot_balance_incomplete() {
         !mass.reports_complete(),
         "an empty snapshot with an unresolvable spot balance is incomplete, not authoritatively clean",
     );
+    assert_eq!(mass.lookback_start(), None);
 
     client.disconnect().await.unwrap();
 }
@@ -11905,7 +12929,7 @@ async fn test_get_account_address_uses_explicit_account_address(#[case] explicit
         .clone()
         .expect("clearinghouseState request must have been issued during connect");
     wait_until_async(
-        || async { subscriptions.lock().await.len() == 2 },
+        || async { subscriptions.lock().await.len() == 4 },
         Duration::from_secs(5),
     )
     .await;
@@ -11916,6 +12940,8 @@ async fn test_get_account_address_uses_explicit_account_address(#[case] explicit
         vec![
             json!({"type": "orderUpdates", "user": captured}),
             json!({"type": "userEvents", "user": captured}),
+            json!({"type": "clearinghouseState", "user": captured}),
+            json!({"type": "spotState", "user": captured, "isPortfolioMargin": false}),
         ],
     );
 
@@ -12156,20 +13182,23 @@ async fn test_command_venue_rejection_preserves_reason_once(
             }}})
         });
 
+        let mut expected_causes = Vec::new();
+
         match command {
             "submit" => client.submit_order(make_submit_cmd(&orders[0])).unwrap(),
-            "modify" => client
-                .modify_order(make_modify_cmd(
-                    &orders[0],
-                    Some(VenueOrderId::from("81234")),
-                ))
-                .unwrap(),
-            "cancel" => client
-                .cancel_order(make_cancel_entry(
+            "modify" => {
+                let command = make_modify_cmd(&orders[0], Some(VenueOrderId::from("81234")));
+                expected_causes.push(command.command_id);
+                client.modify_order(command).unwrap();
+            }
+            "cancel" => {
+                let command = make_cancel_entry(
                     orders[0].client_order_id(),
                     orders[0].venue_order_id().unwrap(),
-                ))
-                .unwrap(),
+                );
+                expected_causes.push(command.command_id);
+                client.cancel_order(command).unwrap();
+            }
             "list" => {
                 let order = &orders[0];
                 let list = OrderList::new(
@@ -12197,18 +13226,22 @@ async fn test_command_venue_rejection_preserves_reason_once(
             }
             "batch_cancel" => {
                 let order = &orders[0];
+
+                let cancels: Vec<_> = orders
+                    .iter()
+                    .map(|order| {
+                        make_cancel_entry(order.client_order_id(), order.venue_order_id().unwrap())
+                    })
+                    .collect();
+
+                expected_causes.extend(cancels.iter().map(|command| command.command_id));
                 client
                     .batch_cancel_orders(BatchCancelOrders::new(
                         order.trader_id(),
                         Some(*HYPERLIQUID_CLIENT_ID),
                         order.strategy_id(),
                         order.instrument_id(),
-                        orders
-                            .iter()
-                            .map(|o| {
-                                make_cancel_entry(o.client_order_id(), o.venue_order_id().unwrap())
-                            })
-                            .collect(),
+                        cancels,
                         UUID4::new(),
                         UnixNanos::default(),
                         None,
@@ -12216,12 +13249,11 @@ async fn test_command_venue_rejection_preserves_reason_once(
                     ))
                     .unwrap();
             }
-            "cancel_all" => client
-                .cancel_all_orders(make_cancel_all_cmd(
-                    HYPERLIQUID_TEST_INSTRUMENT,
-                    OrderSide::Buy,
-                ))
-                .unwrap(),
+            "cancel_all" => {
+                let command = make_cancel_all_cmd(HYPERLIQUID_TEST_INSTRUMENT, OrderSide::Buy);
+                expected_causes.extend(orders.iter().map(|_| command.command_id));
+                client.cancel_all_orders(command).unwrap();
+            }
             _ => unreachable!(),
         }
         wait_until_async(
@@ -12244,13 +13276,19 @@ async fn test_command_venue_rejection_preserves_reason_once(
                     OrderEventAny::ModifyRejected(rejected) if command == "modify" => {
                         assert_eq!(rejected.reason.as_str(), reason);
                         assert!(!rejected.reconciliation);
-                        assert_eq!(rejected.causation_id, None);
+                        assert_eq!(
+                            rejected.causation_id,
+                            expected_causes.get(outcomes.len()).copied()
+                        );
                         outcomes.push(OrderEventAny::ModifyRejected(rejected));
                     }
                     OrderEventAny::CancelRejected(rejected) if cancel => {
                         assert_eq!(rejected.reason.as_str(), reason);
                         assert!(!rejected.reconciliation);
-                        assert_eq!(rejected.causation_id, None);
+                        assert_eq!(
+                            rejected.causation_id,
+                            expected_causes.get(outcomes.len()).copied()
+                        );
                         outcomes.push(OrderEventAny::CancelRejected(rejected));
                     }
                     other => panic!("Unexpected event: {other:?}"),
@@ -12283,7 +13321,7 @@ async fn test_command_venue_rejection_preserves_reason_once(
 #[case("batch_cancel")]
 #[case("cancel_all")]
 #[tokio::test(flavor = "multi_thread")]
-async fn test_command_after_stop_emits_rejection(#[case] command: &str) {
+async fn test_command_after_stop_emits_denial(#[case] command: &str) {
     let state = TestServerState::default();
     let addr = start_mock_server(state.clone()).await;
     let (mut client, mut rx, cache) = create_test_execution_client(addr);
@@ -12326,10 +13364,21 @@ async fn test_command_after_stop_emits_rejection(#[case] command: &str) {
             .unwrap(),
         _ => unreachable!(),
     }
+
     let events = if command == "modify" {
-        drain_modify_rejected_events(&mut rx, Duration::from_millis(250)).await
+        drain_command_refusals(
+            &mut rx,
+            OrderEventType::ModifyDenied,
+            Duration::from_millis(250),
+        )
+        .await
     } else {
-        drain_cancel_rejected_events(&mut rx, Duration::from_millis(250)).await
+        drain_command_refusals(
+            &mut rx,
+            OrderEventType::CancelDenied,
+            Duration::from_millis(250),
+        )
+        .await
     };
     assert_eq!(
         events,
@@ -12349,7 +13398,7 @@ async fn test_command_after_stop_emits_rejection(#[case] command: &str) {
 
 #[rstest]
 #[tokio::test(flavor = "multi_thread")]
-async fn test_modify_order_missing_asset_emits_rejection() {
+async fn test_modify_order_missing_asset_emits_denial() {
     let state = TestServerState::default();
     let addr = start_mock_server(state.clone()).await;
     let (mut client, mut rx, cache) = create_test_execution_client(addr);
@@ -12367,7 +13416,12 @@ async fn test_modify_order_missing_asset_emits_rejection() {
     client
         .modify_order(make_modify_cmd(&order, Some(VenueOrderId::from("92345"))))
         .unwrap();
-    let events = drain_modify_rejected_events(&mut rx, Duration::from_millis(250)).await;
+    let events = drain_command_refusals(
+        &mut rx,
+        OrderEventType::ModifyDenied,
+        Duration::from_millis(250),
+    )
+    .await;
     assert_eq!(
         events,
         vec![(
@@ -12868,6 +13922,56 @@ async fn test_order_report_task_defers_cached_older_triggered_leg() {
     assert!(rx.try_recv().is_err());
     drop(requests);
     client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_report_task_uses_instruments_before_connect(#[values(false, true)] worker: bool) {
+    let state = TestServerState::default();
+    *state.user_fills_response.lock().await = Some(json!([user_fill("BTC", 101)]));
+    let addr = start_mock_server(state.clone()).await;
+    let (mut client, _rx, cache) = create_test_execution_client(addr);
+    add_test_perp_instrument_to_cache(&cache);
+    let instrument = cache
+        .borrow()
+        .instrument(&InstrumentId::from(HYPERLIQUID_TEST_INSTRUMENT))
+        .unwrap()
+        .clone();
+    client.on_instrument(instrument);
+
+    let command = GenerateFillReports::new(
+        UUID4::new(),
+        UnixNanos::default(),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    );
+
+    let reports = generate_fills(&client, command, worker).await.unwrap();
+
+    assert!(!client.is_connected());
+    assert_eq!(reports.len(), 1);
+    assert_eq!(
+        reports[0].instrument_id,
+        InstrumentId::from(HYPERLIQUID_TEST_INSTRUMENT)
+    );
+    assert_eq!(reports[0].venue_order_id, VenueOrderId::from("101"));
+    assert_eq!(reports[0].last_px, Price::from("100.00"));
+    assert_eq!(reports[0].last_px.precision, 2);
+    assert_eq!(reports[0].last_qty, Quantity::from("0.10000"));
+    assert_eq!(reports[0].last_qty.precision, 5);
+    assert_eq!(state.ws_connections.load(Ordering::Relaxed), 0);
+    let requests = state.info_requests.lock().await;
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|r| r["type"] == "allPerpMetas")
+            .count(),
+        0
+    );
 }
 
 #[rstest]

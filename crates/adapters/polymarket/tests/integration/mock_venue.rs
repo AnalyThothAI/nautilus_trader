@@ -30,7 +30,7 @@ use axum::{
     Router,
     body::Bytes,
     extract::{
-        Query, State,
+        Path, Query, State,
         ws::{Message, WebSocket, WebSocketUpgrade},
     },
     http::{HeaderMap, StatusCode, Uri},
@@ -41,8 +41,9 @@ use futures_util::StreamExt;
 use nautilus_common::testing::wait_until_async;
 use nautilus_network::http::HttpClient;
 use nautilus_polymarket::{
-    config::PolymarketExecutionClientConfig, http::models::PolymarketOrder,
-    signing::eip712::order_hash,
+    config::PolymarketExecutionClientConfig,
+    http::models::PolymarketOrder,
+    signing::eip712::{OrderSigningContext, order_hash_with_context},
 };
 use serde_json::{Value, json};
 
@@ -136,10 +137,14 @@ pub(super) struct TestServerState {
     pub(super) balance_queries: Arc<tokio::sync::Mutex<Vec<HashMap<String, String>>>>,
     pub(super) gamma_response: Arc<tokio::sync::Mutex<Option<Value>>>,
     pub(super) version_response: Arc<tokio::sync::Mutex<Value>>,
+    pub(super) market_responses: Arc<tokio::sync::Mutex<HashMap<String, (StatusCode, Value)>>>,
+    pub(super) market_queries: Arc<tokio::sync::Mutex<Vec<String>>>,
     pub(super) version_response_status: Arc<tokio::sync::Mutex<StatusCode>>,
     pub(super) startup_request_paths: Arc<tokio::sync::Mutex<Vec<String>>>,
     pub(super) balance_response_status: Arc<tokio::sync::Mutex<StatusCode>>,
+    pub(super) balance_update_status: Arc<tokio::sync::Mutex<StatusCode>>,
     pub(super) balance_response: Arc<tokio::sync::Mutex<Value>>,
+    pub(super) balance_response_gate: Arc<RequestGate>,
     pub(super) order_response: Arc<tokio::sync::Mutex<Option<Value>>>,
     pub(super) order_response_status: Arc<tokio::sync::Mutex<StatusCode>>,
     pub(super) order_response_headers: Arc<tokio::sync::Mutex<HeaderMap>>,
@@ -148,6 +153,7 @@ pub(super) struct TestServerState {
     /// reverting to the configured `order_response_status`. Used by retry tests.
     pub(super) order_post_500_remaining: Arc<tokio::sync::Mutex<usize>>,
     pub(super) order_response_uses_request_hash: Arc<AtomicBool>,
+    pub(super) order_market_versions: Arc<tokio::sync::Mutex<HashMap<String, String>>>,
     pub(super) batch_order_response: Arc<tokio::sync::Mutex<Option<Value>>>,
     pub(super) batch_order_response_status: Arc<tokio::sync::Mutex<StatusCode>>,
     pub(super) batch_order_post_count: Arc<tokio::sync::Mutex<usize>>,
@@ -208,6 +214,8 @@ impl Default for TestServerState {
         let (user_frames, _) = tokio::sync::broadcast::channel(32);
 
         Self {
+            market_responses: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            market_queries: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             last_body: Arc::new(tokio::sync::Mutex::new(None)),
             last_headers: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             last_path: Arc::new(tokio::sync::Mutex::new(String::new())),
@@ -221,6 +229,8 @@ impl Default for TestServerState {
             version_response_status: Arc::new(tokio::sync::Mutex::new(StatusCode::OK)),
             startup_request_paths: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             balance_response_status: Arc::new(tokio::sync::Mutex::new(StatusCode::OK)),
+            balance_update_status: Arc::new(tokio::sync::Mutex::new(StatusCode::OK)),
+            balance_response_gate: Arc::new(RequestGate::default()),
             balance_response: Arc::new(tokio::sync::Mutex::new(load_json(
                 "http_balance_allowance_collateral.json",
             ))),
@@ -230,6 +240,7 @@ impl Default for TestServerState {
             order_post_count: Arc::new(tokio::sync::Mutex::new(0)),
             order_post_500_remaining: Arc::new(tokio::sync::Mutex::new(0)),
             order_response_uses_request_hash: Arc::new(AtomicBool::new(false)),
+            order_market_versions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             batch_order_response: Arc::new(tokio::sync::Mutex::new(None)),
             batch_order_response_status: Arc::new(tokio::sync::Mutex::new(StatusCode::OK)),
             batch_order_post_count: Arc::new(tokio::sync::Mutex::new(0)),
@@ -441,6 +452,7 @@ async fn handle_get_balance(
     headers: HeaderMap,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
+    let status = *state.balance_response_status.lock().await;
     state.balance_queries.lock().await.push(query);
     *state.last_path.lock().await = uri.path().to_string();
     state
@@ -452,9 +464,24 @@ async fn handle_get_balance(
         .iter()
         .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string()))
         .collect();
-    let status = *state.balance_response_status.lock().await;
     let response = state.balance_response.lock().await.clone();
+    state.balance_response_gate.wait().await;
     (status, Json(response)).into_response()
+}
+
+async fn handle_update_balance(
+    State(state): State<TestServerState>,
+    uri: Uri,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    let status = *state.balance_update_status.lock().await;
+    state.balance_queries.lock().await.push(query);
+    state
+        .startup_request_paths
+        .lock()
+        .await
+        .push(uri.path().to_string());
+    (status, Json(json!({}))).into_response()
 }
 
 async fn handle_get_version(State(state): State<TestServerState>, uri: Uri) -> Response {
@@ -519,9 +546,14 @@ async fn handle_post_order(
                 .expect("order request body"),
         )
         .expect("valid signed order");
+        let versions = state.order_market_versions.lock().await;
+        let version = versions
+            .get(signed_order.token_id.as_str())
+            .map_or("v1", String::as_str);
+        let context = OrderSigningContext::new(Some(version), false).unwrap();
         body["orderID"] = Value::String(format!(
             "{:#x}",
-            order_hash(&signed_order, false).expect("valid order hash")
+            order_hash_with_context(&signed_order, context).expect("valid order hash")
         ));
     }
 
@@ -898,6 +930,26 @@ async fn handle_get_positions(State(state): State<TestServerState>) -> impl Into
     }))
 }
 
+async fn handle_get_market(
+    State(state): State<TestServerState>,
+    Path(condition_id): Path<String>,
+) -> Response {
+    state.market_queries.lock().await.push(condition_id.clone());
+    if let Some((status, market)) = state
+        .market_responses
+        .lock()
+        .await
+        .get(&condition_id)
+        .cloned()
+    {
+        return (status, Json(market)).into_response();
+    }
+
+    let mut market = load_json("clob_market_response.json");
+    market["condition_id"] = json!(condition_id);
+    Json(market).into_response()
+}
+
 fn create_test_router(state: TestServerState) -> Router {
     Router::new()
         .route("/data/orders", get(handle_get_orders))
@@ -905,6 +957,7 @@ fn create_test_router(state: TestServerState) -> Router {
         .route("/data/trades", get(handle_get_trades))
         .route("/version", get(handle_get_version))
         .route("/balance-allowance", get(handle_get_balance))
+        .route("/balance-allowance/update", get(handle_update_balance))
         .route(
             "/order",
             post(handle_post_order).delete(handle_delete_order),
@@ -916,6 +969,7 @@ fn create_test_router(state: TestServerState) -> Router {
         .route("/cancel-all", delete(handle_cancel_all))
         .route("/cancel-market-orders", delete(handle_cancel_market_orders))
         .route("/markets", get(handle_gamma_markets))
+        .route("/markets/{condition_id}", get(handle_get_market))
         .route("/markets/keyset", get(handle_gamma_markets_keyset))
         .route("/book", get(handle_get_book))
         .route("/fee-rate", get(handle_get_fee_rate))

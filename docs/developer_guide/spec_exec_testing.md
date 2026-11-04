@@ -967,7 +967,7 @@ Test order modification (amend) and cancel-replace workflows.
 | TC-E33 | Cancel-replace limit SELL | Cancel and resubmit limit sell at new price.   | Never.                   |
 | TC-E34 | Modify stop trigger price | Amend stop order trigger price.                | No modify or no stop.    |
 | TC-E35 | Cancel-replace stop order | Cancel and resubmit stop at new trigger price. | No stop orders.          |
-| TC-E36 | Modify rejected           | Modify on unsupported adapter.                 | Adapter supports modify. |
+| TC-E36 | Unsupported modify denied | Modify on unsupported adapter.                 | Adapter supports modify. |
 
 `trigger_limit_order_maintenance_once=True` requires exactly one of the limit-order modify or
 cancel-replace modes and at least one enabled limit side. It is incompatible with bracket entries,
@@ -1224,6 +1224,9 @@ ExecTesterConfig::builder()
 - This is the required path for venues that do not support native trigger-order replace.
 - After the new stop is accepted, restart or force reconciliation and verify exactly one
   current trigger order remains.
+- ExecTester keeps replacements pending after reconciliation-generated cancellations and logs an error.
+  Mark the case inconclusive, then check and cancel any remaining test orders at the venue;
+  the original stop may still be working.
 
 **Python config**:
 
@@ -1252,20 +1255,20 @@ ExecTesterConfig::builder()
     .build()?
 ```
 
-### TC-E36: Modify rejected
+### TC-E36: Unsupported modify denied
 
-| Field              | Value                                                                                                |
-| ------------------ | ---------------------------------------------------------------------------------------------------- |
-| **Prerequisite**   | Open limit order, adapter does NOT support modify.                                                   |
-| **Action**         | Attempt to modify the order (programmatically, not via ExecTester auto-maintain).                    |
-| **Event sequence** | `OrderModifyRejected`.                                                                               |
-| **Pass criteria**  | Modify attempt results in `OrderModifyRejected` event with reason. Original order remains unchanged. |
-| **Skip when**      | Adapter supports order modification.                                                                 |
+| Field              | Value                                                                                                           |
+| ------------------ | --------------------------------------------------------------------------------------------------------------- |
+| **Prerequisite**   | Open limit order, adapter does NOT support modify.                                                              |
+| **Action**         | Attempt to modify the order (programmatically, not via ExecTester auto-maintain).                               |
+| **Event sequence** | `OrderModifyDenied`.                                                                                            |
+| **Pass criteria**  | Modify attempt results in `OrderModifyDenied` with the command ID and reason. Original order remains unchanged. |
+| **Skip when**      | Adapter supports order modification.                                                                            |
 
 **Considerations**:
 
-- This tests the adapter's rejection path, not the ExecTester's cancel-replace logic.
-- The rejection reason should indicate that modification is not supported.
+- This tests the adapter's local denial path, not the ExecTester's cancel-replace logic.
+- The denial reason should indicate that modification is not supported.
 
 ---
 
@@ -1273,13 +1276,13 @@ ExecTesterConfig::builder()
 
 Test order cancellation workflows.
 
-| TC     | Name                       | Description                                       | Skip when        |
-| ------ | -------------------------- | ------------------------------------------------- | ---------------- |
-| TC-E40 | Cancel single limit order  | Cancel an open limit order.                       | Never.           |
-| TC-E41 | Cancel all on stop         | Strategy stop cancels all open orders (default).  | Never.           |
-| TC-E42 | Individual cancels on stop | Cancel orders one-by-one on stop.                 | Never.           |
-| TC-E43 | Batch cancel on stop       | Cancel orders via batch API on stop.              | No batch cancel. |
-| TC-E44 | Cancel already-canceled    | Verify documented rejection or idempotent result. | Never.           |
+| TC     | Name                       | Description                                                | Skip when        |
+| ------ | -------------------------- | ---------------------------------------------------------- | ---------------- |
+| TC-E40 | Cancel single limit order  | Cancel an open limit order.                                | Never.           |
+| TC-E41 | Cancel all on stop         | Strategy stop cancels all open orders (default).           | Never.           |
+| TC-E42 | Individual cancels on stop | Cancel orders one-by-one on stop.                          | Never.           |
+| TC-E43 | Batch cancel on stop       | Cancel orders via batch API on stop.                       | No batch cancel. |
+| TC-E44 | Cancel already-canceled    | Verify documented denial, rejection, or idempotent result. | Never.           |
 
 ### TC-E40: Cancel single limit order
 
@@ -1450,18 +1453,18 @@ ExecTesterConfig::builder()
 
 ### TC-E44: Cancel already-canceled order
 
-| Field              | Value                                                                                 |
-| ------------------ | ------------------------------------------------------------------------------------- |
-| **Prerequisite**   | A previously canceled order (from TC-E40).                                            |
-| **Action**         | Attempt to cancel the same order again.                                               |
-| **Event sequence** | `OrderCancelRejected` by default, or no new event for a documented idempotent result. |
-| **Pass criteria**  | Result matches the adapter contract without a duplicate terminal event.               |
-| **Skip when**      | Never.                                                                                |
+| Field              | Value                                                                                                 |
+| ------------------ | ----------------------------------------------------------------------------------------------------- |
+| **Prerequisite**   | A previously canceled order (from TC-E40).                                                            |
+| **Action**         | Attempt to cancel the same order again.                                                               |
+| **Event sequence** | `OrderCancelDenied` locally, `OrderCancelRejected` from the venue, or a documented idempotent result. |
+| **Pass criteria**  | Result matches the adapter contract without a duplicate terminal event.                               |
+| **Skip when**      | Never.                                                                                                |
 
 **Considerations**:
 
 - The default contract tests the adapter's error handling for invalid cancel requests. The
-  rejection reason should indicate the order is not in a cancelable state.
+  denial or rejection reason should indicate the order is not in a cancelable state.
 - `Strategy.cancel_order` and the order manager drop cancels for locally closed orders, so
   `ExecTester` cannot reach the adapter after TC-E40. A second `cancel_order` that never
   leaves the process is inconclusive.
@@ -1475,12 +1478,17 @@ ExecTesterConfig::builder()
 
 Test bracket order submission (entry + take-profit + stop-loss).
 
-| TC     | Name                         | Description                                     | Skip when           |
-| ------ | ---------------------------- | ----------------------------------------------- | ------------------- |
-| TC-E50 | Bracket BUY                  | Entry limit buy + TP limit sell + SL stop sell. | No bracket support. |
-| TC-E51 | Bracket SELL                 | Entry limit sell + TP limit buy + SL stop buy.  | No bracket support. |
-| TC-E52 | Bracket entry fill activates | Verify TP/SL become active after entry fill.    | No bracket support. |
-| TC-E53 | Bracket with post-only entry | Entry order uses post-only flag.                | No bracket or PO.   |
+`ExecTester` defaults to `OUO` exits and a `LIMIT` take-profit. For adapters that require native OCO
+exits with a conditional take-profit, set `bracket_contingency_type` to `OCO` and
+`bracket_tp_order_type` to `MARKET_IF_TOUCHED` or `LIMIT_IF_TOUCHED`, as supported by the adapter.
+For Lighter, use `OCO` and `MARKET_IF_TOUCHED`; see [contingent orders](../integrations/lighter.md#contingent-orders).
+
+| TC     | Name                         | Description                                  | Skip when           |
+| ------ | ---------------------------- | -------------------------------------------- | ------------------- |
+| TC-E50 | Bracket BUY                  | Entry limit buy + TP sell + SL stop sell.    | No bracket support. |
+| TC-E51 | Bracket SELL                 | Entry limit sell + TP buy + SL stop buy.     | No bracket support. |
+| TC-E52 | Bracket entry fill activates | Verify TP/SL become active after entry fill. | No bracket support. |
+| TC-E53 | Bracket with post-only entry | Entry order uses post-only flag.             | No bracket or PO.   |
 
 ### TC-E50: Bracket BUY
 
@@ -1552,13 +1560,16 @@ ExecTesterConfig::builder()
 
 ### TC-E53: Bracket with post-only entry
 
-| Field              | Value                                                                   |
-| ------------------ | ----------------------------------------------------------------------- |
-| **Prerequisite**   | Adapter supports brackets and post-only.                                |
-| **Action**         | Submit bracket with `use_post_only=True` (applied to entry and TP).     |
-| **Event sequence** | Same as TC-E50 with post-only flag on entry.                            |
-| **Pass criteria**  | Entry and TP orders accepted as post-only (maker). SL is not post-only. |
-| **Skip when**      | No bracket support or no post-only support.                             |
+| Field              | Value                                        |
+| ------------------ | -------------------------------------------- |
+| **Prerequisite**   | Adapter supports brackets and post-only.     |
+| **Action**         | Submit bracket with `use_post_only=True`.    |
+| **Event sequence** | Same as TC-E50 with post-only flag on entry. |
+| **Pass criteria**  | Entry order accepted as post-only (maker).   |
+| **Skip when**      | No bracket support or no post-only support.  |
+
+`LIMIT` and `LIMIT_IF_TOUCHED` take-profits are also post-only. Stop-loss and `MARKET_IF_TOUCHED`
+take-profit orders are not post-only.
 
 ---
 
@@ -1735,27 +1746,28 @@ WebSocket boundary rather than a live venue.
 These cases prove that adapter request failures do not turn into terminal rejection events when the venue
 outcome is unknown. The pass criteria also define an exception for local prepare failures. The command must be
 known not to have been sent. The failure must be attributable to one cancel or modify command. If both
-conditions hold, the adapter can emit the matching rejection event.
+conditions hold, the adapter emits the matching denied event with the command ID.
 
 **Pass criteria**:
 
 - Submit failures from transport errors, timeouts, WebSocket send failures, retry exhaustion, or
   response parse failures do not emit `OrderRejected`.
-- Cancel failures from transport errors, timeouts, WebSocket send failures, retry exhaustion, or
-  whole-request server failures do not emit `OrderCancelRejected`.
-- Modify failures from transport errors, timeouts, WebSocket send failures, retry exhaustion, or
-  whole-request server failures do not emit `OrderModifyRejected`.
-- Local cancel prepare failures that prove the command cannot be sent may emit
-  `OrderCancelRejected` when the adapter can attribute the failure to one cancel command.
-- Local modify prepare failures that prove the command cannot be sent may emit
-  `OrderModifyRejected` when the adapter can attribute the failure to one modify command.
-- Whole-batch request failures do not emit one rejection per order when the venue did not return
-  per-order results.
+- When the venue outcome is unknown, cancel failures from transport errors, timeouts, WebSocket send
+  failures, retry exhaustion, or whole-request server failures emit neither `OrderCancelDenied` nor
+  `OrderCancelRejected`.
+- When the venue outcome is unknown, modify failures from transport errors, timeouts, WebSocket send
+  failures, retry exhaustion, or whole-request server failures emit neither `OrderModifyDenied` nor
+  `OrderModifyRejected`.
+- Local cancel prepare failures that prove the command cannot be sent emit
+  `OrderCancelDenied` with the attributable cancel command ID.
+- Local modify prepare failures that prove the command cannot be sent emit
+  `OrderModifyDenied` with the attributable modify command ID.
+- Whole-batch failures with unknown per-order outcomes emit neither denied nor rejected events.
 - Explicit per-order venue rejections still emit the matching rejection event with the venue
   reason.
 
-The order remains in the appropriate in-flight state until a venue update, query result, or
-reconciliation pass resolves it.
+After an ambiguous outcome, the order remains in the appropriate in-flight state until a venue
+update, query result, or reconciliation pass resolves it.
 
 ### TC-E70: PostOnly rejection
 
@@ -2095,13 +2107,13 @@ ExecTesterConfig::builder()
 
 ### TC-E89: WebSocket commission failure
 
-| Field              | Value                                                                                                                |
-| ------------------ | -------------------------------------------------------------------------------------------------------------------- |
-| **Prerequisite**   | A private fill fixture produces an out-of-range commission and has a stable venue trade ID.                          |
-| **Action**         | Deliver the invalid trade, replace its commission with a valid value, then redeliver the same trade ID.              |
-| **Event sequence** | The first delivery emits no fill and changes no fill, terminal, or deduplication state. The replay emits one fill.   |
-| **Pass criteria**  | No panic or fallback occurs. The valid replay applies exactly once. REST reconciliation can recover a missed replay. |
-| **Skip when**      | The adapter has no private fill stream or does not calculate commission for private fills.                           |
+| Field              | Value                                                                                                                     |
+| ------------------ | ------------------------------------------------------------------------------------------------------------------------- |
+| **Prerequisite**   | A private fill fixture produces an out-of-range commission and has a stable venue trade ID.                               |
+| **Action**         | Deliver the invalid trade, repair its commission, then replay the same trade ID. For Polymarket, use the exception below. |
+| **Event sequence** | The first delivery emits no fill and changes no fill, terminal, or deduplication state. The replay emits one fill.        |
+| **Pass criteria**  | No panic or fallback occurs. The valid replay applies exactly once. REST reconciliation can recover a missed replay.      |
+| **Skip when**      | The adapter has no private fill stream or does not calculate commission for private fills.                                |
 
 **Considerations**:
 
@@ -2110,6 +2122,26 @@ ExecTesterConfig::builder()
 - Assert that the adapter consumes the deduplication key only after all reports construct and route
   successfully.
 - Assert that a failed trade does not confirm or terminalize its order.
+
+**Polymarket exception**:
+
+Invalid commission evidence quarantines the whole trade for targeted REST resolution. The failed
+delivery emits no fill, applies no owned leg, and does not confirm or terminalize the order. Quarantine
+state persists across repaired WebSocket replays with the same trade ID, including `CONFIRMED` updates.
+The default WebSocket replay recovery, unchanged deduplication state, and REST reconciliation fallback
+requirements above do not apply to Polymarket, including the deduplication-key consideration.
+Targeted terminal REST evidence supplies recovery.
+
+After repairing the commission inputs, verify that:
+
+1. A same-ID WebSocket replay emits no fill and leaves the trade quarantined.
+1. A targeted non-terminal REST result emits no fill and leaves the trade quarantined.
+1. A valid targeted REST `CONFIRMED` result emits the exact fill quantity, price, and commission once.
+1. Repeated REST evidence emits no duplicate, both before and after the engine applies the fill.
+
+Use distinct REST fill values to prove that recovery uses REST evidence. For terminal `FAILED`
+evidence, verify that no previously unemitted fill appears. See
+[Polymarket settlement resolution](../integrations/polymarket.md#failed-trades-and-rest-resolution).
 
 ---
 
@@ -2331,6 +2363,8 @@ The Rust builder uses equivalent defaults.
 | `enable_brackets`                               | `bool`                | `False`                | 6              |
 | `batch_submit_limit_pair`                       | `bool`                | `False`                | 2, 5           |
 | `bracket_entry_order_type`                      | `OrderType`           | `LIMIT`                | 6              |
+| `bracket_contingency_type`                      | `ContingencyType`     | `OUO`                  | 6              |
+| `bracket_tp_order_type`                         | `OrderType`           | `LIMIT`                | 6              |
 | `bracket_offset_ticks`                          | `PositiveInt`         | `500`                  | 6              |
 | `modify_orders_to_maintain_tob_offset`          | `bool`                | `False`                | 4              |
 | `modify_stop_orders_to_maintain_offset`         | `bool`                | `False`                | 4              |

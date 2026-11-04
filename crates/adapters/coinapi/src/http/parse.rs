@@ -81,7 +81,7 @@ pub fn parse_instruments(
     let mut errors = Vec::new();
 
     for symbol in symbols {
-        if CoinApiSymbolType::from_str(&symbol.symbol_type).is_err() {
+        if CoinApiSymbolType::from_str(symbol.symbol_type.as_ref()).is_err() {
             continue;
         }
 
@@ -140,7 +140,7 @@ pub fn parse_instrument(
         Ok(value)
     };
 
-    let symbol_type = CoinApiSymbolType::from_str(&symbol.symbol_type).map_err(|_| {
+    let symbol_type = CoinApiSymbolType::from_str(symbol.symbol_type.as_ref()).map_err(|_| {
         field(
             "symbol_type",
             &format!("unsupported {}", symbol.symbol_type),
@@ -177,10 +177,15 @@ pub fn parse_instrument(
         .map_err(|source| InstrumentError::Symbol { symbol_id, source })?;
 
     let price_increment = decimal(symbol.price_precision)
-        .and_then(|value| Price::from_decimal(value).map_err(|e| e.to_string()))
+        .and_then(|value| {
+            Price::from_decimal_dp(value, value.scale() as u8).map_err(|e| e.to_string())
+        })
         .map_err(|reason| field("price_precision", &reason))?;
+
     let size_increment = decimal(symbol.size_precision)
-        .and_then(|value| Quantity::from_decimal(value).map_err(|e| e.to_string()))
+        .and_then(|value| {
+            Quantity::from_decimal_dp(value, value.scale() as u8).map_err(|e| e.to_string())
+        })
         .map_err(|reason| field("size_precision", &reason))?;
 
     let instrument_id = native.instrument_id;
@@ -426,8 +431,9 @@ fn perpetual_asset_class(symbol: &Symbol) -> Result<Option<AssetClass>, (&'stati
 }
 
 fn multiplier(symbol: &Symbol) -> Result<Quantity, String> {
-    decimal(symbol.future_contract_unit)
-        .and_then(|value| Quantity::from_decimal(value).map_err(|e| e.to_string()))
+    decimal(symbol.future_contract_unit).and_then(|value| {
+        Quantity::from_decimal_dp(value, value.scale() as u8).map_err(|e| e.to_string())
+    })
 }
 
 // CoinAPI pads resolutions with trailing zeros beyond the domain precision limit

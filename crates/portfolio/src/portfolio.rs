@@ -44,7 +44,7 @@ use nautilus_model::{
     identifiers::{AccountId, InstrumentId, PositionId, Venue},
     instruments::{Instrument, InstrumentAny},
     orders::{Order, OrderAny},
-    position::Position,
+    position::{Position, PositionReplayEvent},
     types::{AccountBalance, Currency, MarginBalance, Money, Price},
 };
 use rust_decimal::Decimal;
@@ -63,9 +63,9 @@ struct PortfolioState {
     analyzer: PortfolioAnalyzer,
     unrealized_pnls: IndexMap<InstrumentId, Money>,
     realized_pnls: IndexMap<InstrumentId, Money>,
-    recorded_closed_position_cycles: AHashSet<(PositionId, UnixNanos)>,
+    recorded_closed_position_cycles: AHashSet<(PositionId, UnixNanos, Option<[u8; 16]>)>,
     snapshot_sum_per_position: AHashMap<PositionId, Money>,
-    snapshot_last_per_position: AHashMap<PositionId, Money>,
+    snapshot_last_per_position: AHashMap<PositionId, LastSnapshotFrame>,
     snapshot_currency_mismatches: AHashSet<PositionId>,
     snapshot_aggregation_overflows: AHashSet<PositionId>,
     snapshot_processed_counts: AHashMap<PositionId, usize>,
@@ -89,6 +89,39 @@ struct PortfolioState {
     portfolio_snapshots: AHashMap<AccountId, VecDeque<PortfolioSnapshot>>,
     pre_position_fill_events: AHashSet<UUID4>,
     balance_error: Option<String>,
+}
+
+struct LastSnapshotFrame {
+    realized_pnl: Money,
+    fill_ids: AHashSet<UUID4>,
+}
+
+impl LastSnapshotFrame {
+    fn new(snapshot: &Position, realized_pnl: Money) -> Self {
+        Self {
+            realized_pnl,
+            fill_ids: snapshot.events.iter().map(|fill| fill.event_id).collect(),
+        }
+    }
+
+    fn duplicates_closed_cycle(&self, position: &Position) -> bool {
+        if position.is_open() || position.realized_pnl != Some(self.realized_pnl) {
+            return false;
+        }
+
+        if position.events.is_empty() {
+            // Replay retains the cycle's fill IDs after every effective fill has been voided
+            self.fill_ids.is_empty()
+                || position.replay_events.iter().any(|event| {
+                    matches!(event, PositionReplayEvent::Filled(fill) if self.fill_ids.contains(&fill.event_id))
+                })
+        } else {
+            position
+                .events
+                .iter()
+                .any(|fill| self.fill_ids.contains(&fill.event_id))
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -317,17 +350,18 @@ impl Portfolio {
 
         let update_order_handler = {
             let cache = Rc::clone(cache);
+            let clock = Rc::clone(clock);
             let inner = WeakCell::clone(&inner_weak);
             TypedHandler::from(move |event: &OrderEventAny| {
                 if let Some(inner_rc) = inner.upgrade() {
                     let inner_rc: Rc<RefCell<PortfolioState>> = inner_rc.into();
-                    on_order_event(&cache, &inner_rc, event);
+                    on_order_event(&cache, &clock, &inner_rc, config, event);
                 }
             })
         };
 
         let endpoint = MessagingSwitchboard::portfolio_update_account();
-        msgbus::register_account_state_endpoint(endpoint, update_account_handler.clone());
+        msgbus::register_account_state_endpoint(endpoint, update_account_handler);
 
         let update_order_endpoint_handler = {
             let cache = Rc::clone(cache);
@@ -369,11 +403,6 @@ impl Portfolio {
         msgbus::subscribe_position_events(
             "events.position.*".into(),
             update_position_handler,
-            Some(10),
-        );
-        msgbus::subscribe_account_state(
-            "events.account.*".into(),
-            update_account_handler,
             Some(10),
         );
     }
@@ -2617,12 +2646,12 @@ impl Portfolio {
                     .position_snapshots(Some(position_id), None);
 
                 let mut sum_pnl: Option<Money> = None;
-                let mut last_pnl: Option<Money> = None;
+                let mut last_frame: Option<(&Position, Money)> = None;
                 let mut snapshot_account_id: Option<AccountId> = None;
                 let mut currency_mismatch = false;
                 let mut aggregation_overflow = false;
 
-                for snapshot in snapshots {
+                for snapshot in &snapshots {
                     snapshot_account_id.get_or_insert(snapshot.account_id);
                     if let Some(realized_pnl) = snapshot.realized_pnl {
                         if let Some(sum) = sum_pnl {
@@ -2638,7 +2667,8 @@ impl Portfolio {
                         } else {
                             sum_pnl = Some(realized_pnl);
                         }
-                        last_pnl = Some(realized_pnl);
+
+                        last_frame = Some((snapshot, realized_pnl));
                     }
                 }
 
@@ -2646,9 +2676,10 @@ impl Portfolio {
 
                 if !aggregation_overflow && let Some(sum) = sum_pnl {
                     inner.snapshot_sum_per_position.insert(*position_id, sum);
-
-                    if let Some(last) = last_pnl {
-                        inner.snapshot_last_per_position.insert(*position_id, last);
+                    if let Some((snapshot, last_pnl)) = last_frame {
+                        inner
+                            .snapshot_last_per_position
+                            .insert(*position_id, LastSnapshotFrame::new(snapshot, last_pnl));
                     }
                 } else {
                     inner.snapshot_sum_per_position.remove(position_id);
@@ -2711,12 +2742,7 @@ impl Portfolio {
                     .snapshot_sum_per_position
                     .get(position_id)
                     .copied();
-                let mut last_pnl = self
-                    .inner
-                    .borrow()
-                    .snapshot_last_per_position
-                    .get(position_id)
-                    .copied();
+                let mut last_frame: Option<(&Position, Money)> = None;
                 let mut snapshot_account_id: Option<AccountId> = None;
                 let mut currency_mismatch = self
                     .inner
@@ -2734,7 +2760,7 @@ impl Portfolio {
                     .borrow()
                     .position_snapshots_from(position_id, prev_count);
 
-                for snapshot in new_snapshots {
+                for snapshot in &new_snapshots {
                     snapshot_account_id.get_or_insert(snapshot.account_id);
                     if let Some(realized_pnl) = snapshot.realized_pnl {
                         if let Some(sum) = sum_pnl {
@@ -2750,7 +2776,8 @@ impl Portfolio {
                         } else {
                             sum_pnl = Some(realized_pnl);
                         }
-                        last_pnl = Some(realized_pnl);
+
+                        last_frame = Some((snapshot, realized_pnl));
                     }
                 }
 
@@ -2758,9 +2785,10 @@ impl Portfolio {
 
                 if !aggregation_overflow && let Some(sum) = sum_pnl {
                     inner.snapshot_sum_per_position.insert(*position_id, sum);
-
-                    if let Some(last) = last_pnl {
-                        inner.snapshot_last_per_position.insert(*position_id, last);
+                    if let Some((snapshot, last_pnl)) = last_frame {
+                        inner
+                            .snapshot_last_per_position
+                            .insert(*position_id, LastSnapshotFrame::new(snapshot, last_pnl));
                     }
                 }
 
@@ -2884,7 +2912,6 @@ impl Portfolio {
                     inner
                         .snapshot_sum_per_position
                         .get(position_id)
-                        .or_else(|| inner.snapshot_last_per_position.get(position_id))
                         .map(|pnl| pnl.currency)
                 })
             })
@@ -2916,31 +2943,29 @@ impl Portfolio {
 
                 // A closed position whose final cycle was snapshotted carries that cycle both in
                 // its last frame and in its own realized PnL, which the loop below adds; drop
-                // the frame here so the cycle lands once.
+                // the frame here so the cycle lands once, matching fills as well as PnL since an
+                // earlier cycle can realize the same amount.
                 let sum_pnl = if let Some(sum_pnl) = sum_pnl {
-                    let closed_position_pnl = position
-                        .filter(|position| !position.is_open())
-                        .and_then(|position| position.realized_pnl);
-                    let last_pnl = self
-                        .inner
-                        .borrow()
-                        .snapshot_last_per_position
-                        .get(position_id)
-                        .copied();
+                    let last_pnl = position.and_then(|position| {
+                        self.inner
+                            .borrow()
+                            .snapshot_last_per_position
+                            .get(position_id)
+                            .filter(|last| last.duplicates_closed_cycle(position))
+                            .map(|last| last.realized_pnl)
+                    });
 
-                    Some(match (closed_position_pnl, last_pnl) {
-                        (Some(realized_pnl), Some(last_pnl)) if last_pnl == realized_pnl => {
-                            match sum_pnl.checked_sub(last_pnl) {
-                                Some(remaining) => remaining,
-                                None => {
-                                    log::error!(
-                                        "Cannot calculate realized PnL: snapshot adjustment exceeds Money bounds"
-                                    );
-                                    return None;
-                                }
+                    Some(match last_pnl {
+                        Some(last_pnl) => match sum_pnl.checked_sub(last_pnl) {
+                            Some(remaining) => remaining,
+                            None => {
+                                log::error!(
+                                    "Cannot calculate realized PnL: snapshot adjustment exceeds Money bounds"
+                                );
+                                return None;
                             }
-                        }
-                        _ => sum_pnl,
+                        },
+                        None => sum_pnl,
                     })
                 } else {
                     None
@@ -3667,7 +3692,9 @@ fn update_order(
             | OrderEventAny::Triggered(_)
             | OrderEventAny::PendingUpdate(_)
             | OrderEventAny::PendingCancel(_)
+            | OrderEventAny::ModifyDenied(_)
             | OrderEventAny::ModifyRejected(_)
+            | OrderEventAny::CancelDenied(_)
             | OrderEventAny::CancelRejected(_)
             | OrderEventAny::Updated(_)
             | OrderEventAny::Filled(_)
@@ -3898,7 +3925,7 @@ fn update_order(
 
     if let Some(account_state) = account_state {
         if publish_account_state {
-            record_and_publish_account_state(inner, &account_state);
+            update_account(clock, cache, inner, config, &account_state);
         }
     } else {
         log::debug!("Added pending calculation for {}", instrument.id());
@@ -3916,7 +3943,9 @@ fn take_or_clone_account(cache: &Rc<RefCell<Cache>>, account_id: AccountId) -> O
 
 fn on_order_event(
     cache: &Rc<RefCell<Cache>>,
+    clock: &Rc<RefCell<dyn Clock>>,
     inner: &Rc<RefCell<PortfolioState>>,
+    config: PortfolioConfig,
     event: &OrderEventAny,
 ) {
     if let OrderEventAny::Filled(order_filled) = event {
@@ -3947,7 +3976,9 @@ fn on_order_event(
         | OrderEventAny::Triggered(_)
         | OrderEventAny::PendingUpdate(_)
         | OrderEventAny::PendingCancel(_)
+        | OrderEventAny::ModifyDenied(_)
         | OrderEventAny::ModifyRejected(_)
+        | OrderEventAny::CancelDenied(_)
         | OrderEventAny::CancelRejected(_)
         | OrderEventAny::FillVoided(_)
             if is_wallet => {}
@@ -3960,7 +3991,7 @@ fn on_order_event(
         .and_then(|account| account.last_event());
 
     if let Some(account_state) = account_state {
-        record_and_publish_account_state(inner, &account_state);
+        update_account(clock, cache, inner, config, &account_state);
     }
 }
 
@@ -4088,21 +4119,9 @@ fn update_position(
                 .is_some_and(|event_id| *event_id == account_state.event_id);
 
         if !already_published {
-            record_and_publish_account_state(inner, &account_state);
+            update_account(clock, cache, inner, config, &account_state);
         }
     }
-}
-
-fn record_and_publish_account_state(
-    inner: &Rc<RefCell<PortfolioState>>,
-    account_state: &AccountState,
-) {
-    let account_id = account_state.account_id;
-    inner
-        .borrow_mut()
-        .last_published_account_states
-        .insert(account_id, account_state.event_id);
-    msgbus::publish_account_state(format!("events.account.{account_id}").into(), account_state);
 }
 
 /// Recalculates the margin account for `instrument_id` from the currently open positions.
@@ -4181,6 +4200,38 @@ fn record_closed_position_pnl(
         return;
     };
 
+    let cycle_key = (position.id, position.ts_opened, None);
+    let mut inner_ref = inner.borrow_mut();
+
+    if !position.is_closed()
+        && !inner_ref
+            .recorded_closed_position_cycles
+            .contains(&cycle_key)
+    {
+        return;
+    }
+
+    // Corrections can remove the opening fill, so remember every fill in the cycle
+    let cycle_keys = position
+        .events
+        .iter()
+        .map(|fill| {
+            (
+                position.id,
+                position.ts_opened,
+                Some(fill.event_id.as_bytes()),
+            )
+        })
+        .chain(position.events.is_empty().then_some(cycle_key));
+
+    if cycle_keys
+        .clone()
+        .any(|key| inner_ref.recorded_closed_position_cycles.contains(&key))
+    {
+        inner_ref.recorded_closed_position_cycles.extend(cycle_keys);
+        return;
+    }
+
     if !position.is_closed() {
         return;
     }
@@ -4189,14 +4240,8 @@ fn record_closed_position_pnl(
         return;
     };
 
-    let mut inner_ref = inner.borrow_mut();
-
-    if !inner_ref
-        .recorded_closed_position_cycles
-        .insert((position.id, position.ts_opened))
-    {
-        return;
-    }
+    inner_ref.recorded_closed_position_cycles.extend(cycle_keys);
+    inner_ref.recorded_closed_position_cycles.insert(cycle_key);
 
     let converted_pnl =
         converted_realized_pnl(&cache_ref, config, event, position_id, realized_pnl);
@@ -4311,6 +4356,11 @@ fn update_account(
     drop(inner_ref);
 
     register_equity_curve_account(clock, cache, inner, config, event.account_id);
+    inner
+        .borrow_mut()
+        .last_published_account_states
+        .insert(event.account_id, event.event_id);
+    msgbus::publish_account_state(format!("events.account.{}", event.account_id).into(), event);
 }
 
 fn equity_curve_timer_name(account_id: AccountId) -> String {

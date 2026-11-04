@@ -22,7 +22,7 @@ use nautilus_live::{
     execution::{context::OrderContext, failure::CommandFailure},
 };
 use nautilus_model::{
-    enums::{OrderSide, OrderStatus, OrderType, TimeInForce},
+    enums::{OrderStatus, OrderType, TimeInForce},
     events::{OrderEventAny, OrderFilled, OrderUpdated},
     identifiers::{AccountId, VenueOrderId},
     orders::{Order, OrderAny},
@@ -221,12 +221,8 @@ pub(super) fn reject_submit_order(
     pending_cancels.remove(&order.client_order_id());
 }
 
-#[expect(clippy::too_many_arguments)]
 pub(super) fn emit_market_order_quantity_update(
     order: &mut OrderAny,
-    is_quote_qty: bool,
-    side: OrderSide,
-    amount: Quantity,
     expected_base_qty: Decimal,
     update_quantity: bool,
     size_precision: u8,
@@ -241,14 +237,11 @@ pub(super) fn emit_market_order_quantity_update(
         return;
     };
 
-    emit_signed_base_quantity_update(order, is_quote_qty, side, amount, base_qty, emitter, clock);
+    emit_signed_base_quantity_update(order, base_qty, emitter, clock);
 }
 
 pub(super) fn emit_signed_base_quantity_update(
     order: &mut OrderAny,
-    is_quote_qty: bool,
-    side: OrderSide,
-    amount: Quantity,
     base_qty: Quantity,
     emitter: &ExecutionEventEmitter,
     clock: &'static AtomicTime,
@@ -261,10 +254,16 @@ pub(super) fn emit_signed_base_quantity_update(
         return;
     }
 
+    let side = order.order_side();
+    let amount = order.quantity();
     log::debug!(
         "Normalized {} {side:?} {} quantity {amount} to signed base quantity {base_qty}",
         order.instrument_id(),
-        if is_quote_qty { "quote" } else { "base" },
+        if order.is_quote_quantity() {
+            "quote"
+        } else {
+            "base"
+        },
     );
 
     let ts_now = clock.get_time_ns();
@@ -1255,6 +1254,7 @@ mod tests {
         binary.outcome = Some(Ustr::from(trade.outcome.as_str()));
         binary.info = Some(
             serde_json::from_value(serde_json::json!({
+                "market_version": "v1",
                 "condition_id": trade.market.as_str(),
                 "token_id": trade.asset_id.as_str(),
             }))
@@ -1293,6 +1293,7 @@ mod tests {
         binary.outcome = Some(trade.outcome.inner());
         binary.info = Some(
             serde_json::from_value(serde_json::json!({
+                "market_version": "v1",
                 "condition_id": trade.market.as_str(),
                 "token_id": trade.asset_id.as_str(),
             }))
@@ -2469,7 +2470,7 @@ mod tests {
         let settlement = SettlementRegistry::new(AccountId::from("POLY-001"));
         let order_contexts = OrderContextRegistry::default();
         let pending_cancels = PendingCancelTracker::default();
-        pending_cancels.insert(order.client_order_id());
+        pending_cancels.insert(order.client_order_id(), None);
 
         let deferred = handle_order_response(
             Ok(response),
@@ -2575,9 +2576,6 @@ mod tests {
         emitter.emit_order_submitted(&order);
         emit_market_order_quantity_update(
             &mut order,
-            false,
-            OrderSide::Sell,
-            Quantity::from("5.208000"),
             Decimal::new(5_200_000, 6),
             true,
             6,
@@ -3164,9 +3162,6 @@ mod tests {
         emitter.emit_order_submitted(&order);
         emit_market_order_quantity_update(
             &mut order,
-            true,
-            OrderSide::Buy,
-            Quantity::new(10.0, 0),
             Decimal::new(18_180, 3),
             true,
             3,
@@ -3268,9 +3263,6 @@ mod tests {
         emitter.emit_order_submitted(&order);
         emit_market_order_quantity_update(
             &mut order,
-            true,
-            OrderSide::Buy,
-            Quantity::new(5.0, 0),
             Decimal::new(5_202_910, 6),
             true,
             instrument.size_precision(),
@@ -3699,9 +3691,6 @@ mod tests {
         emitter.emit_order_submitted(&order);
         emit_market_order_quantity_update(
             &mut order,
-            true,
-            OrderSide::Buy,
-            Quantity::new(5.0, 0),
             Decimal::new(5_192_100, 6),
             true,
             instrument.size_precision(),
@@ -4564,7 +4553,7 @@ mod tests {
         let order = test_limit_order("O-REJECT-SUBMIT", instrument.id());
         let (emitter, mut receiver) = test_emitter();
         let pending_cancels = PendingCancelTracker::default();
-        pending_cancels.insert(order.client_order_id());
+        pending_cancels.insert(order.client_order_id(), None);
 
         reject_submit_order(
             &order,

@@ -16,7 +16,6 @@
 //! Live market data client implementation for the Binance Spot adapter.
 
 use std::{
-    num::NonZeroU32,
     str::FromStr,
     sync::{
         Arc,
@@ -71,15 +70,19 @@ use ustr::Ustr;
 use crate::{
     book::{
         BinanceBookError,
-        pacing::SnapshotPacer,
+        pacing::{SnapshotPacer, SnapshotPermit},
         recovery::spawn_recovery,
         sync::{BookSyncTracker, DepthSequencing, DepthSnapshot, DepthUpdate},
     },
     common::{
         bar::{binance_bar_data_type, binance_bars_to_custom_data, parse_binance_bar_type},
-        consts::{BINANCE_VENUE, BINANCE_WS_HEARTBEAT_SECS},
+        consts::{
+            BINANCE_SPOT_REQUEST_WEIGHT_PER_MINUTE as SNAPSHOT_WEIGHT_PER_MINUTE, BINANCE_VENUE,
+            BINANCE_WS_HEARTBEAT_SECS,
+        },
         credential::resolve_credentials,
         enums::{BinanceEnvironment, BinanceProductType},
+        http_weights::depth_weight_spot as depth_request_weight,
         parse::{bar_spec_to_binance_interval, quote_to_l1_deltas},
         status::diff_and_emit_statuses,
         urls::{get_http_base_url_with_us, get_ws_base_url_with_us},
@@ -117,9 +120,6 @@ const BOOK_DEPTHS_JSON: [usize; 3] = [5, 10, 20];
 // Venue maximum, so seeded books are as deep as REST allows, at the top request weight of 250
 const SNAPSHOT_DEPTH: u32 = 5000;
 
-// Half the venue's 6,000 per-minute request weight, leaving room for other requests
-const SNAPSHOT_WEIGHT_PER_MINUTE: NonZeroU32 = NonZeroU32::new(3_000).expect("non-zero");
-
 /// Binance Spot data client for SBE market data.
 #[derive(Debug)]
 pub struct BinanceSpotDataClient {
@@ -139,7 +139,7 @@ pub struct BinanceSpotDataClient {
     status_cache: Arc<AtomicMap<InstrumentId, MarketStatusAction>>,
     instrument_update_lock: Arc<tokio::sync::Mutex<()>>,
     book_sync: BookSyncTracker,
-    book_subscriptions: Arc<AtomicMap<InstrumentId, u32>>,
+    book_subscriptions: Arc<AtomicMap<InstrumentId, String>>,
     l1_book_subscriptions: Arc<AtomicMap<InstrumentId, u32>>,
     quote_refs: Arc<AtomicMap<InstrumentId, u32>>,
     ticker_refs: Arc<AtomicMap<InstrumentId, u32>>,
@@ -405,7 +405,7 @@ impl BinanceSpotDataClient {
         }
 
         for instrument in &instruments {
-            if let Err(e) = sender.send(DataEvent::Instrument(instrument.clone())) {
+            if let Err(e) = sender.send(DataEvent::Data(instrument.clone().into())) {
                 log::warn!("Failed to send refreshed Binance Spot instrument: {e}");
             }
         }
@@ -689,8 +689,14 @@ impl BinanceSpotDataClient {
             instrument_id,
             recovery,
             book_sync.clone(),
-            move || {
-                Self::fetch_depth_snapshot(http.clone(), instruments.clone(), instrument_id, clock)
+            move |permit| {
+                Self::fetch_depth_snapshot(
+                    http.clone(),
+                    instruments.clone(),
+                    instrument_id,
+                    clock,
+                    permit,
+                )
             },
             depth_request_weight(SNAPSHOT_DEPTH),
             snapshot_timeout,
@@ -723,6 +729,7 @@ impl BinanceSpotDataClient {
         instruments: Arc<AtomicMap<InstrumentId, InstrumentAny>>,
         instrument_id: InstrumentId,
         clock: &'static AtomicTime,
+        permit: SnapshotPermit,
     ) -> Result<DepthSnapshot, BinanceBookError> {
         let params = DepthParams {
             symbol: instrument_id.symbol.as_str().to_uppercase(),
@@ -731,7 +738,7 @@ impl BinanceSpotDataClient {
 
         let depth = http
             .inner()
-            .depth(&params)
+            .depth_paced(&params, permit)
             .await
             .map_err(|e| depth_snapshot_error(instrument_id, &e))?;
 
@@ -850,16 +857,6 @@ fn parse_spot_depth_snapshot(
     }
 
     Ok(OrderBookDeltas::new(instrument_id, deltas))
-}
-
-// Spot `/api/v3/depth` request weight by level limit
-fn depth_request_weight(limit: u32) -> u32 {
-    match limit {
-        ..=100 => 5,
-        101..=500 => 25,
-        501..=1000 => 50,
-        _ => 250,
-    }
 }
 
 // The HTTP client has already spent its own retries, so an exhausted budget stays retryable
@@ -1304,6 +1301,19 @@ impl DataClient for BinanceSpotDataClient {
 
             let ws = self.ws_client.clone();
             let symbol_lower = instrument_id.symbol.as_str().to_lowercase();
+            let stream = self.depth_stream(
+                &symbol_lower,
+                cmd.depth.map(|d| d.get()),
+                cmd.params.as_ref(),
+            )?;
+
+            if let Some(existing) = self.book_subscriptions.load().get(&instrument_id) {
+                anyhow::ensure!(
+                    existing == &stream,
+                    "unsubscribe before changing Binance Spot book depth or update_speed"
+                );
+                return Ok(());
+            }
 
             if self.spot_market_data_mode == BinanceSpotMarketDataMode::Json
                 && let Some(depth) = cmd.depth
@@ -1319,10 +1329,8 @@ impl DataClient for BinanceSpotDataClient {
                     );
                 }
 
-                let depth_level = depth as u32;
-                self.book_subscriptions.insert(instrument_id, depth_level);
-
-                let stream = format!("{symbol_lower}@depth{depth_level}");
+                self.book_subscriptions
+                    .insert(instrument_id, stream.clone());
                 self.spawn_ws(
                     chain_command(&self.book_command_tail, async move {
                         ws.subscribe(vec![stream])
@@ -1342,10 +1350,8 @@ impl DataClient for BinanceSpotDataClient {
                         depth == 20,
                         "Binance Spot SBE partial books support depth 20 only; use JSON market data for other depths"
                     );
-                    let depth_level = depth as u32;
-                    self.book_subscriptions.insert(instrument_id, depth_level);
-
-                    let stream = format!("{symbol_lower}@depth{depth_level}");
+                    self.book_subscriptions
+                        .insert(instrument_id, stream.clone());
                     self.spawn_ws(
                         chain_command(&self.book_command_tail, async move {
                             ws.subscribe(vec![stream])
@@ -1357,12 +1363,12 @@ impl DataClient for BinanceSpotDataClient {
                 }
                 // Full book diffs are seeded by a REST snapshot and replayed.
                 None => {
-                    self.book_subscriptions.insert(instrument_id, 0);
+                    self.book_subscriptions
+                        .insert(instrument_id, stream.clone());
 
                     // Resync from the next diff, cancelling any recovery from a prior subscription
                     self.book_sync.subscribe(instrument_id);
 
-                    let stream = format!("{symbol_lower}@depth");
                     self.spawn_ws(
                         chain_command(&self.book_command_tail, async move {
                             ws.subscribe(vec![stream])
@@ -1469,20 +1475,17 @@ impl DataClient for BinanceSpotDataClient {
             let ws = self.ws_client.clone();
 
             // Stop book sync so an in-flight snapshot cannot emit after unsubscribe
+            let stream = self.book_subscriptions.load().get(&instrument_id).cloned();
             self.book_subscriptions.remove(&instrument_id);
             self.book_sync.remove(instrument_id);
 
-            let symbol_lower = instrument_id.symbol.as_str().to_lowercase();
-            let streams = vec![
-                format!("{symbol_lower}@depth"),
-                format!("{symbol_lower}@depth5"),
-                format!("{symbol_lower}@depth10"),
-                format!("{symbol_lower}@depth20"),
-            ];
+            let Some(stream) = stream else {
+                return Ok(());
+            };
 
             self.spawn_ws(
                 chain_command(&self.book_command_tail, async move {
-                    ws.unsubscribe(streams)
+                    ws.unsubscribe(vec![stream])
                         .await
                         .context("book deltas unsubscribe")
                 }),
@@ -1872,9 +1875,12 @@ impl DataClient for BinanceSpotDataClient {
         self.spawn_command(async move {
             // The venue applies a 100-level limit when none is given
             let weight = depth_request_weight(depth.unwrap_or(100));
-            book_sync.pacer().acquire(weight).await;
+            let permit = book_sync.pacer().acquire(weight).await;
 
-            match http.request_book_snapshot(instrument_id, depth).await {
+            match http
+                .request_book_snapshot_with_permit(instrument_id, depth, Some(permit))
+                .await
+            {
                 Ok(book) => {
                     let response = DataResponse::Book(BookResponse::new(
                         request_id,
@@ -1899,6 +1905,34 @@ impl DataClient for BinanceSpotDataClient {
 }
 
 impl BinanceSpotDataClient {
+    fn depth_stream(
+        &self,
+        symbol: &str,
+        depth: Option<usize>,
+        params: Option<&Params>,
+    ) -> anyhow::Result<String> {
+        let mut stream = match depth {
+            Some(depth) => format!("{symbol}@depth{depth}"),
+            None => format!("{symbol}@depth"),
+        };
+
+        if self.spot_market_data_mode == BinanceSpotMarketDataMode::Json {
+            let speed = params.and_then(|p| p.get("update_speed"));
+            if let Some(speed) = speed {
+                anyhow::ensure!(
+                    matches!(speed.as_u64(), Some(100 | 1000)),
+                    "Binance Spot JSON update_speed must be 100 or 1000, was {speed}"
+                );
+            }
+
+            if speed.is_none_or(|speed| speed.as_u64() == Some(100)) {
+                stream.push_str("@100ms");
+            }
+        }
+
+        Ok(stream)
+    }
+
     fn subscribe_top_of_book(&self, instrument_id: InstrumentId) {
         let should_subscribe = {
             let previous = self
@@ -2053,12 +2087,16 @@ mod tests {
         testing::wait_until_async,
     };
     use nautilus_core::{AtomicMap, nanos::UnixNanos, time::AtomicTime};
-    use nautilus_live::task::TaskGroup;
+    use nautilus_live::{book::DEFAULT_BOOK_SNAPSHOT_TIMEOUT_SECS, task::TaskGroup};
     use nautilus_model::{
         data::Data,
         enums::{BookAction, RecordFlag},
         identifiers::InstrumentId,
         instruments::{Instrument, InstrumentAny, stubs::currency_pair_btcusdt},
+    };
+    use nautilus_network::{
+        http::HttpClient,
+        ratelimiter::{RateLimiter, quota::Quota},
     };
     use parking_lot::Mutex;
     use rstest::rstest;
@@ -2067,8 +2105,9 @@ mod tests {
 
     use super::{
         BinanceBookError, BinanceDepth, BinanceEnvironment, BinanceSpotDataClient,
-        BinanceSpotHttpError, BinanceSpotMarketDataMode, depth_request_weight,
-        depth_snapshot_error, parse_spot_depth_snapshot, resolve_spot_json_ws_url,
+        BinanceSpotHttpError, BinanceSpotMarketDataMode, SNAPSHOT_DEPTH,
+        SNAPSHOT_WEIGHT_PER_MINUTE, depth_request_weight, depth_snapshot_error,
+        parse_spot_depth_snapshot, resolve_spot_json_ws_url,
     };
     use crate::{
         book::{
@@ -2076,7 +2115,9 @@ mod tests {
             sync::{BookSyncTracker, DepthSequencing},
         },
         common::{
-            consts::{BINANCE_CLIENT_ID, BINANCE_SPOT_WS_URL},
+            consts::{
+                BINANCE_CLIENT_ID, BINANCE_SPOT_REQUEST_WEIGHT_PER_MINUTE, BINANCE_SPOT_WS_URL,
+            },
             websocket::chain_command,
         },
         config::BinanceDataClientConfig,
@@ -2089,6 +2130,50 @@ mod tests {
             websocket::streams::messages::BinanceSpotWsMessage,
         },
     };
+
+    #[tokio::test(start_paused = true)]
+    async fn full_depth_snapshot_pacing_prevents_http_admission_timeouts() {
+        let pacer = Arc::new(SnapshotPacer::new(SNAPSHOT_WEIGHT_PER_MINUTE));
+        let quota = Quota::per_minute(BINANCE_SPOT_REQUEST_WEIGHT_PER_MINUTE);
+        let request_key = Ustr::from("snapshot");
+
+        let limiter = Arc::new(RateLimiter::new_with_quota(
+            None,
+            vec![(request_key, quota)],
+        ));
+        let client = HttpClient::builder()
+            .rate_limiters(vec![limiter])
+            .build()
+            .unwrap();
+        let weight = depth_request_weight(SNAPSHOT_DEPTH);
+        let mut snapshots = tokio::task::JoinSet::new();
+
+        for _ in 0..6 {
+            let pacer = pacer.clone();
+            let client = client.clone();
+
+            snapshots.spawn(async move {
+                let permit = pacer.acquire(weight).await;
+                tokio::time::timeout(
+                    Duration::from_secs(DEFAULT_BOOK_SNAPSHOT_TIMEOUT_SECS),
+                    async move {
+                        let keys = vec![request_key; weight as usize];
+                        client.await_rate_limits(Some(&keys)).await;
+                        permit.commit();
+                    },
+                )
+                .await
+                .is_ok()
+            });
+        }
+
+        let mut admitted = Vec::new();
+        while let Some(snapshot) = snapshots.join_next().await {
+            admitted.push(snapshot.unwrap());
+        }
+
+        assert_eq!(admitted, vec![true; 6]);
+    }
 
     #[rstest]
     #[case::trades("trades")]

@@ -197,8 +197,9 @@ frames (`st: false`) to avoid clearing unchanged book levels.
 
 :::note
 AX publishes no trade identifier for market data. Thus, the adapter derives `TradeTick.trade_id` from the
-trade's timestamp, price, size, and aggressor side. REST and WebSocket agree on the same trade whenever both
-report its aggressor side. Prints that AX reports identically share an ID. This affects only consumers that
+trade's timestamp, price, size, and aggressor side. The adapter rejects REST and WebSocket trades with a
+missing or invalid aggressor side, so the same print has the same ID across transports. Prints that AX
+reports identically share an ID. This affects only consumers that
 deduplicate market data on `trade_id`, because fills carry the venue's own trade IDs.
 :::
 
@@ -338,8 +339,9 @@ and output format.
 - Open-order, historical-order, fill, and position report requests resolve an uncached symbol
   through `GET /instrument` and cache the result. An instrument request or parse failure fails that
   entire report request instead of dropping venue state.
-- `GET /transactions` requires `start_timestamp_ns` and `end_timestamp_ns` with a range no wider
-  than 7 days. The low-level client exposes its cursor and account selectors.
+- `GET /transactions` accepts optional `start_timestamp_ns` and `end_timestamp_ns` filters. When both
+  are supplied, `end_timestamp_ns` must be greater than `start_timestamp_ns`. The low-level client
+  requires both bounds and exposes cursor and account selectors.
 - `GET /order-status` can include `reject_reason` and `reject_message` for rejected orders.
 - When an account selector is omitted, AX uses the primary account. The high-level execution client owns one
   primary account. Low-level request models expose documented account selectors.
@@ -678,9 +680,9 @@ credentials are valid and have trading permissions.
   and returns the confirmed replacement's status, including fills or cancellation. It leaves the result
   unresolved when no replacement is confirmed. A cancel before confirmation targets the parent and
   can be rejected; recovery then needs a late stream confirmation, a child fill, or an explicit query.
-  A crossing post-only replacement emits `OrderModifyRejected` with the venue reason
-  and leaves the original order working. The adapter rejects a modification locally if it carries a
-  trigger price, because AX has no field for one, or if the order has no venue order ID yet.
+  The adapter emits `OrderModifyDenied` if a modification carries a trigger price, because AX has no
+  field for one, or if the order has no venue order ID yet. A crossing post-only replacement emits
+  `OrderModifyRejected` with the venue reason and leaves the original order working.
 - **Funding rate polling**: The data client polls `GET /funding-rates` for each subscribed instrument at
   `funding_rate_poll_interval_mins`. It requests a seven-day lookback to find a rate across weekends and
   holidays. It emits the latest rate only when it differs from the last one emitted.
@@ -709,8 +711,13 @@ credentials are valid and have trading permissions.
   order-status requests that need fills, and mass status. During startup, that error prevents the node
   from starting.
 - **Fill reconciliation window**: The `/fills` endpoint requires a bounded time range and caps the span at
-  seven days. Reconciliation uses seven days by default, or the shorter configured lookback. Fills older
-  than the applied window are not reconciled.
+  seven days. Fill requests cover seven days by default, or the shorter configured lookback. Order history
+  uses the configured lookback and has no start bound by default.
+
+  Older order reports can still produce inferred fills with `commission=None`. Order history does not
+  supply fees, and the adapter does not estimate historical fees from current account rates. Position
+  accounting excludes unavailable fees, so reconstructed PnL for that history is incomplete. A reported
+  zero fee remains a zero commission.
 - **Fill order identity**: AX can omit `order_id` for block trades and final settlement fills. The
   adapter derives a deterministic reconciliation order ID from `trade_id` for those classified
   records and includes a matching `FILLED` market order report in startup mass status. Classification

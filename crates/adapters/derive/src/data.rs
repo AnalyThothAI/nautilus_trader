@@ -89,7 +89,8 @@ use crate::{
     config::DeriveDataClientConfig,
     http::{DeriveHttpClient, query::PaginationCursor},
     providers::{
-        DeriveInstrumentProvider, fetch_instrument_definitions, parse_instrument_definitions,
+        DeriveInstrumentProvider, fetch_instrument_definitions, normalize_currency,
+        parse_instrument_definitions,
     },
     websocket::{
         DEFAULT_ORDERBOOK_DEPTH, DEFAULT_ORDERBOOK_GROUP, DEFAULT_TICKER_INTERVAL,
@@ -394,6 +395,70 @@ impl DeriveDataClient {
         Ok(())
     }
 
+    fn spawn_instrument_refresh(&self) -> anyhow::Result<()> {
+        if let Some(future) = self.instrument_refresh() {
+            self.session_tasks.spawn(future)?;
+        }
+
+        Ok(())
+    }
+
+    fn instrument_refresh(&self) -> Option<impl Future<Output = ()> + Send + 'static> {
+        let minutes = self.config.update_instruments_interval_mins;
+        let currencies: Vec<_> = self
+            .config
+            .currencies
+            .iter()
+            .filter_map(|currency| normalize_currency(currency).map(ToOwned::to_owned))
+            .collect();
+
+        if minutes == 0 || currencies.is_empty() {
+            return None;
+        }
+
+        let interval = Duration::from_secs(minutes.saturating_mul(60));
+        let cancellation = self.cancellation_token.clone();
+        let http_client = self.http_client.clone();
+        let include_expired = self.config.include_expired;
+        let instruments = Arc::clone(&self.instruments);
+        let sender = self.data_sender.clone();
+        let subscription_lock = Arc::clone(&self.subscription_lock);
+
+        Some(async move {
+            loop {
+                tokio::select! {
+                    biased;
+                    () = cancellation.cancelled() => break,
+                    () = time::sleep(interval) => {}
+                }
+
+                for currency in &currencies {
+                    let result = tokio::select! {
+                        biased;
+                        () = cancellation.cancelled() => return,
+                        result = fetch_instrument_definitions(&http_client, currency, include_expired) => result,
+                    };
+
+                    match result {
+                        Ok(definitions) => {
+                            let loaded = parse_instrument_definitions(definitions);
+                            cache_instruments(
+                                loaded,
+                                &instruments,
+                                &sender,
+                                &cancellation,
+                                &subscription_lock,
+                            );
+                        }
+                        Err(e) => {
+                            log::warn!("Failed to refresh Derive instruments for {currency}: {e}");
+                        }
+                    }
+                }
+            }
+        })
+    }
+
     fn handle_ws_message(message: DeriveWsMessage, ctx: &WsMessageContext) {
         match message {
             DeriveWsMessage::Subscription(payload) => match parse_public_ws_data(&payload) {
@@ -633,7 +698,10 @@ impl DeriveDataClient {
         if ctx.active_funding_subs.contains(&instrument_id) {
             match parse_funding_rate(msg, ts_init) {
                 Ok(Some(update)) => {
-                    if let Err(e) = ctx.data_sender.send(DataEvent::FundingRate(update)) {
+                    if let Err(e) = ctx
+                        .data_sender
+                        .send(DataEvent::Data(Data::FundingRate(update)))
+                    {
                         log::error!("Failed to send Derive funding rate: {e}");
                     }
                 }
@@ -645,7 +713,10 @@ impl DeriveDataClient {
         if ctx.active_greeks_subs.contains(&instrument_id) {
             match parse_option_greeks(msg, ts_init) {
                 Ok(Some(greeks)) => {
-                    if let Err(e) = ctx.data_sender.send(DataEvent::OptionGreeks(greeks)) {
+                    if let Err(e) = ctx
+                        .data_sender
+                        .send(DataEvent::Data(Data::OptionGreeks(greeks)))
+                    {
                         log::error!("Failed to send Derive option greeks: {e}");
                     }
                 }
@@ -708,7 +779,7 @@ impl DeriveDataClient {
     }
 
     fn cache_provider_instruments(&self) {
-        let mut instruments = self
+        let instruments = self
             .provider
             .store()
             .get_all()
@@ -716,18 +787,13 @@ impl DeriveDataClient {
             .cloned()
             .collect::<Vec<_>>();
 
-        instruments.sort_by_key(|instrument| instrument.id());
-        self.instruments.rcu(|cache| {
-            for instrument in &instruments {
-                cache.insert(instrument.id(), instrument.clone());
-            }
-        });
-
-        for instrument in instruments {
-            if let Err(e) = self.data_sender.send(DataEvent::Instrument(instrument)) {
-                log::warn!("Failed to send Derive instrument: {e}");
-            }
-        }
+        cache_instruments(
+            instruments,
+            &self.instruments,
+            &self.data_sender,
+            &self.cancellation_token,
+            &self.subscription_lock,
+        );
     }
 
     fn prepare_subscribe(&self, instrument_id: InstrumentId) -> anyhow::Result<bool> {
@@ -899,6 +965,7 @@ impl DataClient for DeriveDataClient {
     fn stop(&mut self) -> anyhow::Result<()> {
         log::info!("Stopping Derive data client: {}", self.client_id);
         self.cancellation_token.cancel();
+        let _guard = self.subscription_lock.lock();
         self.abort_session_tasks();
         self.abort_pending_tasks();
         self.book_sync.clear();
@@ -916,7 +983,11 @@ impl DataClient for DeriveDataClient {
 
         // Leave the cancellation token cancelled; connect() refreshes it
         // (and tears down the inner WS client) on the next lifecycle start.
-        self.instruments.store(AHashMap::new());
+        {
+            let _guard = self.subscription_lock.lock();
+            self.instruments.store(AHashMap::new());
+        }
+
         self.clear_subscription_state();
         self.provider.store_mut().clear();
         Ok(())
@@ -948,6 +1019,7 @@ impl DataClient for DeriveDataClient {
         if self.cancellation_token.is_cancelled()
             || !self.session_tasks.is_open()
             || !self.pending_tasks.is_open()
+            || !self.session_tasks.is_empty()
         {
             self.teardown_partial_connect().await?;
             self.cancellation_token = CancellationToken::new();
@@ -986,7 +1058,8 @@ impl DataClient for DeriveDataClient {
             .take_event_receiver()
             .ok_or_else(|| anyhow::anyhow!("Derive WebSocket event receiver not initialized"))
             .and_then(|rx| self.spawn_stream_task(rx))
-            .and_then(|()| self.spawn_book_monitor());
+            .and_then(|()| self.spawn_book_monitor())
+            .and_then(|()| self.spawn_instrument_refresh());
 
         if let Err(e) = session_result {
             if let Err(teardown_error) = self.teardown_partial_connect().await {
@@ -1464,8 +1537,14 @@ impl DataClient for DeriveDataClient {
                         size_precision,
                         ts_init,
                     ) {
-                        Ok(tick) if seen_trade_ids.insert(tick.trade_id) => trades.push(tick),
-                        Ok(_) => {}
+                        Ok(tick) => {
+                            let within_start =
+                                start_nanos.is_none_or(|nanos| tick.ts_event >= nanos);
+                            let within_end = end_nanos.is_none_or(|nanos| tick.ts_event <= nanos);
+                            if within_start && within_end && seen_trade_ids.insert(tick.trade_id) {
+                                trades.push(tick);
+                            }
+                        }
                         Err(e) => log::warn!(
                             "Failed to parse Derive trade {} for {instrument_id}: {e}",
                             trade.trade_id,
@@ -1557,7 +1636,13 @@ impl DataClient for DeriveDataClient {
 
             for record in &result.funding_rate_history {
                 match parse_funding_rate_history_record(record, instrument_id, None, ts_init) {
-                    Ok(update) => updates.push(update),
+                    Ok(update) => {
+                        let within_start = start_nanos.is_none_or(|nanos| update.ts_event >= nanos);
+                        let within_end = end_nanos.is_none_or(|nanos| update.ts_event <= nanos);
+                        if within_start && within_end {
+                            updates.push(update);
+                        }
+                    }
                     Err(e) => log::warn!(
                         "Failed to parse Derive funding rate record for {instrument_id} at {}: {e}",
                         record.timestamp,
@@ -2587,6 +2672,33 @@ impl DeriveDataClient {
     }
 }
 
+fn cache_instruments(
+    mut loaded: Vec<InstrumentAny>,
+    instruments: &AtomicMap<InstrumentId, InstrumentAny>,
+    sender: &EventSender<DataEvent>,
+    cancellation: &CancellationToken,
+    subscription_lock: &Mutex<()>,
+) {
+    loaded.sort_by_key(|instrument| instrument.id());
+    let _guard = subscription_lock.lock();
+
+    if cancellation.is_cancelled() {
+        return;
+    }
+
+    instruments.rcu(|cache| {
+        for instrument in &loaded {
+            cache.insert(instrument.id(), instrument.clone());
+        }
+    });
+
+    for instrument in loaded {
+        if let Err(e) = sender.send(DataEvent::Data(instrument.into())) {
+            log::warn!("Failed to send Derive instrument: {e}");
+        }
+    }
+}
+
 fn cache_instrument(
     instruments: &Arc<AtomicMap<InstrumentId, InstrumentAny>>,
     instrument: &InstrumentAny,
@@ -2769,6 +2881,10 @@ fn truncated_payload_snippet(raw: &str) -> String {
 }
 
 #[cfg(test)]
+#[path = "../tests/integration/data_client.rs"]
+mod data_client_tests;
+
+#[cfg(test)]
 mod tests {
     use std::{path::PathBuf, time::Duration};
 
@@ -2803,6 +2919,46 @@ mod tests {
         let content = std::fs::read_to_string(data_path().join(filename))
             .unwrap_or_else(|_| panic!("failed to read {filename}"));
         serde_json::from_str(&content).expect("invalid json")
+    }
+
+    #[rstest]
+    #[case::stop("stop")]
+    #[case::reset("reset")]
+    #[case::dispose("dispose")]
+    #[tokio::test]
+    async fn test_cache_instruments_rejects_completion_after_shutdown(#[case] shutdown: &str) {
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        replace_data_event_sender(sender);
+        let mut client =
+            DeriveDataClient::new(*DERIVE_CLIENT_ID, DeriveDataClientConfig::default()).unwrap();
+        let original = perp_instrument();
+        let instrument_id = original.id();
+        client.instruments.insert(instrument_id, original.clone());
+        let mut definition: DeriveInstrument =
+            serde_json::from_value(load_json("perps/instrument_eth.json")).unwrap();
+        definition.amount_step = dec!(0.007);
+        let refreshed = parse_derive_instrument_any(&definition, UnixNanos::from(751))
+            .unwrap()
+            .unwrap();
+        let cancellation = client.cancellation_token.clone();
+        match shutdown {
+            "stop" => client.stop().unwrap(),
+            "reset" => client.reset().unwrap(),
+            "dispose" => client.dispose().unwrap(),
+            _ => unreachable!(),
+        }
+
+        cache_instruments(
+            vec![refreshed],
+            &client.instruments,
+            &client.data_sender,
+            &cancellation,
+            &client.subscription_lock,
+        );
+
+        let expected = (shutdown != "reset").then_some(original);
+        assert_eq!(client.instruments.get_cloned(&instrument_id), expected);
+        assert!(receiver.try_recv().is_err());
     }
 
     #[tokio::test]
@@ -4150,7 +4306,7 @@ mod tests {
         );
 
         match rx.try_recv().unwrap() {
-            DataEvent::FundingRate(update) => {
+            DataEvent::Data(Data::FundingRate(update)) => {
                 assert_eq!(update.instrument_id, instrument_id);
                 assert_eq!(update.rate, "0.0002".parse().unwrap());
             }
@@ -4206,7 +4362,7 @@ mod tests {
         DeriveDataClient::handle_ws_message(DeriveWsMessage::Subscription(payload), &ctx);
 
         match rx.try_recv().unwrap() {
-            DataEvent::OptionGreeks(greeks) => {
+            DataEvent::Data(Data::OptionGreeks(greeks)) => {
                 assert_eq!(greeks.instrument_id, instrument_id);
                 assert!((greeks.greeks.delta - 0.55).abs() < 1e-9);
                 assert!((greeks.greeks.gamma - 0.0008).abs() < 1e-9);
@@ -4263,7 +4419,7 @@ mod tests {
                         "duplicate IndexPriceUpdate emission"
                     );
                 }
-                DataEvent::FundingRate(f) => {
+                DataEvent::Data(Data::FundingRate(f)) => {
                     assert!(
                         funding.replace(f).is_none(),
                         "duplicate FundingRate emission"

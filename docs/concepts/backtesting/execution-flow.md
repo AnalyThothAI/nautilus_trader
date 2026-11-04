@@ -96,8 +96,9 @@ Simulation modules run once, after the command loop completes.
 
 #### Latency-delayed commands
 
-A `LatencyModel` places each command in the venue's inflight queue with an arrival timestamp. Once a
-command is due, the settlement point determines whether the engine releases it:
+A [`LatencyModel`](../behavioral_models.md#custom-python-latency-models) places each command in the venue's
+inflight queue with an arrival timestamp. Once a command is due, the settlement point determines whether
+the engine releases it:
 
 | Settlement point               | Due commands released                                                      |
 | ------------------------------ | -------------------------------------------------------------------------- |
@@ -112,8 +113,9 @@ with a future arrival timestamp stay in the inflight queue.
 
 ### Sandbox inbound latency
 
-`SandboxExecutionClientConfig.latency_model` accepts a `StaticLatencyModel` object directly,
-following the `fee_model` configuration pattern. It delays submits, modifies, and cancels by the
+`SandboxExecutionClientConfig.latency_model` accepts a `StaticLatencyModel` or a
+[Python `LatencyModel` subclass](../behavioral_models.md#custom-python-latency-models), following the
+`fee_model` configuration pattern. It delays submits, modifies, and cancels by the
 model's insert, update, and delete legs, respectively, before they reach the matching engine.
 
 Venue-generated events (accepts, fills, cancels, expirations) are not delayed, so the model covers
@@ -131,11 +133,11 @@ from nautilus_trader.model import Venue
 config = SandboxExecutionClientConfig(
     venue=Venue("BINANCE"),
     starting_balances=[Money.from_str("10_000 USDT")],
-    latency_model=StaticLatencyModel(base_latency_nanos=1_000_000_000),
     fee_model=MakerTakerFeeModel(
         maker_rate=Decimal("0.001"),
         taker_rate=Decimal("0.001"),
     ),
+    latency_model=StaticLatencyModel(base_latency_nanos=1_000_000_000),
 )
 ```
 
@@ -172,9 +174,10 @@ In both backtest and sandbox, contingent actions respect venue receipt:
 
 Stopping the client discards anything still in flight:
 
-- A discarded submit, modify, or targeted cancel is rejected (`OrderRejected`, `OrderModifyRejected`,
-  `OrderCancelRejected`) so its order does not stay `SUBMITTED` or pending forever. The sandbox
-  generates no order status reports, so nothing else would resolve it.
+- A discarded submit produces `OrderRejected`. A discarded modify or targeted cancel produces
+  `OrderModifyDenied` or `OrderCancelDenied`, with its command ID. Each denial resolves only its
+  matching pending command and preserves later fills or terminal state. The sandbox generates no
+  order status reports, so nothing else would resolve a stranded command.
 - A discarded `CancelAllOrders` is dropped. The strategy marks no order `PENDING_CANCEL` for it,
   so no pending state needs releasing.
 
@@ -196,7 +199,7 @@ then stops the engines.
   fills must run before `on_stop` returns.
 - Simulation modules do not re-run at shutdown. `SimulationModule::process` runs once per timestamp. A second
   call would double-apply side effects like FX rollover interest.
-- A `LatencyModel` adds its configured delay to trailing commands (those emitted on the final
+- A `LatencyModel` adds its delay to trailing commands (those emitted on the final
   data tick or in `on_stop`). The shutdown path advances the engine clock to the latest inflight
   arrival timestamp so those commands still settle before the engines stop.
 

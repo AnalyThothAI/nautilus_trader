@@ -433,8 +433,9 @@ make an unchanged Cython adapter source-compatible.
 
 - **Forward prices**: use `RequestOptionChainReferencePrice` and its matching response for a v2 option series.
 - **DeFi**: native block/pool subscriptions and pool snapshots are outside this Python interface.
-- **Historical requests**: the [known migration limitations](../../MIGRATION_V2.md#known-limitations)
-  for request joining/completion still apply.
+- **Historical requests**: actors and strategies support callbacks, completion joins, and pending inspection.
+  Joins do not merge or replay historical data. See
+  [Python callbacks and joins](../concepts/actors.md#python-callbacks-and-joins).
 - **Custom publication and subscription**: the same migration limitations apply. Clients emit `CustomData`
   through typed data output. They do not expose component `publish_message` or topic subscription methods.
 - **Database cache backing**: unsupported with custom Python clients in either launch mode. See
@@ -482,7 +483,7 @@ name = "_backend"
 crate-type = ["cdylib"]
 
 [dependencies]
-pyo3 = { version = "=0.29.2", features = ["extension-module"] }
+pyo3 = { version = "=0.30.1", features = ["extension-module"] }
 
 [workspace]
 ```
@@ -500,7 +501,7 @@ build-backend = "maturin"
 [project]
 name = "external-adapter"
 version = "0.1.0"
-requires-python = ">=3.13,<3.15"
+requires-python = ">=3.13,<3.16"
 dependencies = ["nautilus-trader"]
 
 [tool.maturin]

@@ -350,7 +350,7 @@ async fn connected(
     let mut client = CoinApiDataClient::new(client_id(), config(http, ws, &[BTC_USD])).unwrap();
     client.connect().await.unwrap();
 
-    let DataEvent::Instrument(instrument) = next_event(rx).await else {
+    let DataEvent::Data(Data::Instrument(instrument)) = next_event(rx).await else {
         panic!("expected instrument");
     };
 
@@ -372,7 +372,7 @@ async fn connect_loads_selection_and_streams_domain_events() {
         client.connect().await.unwrap();
 
         // The response also lists COINBASE_SPOT_BTC_USDT, which is not selected
-        let DataEvent::Instrument(instrument) = next_event(&mut rx).await else {
+        let DataEvent::Data(Data::Instrument(instrument)) = next_event(&mut rx).await else {
             panic!("expected instrument");
         };
 
@@ -456,7 +456,7 @@ async fn price_precision_override_loads_finer_instrument_and_admits_its_prices()
         let mut client = CoinApiDataClient::new(client_id(), config).unwrap();
         client.connect().await.unwrap();
 
-        let DataEvent::Instrument(instrument) = next_event(&mut rx).await else {
+        let DataEvent::Data(Data::Instrument(instrument)) = next_event(&mut rx).await else {
             panic!("expected instrument");
         };
 
@@ -599,12 +599,6 @@ async fn check_next(
     checker.apply(&deltas).unwrap();
     let is_snapshot = deltas.deltas[0].action == BookAction::Clear;
     (is_snapshot, deltas.deltas[0].sequence)
-}
-
-// The client opens a book's snapshot gate just after its write returns, before a fast local peer
-// could answer
-async fn settle() {
-    tokio::time::sleep(Duration::from_millis(100)).await;
 }
 
 fn levels(pairs: &[(&str, &str)]) -> BTreeMap<Decimal, Decimal> {
@@ -847,7 +841,6 @@ async fn book_deltas_recover_from_gap_and_reconnect() {
         assert_eq!(next_text(&mut socket).await, HELLO_TRADE);
         subscribe_book_deltas(&mut client, BookType::L2_MBP).unwrap();
         assert_eq!(next_text(&mut socket).await, HELLO_BOOK_TRADE);
-        settle().await;
 
         let bid = [("84000.00", "1"), ("83999.99", "2")];
         let ask = [("84000.01", "3")];
@@ -873,7 +866,6 @@ async fn book_deltas_recover_from_gap_and_reconnect() {
         .await;
         assert_eq!(next_text(&mut socket).await, HELLO_TRADE);
         assert_eq!(next_text(&mut socket).await, HELLO_BOOK_TRADE);
-        settle().await;
 
         // The old stream's frames still in flight end before the restarted pair's snapshot
         send(
@@ -900,7 +892,6 @@ async fn book_deltas_recover_from_gap_and_reconnect() {
         drop(socket);
         let mut socket = accept(&ws_listener).await;
         assert_eq!(next_text(&mut socket).await, HELLO_BOOK_TRADE);
-        settle().await;
 
         send(
             &mut socket,
@@ -958,7 +949,6 @@ async fn book_l3_deltas_recover_on_same_connection_when_pair_is_whole_scope() {
         subscribe_book_deltas(&mut client, BookType::L3_MBO).unwrap();
         let mut socket = accept(&ws_listener).await;
         assert_eq!(next_text(&mut socket).await, HELLO_BOOK_L3);
-        settle().await;
 
         send(
             &mut socket,
@@ -1002,7 +992,6 @@ async fn book_l3_deltas_recover_on_same_connection_when_pair_is_whole_scope() {
         .await;
         assert_eq!(next_text(&mut socket).await, HELLO_TRADE);
         assert_eq!(next_text(&mut socket).await, HELLO_BOOK_L3);
-        settle().await;
 
         // The removal scope's trades are not subscribed, so the client drops them
         send(&mut socket, TRADE).await;
@@ -1218,7 +1207,6 @@ async fn book_unsubscribe_removes_pair_from_scope() {
         assert_eq!(next_text(&mut socket).await, HELLO_TRADE);
         subscribe_book_deltas(&mut client, BookType::L2_MBP).unwrap();
         assert_eq!(next_text(&mut socket).await, HELLO_BOOK_TRADE);
-        settle().await;
 
         send(
             &mut socket,
@@ -1319,11 +1307,12 @@ async fn book_restart_discards_paused_symbol_retained_period() {
         next_text(&mut socket).await;
         subscribe_book_deltas(&mut client, BookType::L2_MBP).unwrap();
         next_text(&mut socket).await;
-        settle().await;
 
+        let mut checker = BookStreamChecker::new(BookType::L2_MBP, true);
+        checker.open(instrument_id());
         send(&mut socket, &ohlcv(1, "84523.69")).await;
         send(&mut socket, &book("book", 1, Some(true), &[("84000.00", "1")], &[])).await;
-        next_deltas(&mut rx).await;
+        assert_eq!(check_next(&mut rx, &mut checker).await, (true, 1));
         send(&mut socket, &book("book", 3, Some(false), &[("84000.00", "2")], &[])).await;
         let removal = next_text(&mut socket).await;
 
@@ -1332,7 +1321,8 @@ async fn book_restart_discards_paused_symbol_retained_period() {
         tokio::time::sleep(Duration::from_millis(300)).await;
         send(&mut socket, &ohlcv(1, "84523.68")).await;
         next_text(&mut socket).await;
-        settle().await;
+        send(&mut socket, &book("book", 1, Some(true), &[("84000.00", "3")], &[])).await;
+        assert_eq!(check_next(&mut rx, &mut checker).await, (true, 2));
 
         send(&mut socket, &ohlcv(2, "84523.68")).await;
         send(&mut socket, &ohlcv(3, "84523.69")).await;
@@ -1363,7 +1353,7 @@ async fn missing_initial_snapshot_restarts_pair_after_deadline() {
         let mut client = CoinApiDataClient::new(client_id(), config).unwrap();
         client.connect().await.unwrap();
 
-        let DataEvent::Instrument(_) = next_event(&mut rx).await else {
+        let DataEvent::Data(Data::Instrument(_)) = next_event(&mut rx).await else {
             panic!("expected instrument");
         };
 
@@ -1380,7 +1370,6 @@ async fn missing_initial_snapshot_restarts_pair_after_deadline() {
         send(&mut socket, HEARTBEAT).await;
         assert_eq!(next_text(&mut socket).await, HELLO_BOOK_TRADE);
         let waited = started.elapsed();
-        settle().await;
 
         send(
             &mut socket,
@@ -1460,7 +1449,7 @@ async fn missing_replayed_snapshot_restarts_pair_after_reconnect() {
         client.connect().await.unwrap();
         assert!(matches!(
             next_event(&mut rx).await,
-            DataEvent::Instrument(_)
+            DataEvent::Data(Data::Instrument(_))
         ));
         let mut checker = BookStreamChecker::new(BookType::L2_MBP, true);
         checker.open(instrument_id());
@@ -1469,7 +1458,6 @@ async fn missing_replayed_snapshot_restarts_pair_after_reconnect() {
         assert_eq!(next_text(&mut socket).await, HELLO_TRADE);
         subscribe_book_deltas(&mut client, BookType::L2_MBP).unwrap();
         assert_eq!(next_text(&mut socket).await, HELLO_BOOK_TRADE);
-        settle().await;
         send(
             &mut socket,
             &book("book", 1, Some(true), &[("84000.00", "1")], &[]),
@@ -1489,7 +1477,6 @@ async fn missing_replayed_snapshot_restarts_pair_after_reconnect() {
         ));
         send(&mut socket, HEARTBEAT).await;
         assert_eq!(next_text(&mut socket).await, HELLO_BOOK_TRADE);
-        settle().await;
         send(
             &mut socket,
             &book(
@@ -1551,11 +1538,10 @@ async fn shutdown_closes_socket_and_reconnects_with_fresh_book_scope(
 
         drop(socket);
         client.connect().await.unwrap();
-        assert!(matches!(next_event(&mut rx).await, DataEvent::Instrument(_)));
+        assert!(matches!(next_event(&mut rx).await, DataEvent::Data(Data::Instrument(_))));
         subscribe_book_deltas(&mut client, BookType::L2_MBP).unwrap();
         let mut socket = accept(&ws_listener).await;
         let replay = next_text(&mut socket).await;
-        settle().await;
         send(&mut socket, &book("book", 1, Some(true), &[("84000.00", "1")], &[])).await;
         let mut checker = BookStreamChecker::new(BookType::L2_MBP, true);
         checker.open(instrument_id());
@@ -1842,7 +1828,7 @@ async fn instrument_refresh_preserves_stream_symbol(#[case] plural: bool) {
         client.disconnect().await.unwrap();
         client.connect().await.unwrap();
 
-        let DataEvent::Instrument(instrument) = next_event(&mut rx).await else {
+        let DataEvent::Data(Data::Instrument(instrument)) = next_event(&mut rx).await else {
             panic!("expected instrument");
         };
 
@@ -1877,7 +1863,7 @@ async fn connect_after_disconnect_restores_streaming() {
         assert!(client.is_disconnected());
         client.connect().await.unwrap();
 
-        let DataEvent::Instrument(instrument) = next_event(&mut rx).await else {
+        let DataEvent::Data(Data::Instrument(instrument)) = next_event(&mut rx).await else {
             panic!("expected instrument");
         };
 

@@ -29,9 +29,9 @@ use std::{
     },
 };
 
-use nautilus_core::UnixNanos;
 use nautilus_model::{
     enums::{OrderSide, TimeInForce},
+    events::OrderDeniedReason,
     identifiers::VenueOrderId,
     types::{Price, Quantity},
 };
@@ -53,6 +53,7 @@ use crate::{
         models::{PolymarketOpenOrder, PolymarketOrder},
         query::{CancelMarketOrdersParams, CancelResponse, OrderResponse},
     },
+    signing::eip712::OrderSigningContext,
 };
 
 /// Fee-adjustment context for market BUYs sized to the user's pUSD balance.
@@ -75,7 +76,7 @@ pub(crate) struct MarketOrderSubmitRequest {
     pub(crate) side: OrderSide,
     pub(crate) amount: Quantity,
     pub(crate) time_in_force: TimeInForce,
-    pub(crate) neg_risk: bool,
+    pub(crate) signing_context: OrderSigningContext,
     pub(crate) tick_size: Price,
     pub(crate) tick_decimals: u32,
     pub(crate) fee_context: Option<MarketBuyFeeContext>,
@@ -157,7 +158,7 @@ impl OrderSubmitter {
             side,
             amount,
             time_in_force,
-            neg_risk,
+            signing_context,
             tick_size,
             tick_decimals,
             fee_context,
@@ -206,12 +207,12 @@ impl OrderSubmitter {
 
         let poly_order = self
             .order_builder
-            .build_market_order(
+            .build_market_order_with_context(
                 &token_id,
                 poly_side,
                 price,
                 signed_amount,
-                neg_risk,
+                signing_context,
                 tick_decimals,
             )
             .map_err(|e| anyhow::anyhow!("Failed to build market order: {e}"))?;
@@ -223,7 +224,7 @@ impl OrderSubmitter {
             signed_base_quantity(poly_order.maker_amount, poly_order.taker_amount, poly_side);
         let expected_venue_order_id = self
             .order_builder
-            .expected_order_id(&poly_order, neg_risk)?;
+            .expected_order_id_with_context(&poly_order, signing_context)?;
         Ok(SignedMarketOrderSubmission {
             order: poly_order,
             order_type,
@@ -258,7 +259,11 @@ impl OrderSubmitter {
                     let poly_order = poly_order.clone();
                     let saw_unknown_outcome = saw_unknown_outcome.clone();
                     async move {
-                        let result = http_client.post_order(&poly_order, order_type, false).await;
+                        let result = http_client
+                            .post_order_guarded(&poly_order, order_type, false, || {
+                                self.ensure_submission_allowed()
+                            })
+                            .await;
 
                         if result.as_ref().is_err_and(Error::is_submit_outcome_unknown) {
                             saw_unknown_outcome.store(true, Ordering::Release);
@@ -488,16 +493,6 @@ impl OrderSubmitter {
             .map_err(|e| anyhow::anyhow!("Failed to fetch order status: {e}"))
     }
 
-    pub(crate) fn prepare_limit_order_submissions(
-        &self,
-        requests: &[LimitOrderSubmitRequest],
-    ) -> Vec<anyhow::Result<SignedLimitOrderSubmission>> {
-        requests
-            .iter()
-            .map(|request| self.prepare_limit_order_submission(request))
-            .collect()
-    }
-
     pub(crate) fn prepare_limit_order_submission(
         &self,
         request: &LimitOrderSubmitRequest,
@@ -505,30 +500,29 @@ impl OrderSubmitter {
         let order_type = PolymarketOrderType::try_from(request.time_in_force)
             .map_err(|e| anyhow::anyhow!("Unsupported time in force: {e}"))?;
         let side = PolymarketOrderSide::from(request.side);
-        let expiration = limit_order_expiration(request.expire_time);
 
         let order = if request.quote_quantity {
             anyhow::ensure!(
                 side == PolymarketOrderSide::Buy,
-                "Limit SELL orders require quote_quantity=false (amount in shares)"
+                OrderDeniedReason::unsupported_quote_quantity()
             );
             self.order_builder.build_limit_order_from_collateral(
                 &request.token_id,
                 request.price.as_decimal(),
                 request.quantity.as_decimal(),
-                &expiration,
-                request.neg_risk,
+                request.expire_time,
+                request.signing_context,
                 request.tick_decimals,
             )
         } else {
-            self.order_builder.build_limit_order(
+            self.order_builder.build_limit_order_with_context(
                 &request.token_id,
                 side,
                 request.price.as_decimal(),
                 request.quantity.as_decimal(),
                 order_type,
-                &expiration,
-                request.neg_risk,
+                request.expire_time,
+                request.signing_context,
                 request.tick_decimals,
             )
         }
@@ -550,7 +544,7 @@ impl OrderSubmitter {
 
         let expected_venue_order_id = self
             .order_builder
-            .expected_order_id(&order, request.neg_risk)?;
+            .expected_order_id_with_context(&order, request.signing_context)?;
         self.settlement
             .note_order_submitted(expected_venue_order_id);
 
@@ -580,10 +574,11 @@ impl OrderSubmitter {
                     let saw_unknown_outcome = saw_unknown_outcome.clone();
                     async move {
                         let result = http_client
-                            .post_order(
+                            .post_order_guarded(
                                 &submission.order,
                                 submission.order_type,
                                 submission.post_only,
+                                || self.ensure_submission_allowed(),
                             )
                             .await;
 
@@ -649,7 +644,15 @@ impl OrderSubmitter {
         // Do not retry batch submits automatically.
         // A transport timeout can race with server-side acceptance and resubmit
         // the whole batch without an idempotency key we can verify here.
-        self.http_client.post_orders(&order_refs).await
+        self.http_client
+            .post_orders_guarded(&order_refs, || self.ensure_submission_allowed())
+            .await
+    }
+
+    fn ensure_submission_allowed(&self) -> HttpResult<()> {
+        self.settlement
+            .ensure_submission_allowed()
+            .map_err(|e| Error::bad_request(e.to_string()))
     }
 }
 
@@ -791,20 +794,15 @@ fn signed_base_quantity(
     }
 }
 
-// Converts a nanos expire time to the unix-seconds string expected by the
-// Polymarket API. Returns `"0"` when there is no expiration.
-fn limit_order_expiration(expire_time: Option<UnixNanos>) -> String {
-    match expire_time {
-        Some(ns) if !ns.is_zero() => ns.as_seconds().to_string(),
-        _ => "0".to_string(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use std::{future::Future, task::Poll};
+    use std::{future::Future, sync::atomic::AtomicUsize, task::Poll};
 
-    use axum::{Router, http::StatusCode, routing::delete};
+    use axum::{
+        Router,
+        http::StatusCode,
+        routing::{delete, post},
+    };
     use nautilus_core::string::secret::SecretString;
     use nautilus_model::identifiers::AccountId;
     use rstest::rstest;
@@ -816,9 +814,290 @@ mod tests {
             credential::{Credential, EvmPrivateKey},
             enums::PolymarketSignatureType,
         },
+        execution::settlement::registry::tests::force_trade_fault,
         http::rate_limits::{PolymarketRateLimiter, RateLimitHeaders, TradingBucket},
         signing::eip712::OrderSigner,
     };
+
+    #[rstest]
+    #[tokio::test(start_paused = true)]
+    async fn test_trade_fault_blocks_http_submissions_after_rate_limit_wait(
+        #[values("limit", "market", "batch")] kind: &str,
+        #[values(false, true)] waiting: bool,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let posts = Arc::new(AtomicUsize::new(0));
+        let count = posts.clone();
+
+        let server = tokio::spawn(async move {
+            let handler = post(move || {
+                count.fetch_add(1, Ordering::Relaxed);
+                async { (StatusCode::BAD_REQUEST, "unexpected POST") }
+            });
+
+            axum::serve(
+                listener,
+                Router::new()
+                    .route("/order", handler.clone())
+                    .route("/orders", handler),
+            )
+            .await
+            .unwrap();
+        });
+
+        let signer = format!("fault-gate-{kind}-{waiting}");
+        let settlement = Arc::new(SettlementRegistry::new(AccountId::from("POLYMARKET-001")));
+        let submitter = submission_test_client(
+            format!("http://{address}"),
+            signer.clone(),
+            settlement.clone(),
+        );
+        let limiter = PolymarketRateLimiter::for_signer(&signer);
+
+        let headers = RateLimitHeaders::parse(
+            &[("Poly-RateLimit-Remaining".to_string(), "0".to_string())].into(),
+        );
+        limiter
+            .observe_response("/order", TradingBucket::Order, 0, 0, &headers, false)
+            .await;
+
+        if !waiting {
+            force_trade_fault(&settlement, "fault-trade", "correction declined");
+        }
+
+        let started = tokio::time::Instant::now();
+        let mut submission = Box::pin(post_submission(&submitter, kind));
+
+        if waiting {
+            std::future::poll_fn(|cx| {
+                assert!(submission.as_mut().poll(cx).is_pending());
+                Poll::Ready(())
+            })
+            .await;
+
+            force_trade_fault(&settlement, "fault-trade", "correction declined");
+            tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        }
+
+        let error = submission.await.unwrap_err().to_string();
+        server.abort();
+
+        assert_eq!(
+            error,
+            "bad request: Polymarket submissions for account POLYMARKET-001 are blocked until restart: settlement trade fault-trade is hard-faulted: correction declined"
+        );
+        assert_eq!(posts.load(Ordering::Relaxed), 0);
+
+        if !waiting {
+            assert_eq!(started.elapsed(), std::time::Duration::ZERO);
+        }
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_fault_during_submit_retry_preserves_unknown_outcome(
+        #[values("limit", "market")] kind: &str,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let settlement = Arc::new(SettlementRegistry::new(AccountId::from("POLYMARKET-001")));
+        let faulted = settlement.clone();
+        let posts = Arc::new(AtomicUsize::new(0));
+        let count = posts.clone();
+
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route(
+                    "/order",
+                    post(move || {
+                        count.fetch_add(1, Ordering::Relaxed);
+                        force_trade_fault(&faulted, "retry-trade", "terminal conflict");
+                        async { (StatusCode::SERVICE_UNAVAILABLE, "service unavailable") }
+                    }),
+                ),
+            )
+            .await
+            .unwrap();
+        });
+
+        let submitter = submission_test_client(
+            format!("http://{address}"),
+            format!("retry-fault-{kind}"),
+            settlement,
+        );
+        let error = post_submission(&submitter, kind).await.unwrap_err();
+        server.abort();
+
+        assert!(error.to_string().contains("retry-trade"), "{error}");
+
+        if kind == "market" {
+            let unknown = error.downcast_ref::<UnknownSubmitError>().unwrap();
+            assert_eq!(
+                unknown.expected_venue_order_id,
+                VenueOrderId::from(
+                    "0x1111111111111111111111111111111111111111111111111111111111111111"
+                )
+            );
+            assert_eq!(unknown.expected_base_qty, dec!(50));
+        } else {
+            assert!(
+                error
+                    .downcast_ref::<Error>()
+                    .unwrap()
+                    .is_submit_outcome_unknown()
+            );
+        }
+
+        assert_eq!(posts.load(Ordering::Relaxed), 1);
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_healthy_submission_and_faulted_cancellation_reach_http(
+        #[values("limit", "market", "batch")] kind: &str,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let posts = Arc::new(AtomicUsize::new(0));
+        let cancels = Arc::new(AtomicUsize::new(0));
+        let single_count = posts.clone();
+        let batch_count = posts.clone();
+        let cancel_count = cancels.clone();
+        let response: serde_json::Value =
+            serde_json::from_str(include_str!("../../test_data/http_order_response_ok.json"))
+                .unwrap();
+        let batch_response = vec![response.clone(), response.clone()];
+        let cancellation: serde_json::Value =
+            serde_json::from_str(include_str!("../../test_data/http_cancel_response_ok.json"))
+                .unwrap();
+
+        let server = tokio::spawn(async move {
+            let router = Router::new()
+                .route(
+                    "/order",
+                    post(move || {
+                        single_count.fetch_add(1, Ordering::Relaxed);
+                        let response = response.clone();
+                        async move { axum::Json(response) }
+                    })
+                    .delete(move || {
+                        cancel_count.fetch_add(1, Ordering::Relaxed);
+                        let cancellation = cancellation.clone();
+                        async move { axum::Json(cancellation) }
+                    }),
+                )
+                .route(
+                    "/orders",
+                    post(move || {
+                        batch_count.fetch_add(1, Ordering::Relaxed);
+                        let response = batch_response.clone();
+                        async move { axum::Json(response) }
+                    }),
+                );
+
+            axum::serve(listener, router).await.unwrap();
+        });
+
+        let settlement = Arc::new(SettlementRegistry::new(AccountId::from("POLYMARKET-001")));
+        let submitter = submission_test_client(
+            format!("http://{address}"),
+            format!("healthy-control-{kind}"),
+            settlement.clone(),
+        );
+        post_submission(&submitter, kind).await.unwrap();
+        force_trade_fault(&settlement, "cancel-trade", "terminal conflict");
+        let response = submitter
+            .cancel_order("0xb816482a1234567890abcdef1234567890abcdef1234567890abcdef12345678")
+            .await
+            .unwrap();
+        server.abort();
+
+        assert_eq!(
+            response.canceled,
+            vec!["0xb816482a1234567890abcdef1234567890abcdef1234567890abcdef12345678"]
+        );
+        assert_eq!(response.not_canceled, ahash::AHashMap::new());
+        assert_eq!(posts.load(Ordering::Relaxed), 1);
+        assert_eq!(cancels.load(Ordering::Relaxed), 1);
+    }
+
+    fn submission_test_client(
+        url: String,
+        address: String,
+        settlement: Arc<SettlementRegistry>,
+    ) -> OrderSubmitter {
+        let credential = Credential::new(
+            SecretString::from("test-key"),
+            SecretString::from("dGVzdA=="),
+            SecretString::from("test-passphrase"),
+        )
+        .unwrap();
+        let http_client =
+            PolymarketClobHttpClient::new(credential, address.clone(), Some(url), 5).unwrap();
+        let private_key = EvmPrivateKey::new(
+            "0x7234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
+        )
+        .unwrap();
+
+        let builder = Arc::new(PolymarketOrderBuilder::new(
+            OrderSigner::new(&private_key).unwrap(),
+            address.clone(),
+            address,
+            PolymarketSignatureType::Eoa,
+        ));
+
+        OrderSubmitter::new(
+            http_client,
+            builder,
+            RetryConfig {
+                max_retries: 1,
+                initial_delay_ms: 1,
+                max_delay_ms: 1,
+                jitter_ms: 0,
+                ..RetryConfig::default()
+            },
+            settlement,
+        )
+    }
+
+    async fn post_submission(submitter: &OrderSubmitter, kind: &str) -> anyhow::Result<()> {
+        let order =
+            serde_json::from_str(include_str!("../../test_data/http_signed_order.json")).unwrap();
+        let venue_order_id = VenueOrderId::from(
+            "0x1111111111111111111111111111111111111111111111111111111111111111",
+        );
+
+        if kind == "market" {
+            submitter
+                .post_market_order_submission(SignedMarketOrderSubmission {
+                    order,
+                    order_type: PolymarketOrderType::FAK,
+                    expected_base_qty: dec!(50),
+                    expected_venue_order_id: venue_order_id,
+                })
+                .await?;
+        } else {
+            let submission = SignedLimitOrderSubmission {
+                order,
+                order_type: PolymarketOrderType::GTC,
+                post_only: true,
+                expected_venue_order_id: venue_order_id,
+                expected_base_qty: Quantity::from("50"),
+            };
+
+            if kind == "batch" {
+                submitter
+                    .post_limit_order_submissions(vec![submission.clone(), submission])
+                    .await?;
+            } else {
+                submitter.post_limit_order_submission(submission).await?;
+            }
+        }
+
+        Ok(())
+    }
 
     #[rstest]
     #[case::local_burst(false, 120)]
@@ -926,16 +1205,6 @@ mod tests {
 
         assert!(error.response.canceled.is_empty());
         assert!(error.response.not_canceled.is_empty());
-    }
-
-    #[rstest]
-    #[case::none(None, "0")]
-    #[case::zero(Some(UnixNanos::from(0u64)), "0")]
-    #[case::one_second(Some(UnixNanos::from(1_000_000_000u64)), "1")]
-    #[case::sub_second_truncates(Some(UnixNanos::from(1_500_000_000u64)), "1")]
-    #[case::typical(Some(UnixNanos::from(1_735_689_600_000_000_000u64)), "1735689600")]
-    fn test_limit_order_expiration(#[case] expire_time: Option<UnixNanos>, #[case] expected: &str) {
-        assert_eq!(limit_order_expiration(expire_time), expected);
     }
 
     #[rstest]

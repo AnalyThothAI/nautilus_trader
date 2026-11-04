@@ -30,25 +30,26 @@ use std::{
 use axum::{
     Router,
     extract::{
-        RawQuery, State,
+        Query, RawQuery, State,
         ws::{Message, WebSocket},
     },
     http::StatusCode,
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
 };
+use jiff::{SignedDuration, Timestamp};
 use nautilus_binance::{
     common::{
         bar::BinanceBar,
         consts::{BINANCE_CLIENT_ID, BINANCE_VENUE},
-        enums::BinanceProductType,
+        enums::{BinanceEnvironment, BinanceProductType},
     },
     config::BinanceDataClientConfig,
     data_types::{
         BinanceFuturesLiquidation, BinanceFuturesMarkPriceUpdate, BinanceFuturesOpenInterest,
         BinanceFuturesOpenInterestHist, BinanceFuturesTicker,
     },
-    futures::BinanceFuturesDataClient,
+    futures::{BinanceFuturesDataClient, http::client::BinanceRawFuturesHttpClient},
 };
 use nautilus_common::{
     clients::DataClient,
@@ -98,6 +99,7 @@ struct DataTestServerState {
         Option<tokio::sync::mpsc::UnboundedSender<tokio::sync::oneshot::Sender<Response>>>,
     depth_failures_before_success: usize,
     depth_requests: Arc<AtomicUsize>,
+    depth_request_times: Arc<Mutex<Vec<tokio::time::Instant>>>,
     depth_response_delay: Duration,
     depth_snapshot_last_update_ids: Vec<u64>,
     depth_update_delay: Duration,
@@ -124,6 +126,7 @@ impl Default for DataTestServerState {
             exchange_info_requests: None,
             depth_failures_before_success: 0,
             depth_requests: Arc::new(AtomicUsize::new(0)),
+            depth_request_times: Arc::default(),
             depth_response_delay: Duration::ZERO,
             depth_snapshot_last_update_ids: vec![1027024],
             depth_update_delay: Duration::from_millis(50),
@@ -573,7 +576,17 @@ fn depth_update_message(
     depth_update
 }
 
-async fn handle_depth(State(state): State<DataTestServerState>) -> Response {
+async fn handle_depth(
+    State(state): State<DataTestServerState>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    let coin_m = query
+        .get("symbol")
+        .is_some_and(|symbol| symbol.starts_with("BTCUSD_"));
+    state
+        .depth_request_times
+        .lock()
+        .push(tokio::time::Instant::now());
     let request = state.depth_requests.fetch_add(1, Ordering::Relaxed);
     if request < state.depth_failures_before_success {
         return (
@@ -599,7 +612,7 @@ async fn handle_depth(State(state): State<DataTestServerState>) -> Response {
         "E": 1700000000000_i64,
         "T": 1700000000000_i64,
         "bids": [["50000.00", "1.000"], ["49999.00", "2.000"]],
-        "asks": [["50001.00", "0.500"], ["50002.00", "1.500"]]
+        "asks": [["50001.00", if coin_m { "1" } else { "0.500" }], ["50002.00", if coin_m { "2" } else { "1.500" }]]
     }))
 }
 
@@ -741,7 +754,7 @@ fn futures_agg_trades_response(
         .get("startTime")
         .or_else(|| query.get("endTime"))
         .and_then(|value| value.parse().ok())
-        .unwrap_or_else(|| jiff::Timestamp::now().as_millisecond());
+        .unwrap_or_else(|| Timestamp::now().as_millisecond());
     state.market_queries.lock().push((path.to_string(), query));
     let quantity = if path.starts_with("/dapi") {
         "2"
@@ -785,7 +798,7 @@ fn futures_klines_response(
     let close_time = query
         .get("endTime")
         .and_then(|value| value.parse::<i64>().ok())
-        .unwrap_or_else(|| jiff::Timestamp::now().as_millisecond() - 1_000);
+        .unwrap_or_else(|| Timestamp::now().as_millisecond() - 1_000);
     state.market_queries.lock().push((path.to_string(), query));
 
     if state.empty_klines {
@@ -843,6 +856,21 @@ fn create_data_test_router(state: DataTestServerState) -> Router {
             get(|| async { json_response(&load_fixture("exchange_info_delivery_coinm.json")) }),
         )
         .route("/fapi/v1/depth", get(handle_depth))
+        .route("/dapi/v1/depth", get(handle_depth))
+        .route(
+            "/fapi/v1/cooldown",
+            post(|Query(query): Query<HashMap<String, String>>| async move {
+                if let Some(hold) = query.get("hold") {
+                    tokio::time::sleep(Duration::from_secs(hold.parse().unwrap())).await;
+                }
+
+                (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    [("Retry-After", query["seconds"].clone())],
+                    json!({"code": -1003, "msg": "test cooldown"}).to_string(),
+                )
+            }),
+        )
         .route("/fapi/v1/aggTrades", get(handle_usdm_agg_trades))
         .route("/dapi/v1/aggTrades", get(handle_coinm_agg_trades))
         .route("/fapi/v1/klines", get(handle_usdm_klines))
@@ -897,6 +925,7 @@ async fn recv_data(
     loop {
         let remaining = deadline.checked_duration_since(tokio::time::Instant::now())?;
         match tokio::time::timeout(remaining, rx.recv()).await {
+            Ok(Some(DataEvent::Data(Data::Instrument(_)))) => {}
             Ok(Some(DataEvent::Data(data))) => return Some(data),
             Ok(Some(_)) => {}
             Ok(None) | Err(_) => return None,
@@ -1004,8 +1033,9 @@ async fn test_delivery_instrument_connects_and_subscribes_with_raw_symbol(
             let found = rx.try_recv().is_ok_and(|event| {
                 matches!(
                     event,
-                    DataEvent::Instrument(InstrumentAny::CryptoFuture(future))
-                        if future.id == instrument_id
+                    DataEvent::Data(Data::Instrument(instrument))
+                        if matches!(instrument.as_ref(), InstrumentAny::CryptoFuture(future)
+                            if future.id == instrument_id)
                 )
             });
             async move { found }
@@ -1063,7 +1093,7 @@ async fn test_connect_emits_instruments() {
         || {
             let found = rx
                 .try_recv()
-                .is_ok_and(|e| matches!(e, DataEvent::Instrument(_)));
+                .is_ok_and(|e| matches!(e, DataEvent::Data(Data::Instrument(_))));
             async move { found }
         },
         Duration::from_secs(5),
@@ -1560,7 +1590,6 @@ async fn test_request_funding_rates_emits_response() {
     "BTCUSDT_260925.BINANCE",
     "/fapi/v1/aggTrades",
     "BTCUSDT_260925",
-    dec!(50001.2),
     dec!(0.123),
     AggregateTradeBounds::Both
 )]
@@ -1569,7 +1598,6 @@ async fn test_request_funding_rates_emits_response() {
     "BTCUSD_260925.BINANCE",
     "/dapi/v1/aggTrades",
     "BTCUSD_260925",
-    dec!(50001.2),
     dec!(2),
     AggregateTradeBounds::Both
 )]
@@ -1578,7 +1606,6 @@ async fn test_request_funding_rates_emits_response() {
     "BTCUSDT_260925.BINANCE",
     "/fapi/v1/aggTrades",
     "BTCUSDT_260925",
-    dec!(50001.2),
     dec!(0.123),
     AggregateTradeBounds::Start
 )]
@@ -1587,7 +1614,6 @@ async fn test_request_funding_rates_emits_response() {
     "BTCUSD_260925.BINANCE",
     "/dapi/v1/aggTrades",
     "BTCUSD_260925",
-    dec!(50001.2),
     dec!(2),
     AggregateTradeBounds::End
 )]
@@ -1597,9 +1623,9 @@ async fn test_request_bounded_aggregate_trades_routes_futures_product(
     #[case] instrument: &str,
     #[case] expected_path: &str,
     #[case] expected_symbol: &str,
-    #[case] expected_price: Decimal,
     #[case] expected_size: Decimal,
     #[case] bounds: AggregateTradeBounds,
+    #[values(10, 2_160)] lookback_mins: i64,
 ) {
     let state = DataTestServerState::default();
     let addr = start_data_test_server_with_state(state.clone()).await;
@@ -1612,8 +1638,8 @@ async fn test_request_bounded_aggregate_trades_routes_futures_product(
 
     while rx.try_recv().is_ok() {}
     let instrument_id = InstrumentId::from(instrument);
-    let start = jiff::Timestamp::now() - jiff::SignedDuration::from_mins(10);
-    let end = start + jiff::SignedDuration::from_mins(5);
+    let start = Timestamp::now() - SignedDuration::from_mins(lookback_mins);
+    let end = start + SignedDuration::from_mins(5);
     let (request_start, request_end) = match bounds {
         AggregateTradeBounds::Start => (Some(start), None),
         AggregateTradeBounds::End => (None, Some(end)),
@@ -1665,7 +1691,7 @@ async fn test_request_bounded_aggregate_trades_routes_futures_product(
     assert_eq!(query.get("limit").map(String::as_str), Some("456"));
     assert_eq!(response.instrument_ids, vec![instrument_id]);
     assert_eq!(response.data.len(), 1);
-    assert_eq!(response.data[0].price.as_decimal(), expected_price);
+    assert_eq!(response.data[0].price.as_decimal(), dec!(50001.2));
     assert_eq!(response.data[0].size.as_decimal(), expected_size);
     assert_eq!(response.data[0].trade_id.to_string(), "101");
     assert_eq!(
@@ -1707,8 +1733,8 @@ async fn test_request_historical_binance_bars_routes_futures_product(
     while rx.try_recv().is_ok() {}
     let bar_type = BarType::from(bar_type_raw);
     let data_type = binance_bar_data_type(bar_type);
-    let start = jiff::Timestamp::from_millisecond(1_700_000_000_000).unwrap();
-    let end = jiff::Timestamp::from_millisecond(1_700_000_059_999).unwrap();
+    let start = Timestamp::from_millisecond(1_700_000_000_000).unwrap();
+    let end = Timestamp::from_millisecond(1_700_000_059_999).unwrap();
     let request_id = UUID4::new();
 
     client
@@ -1917,7 +1943,7 @@ async fn test_subscribe_trades() {
         || {
             let found = rx
                 .try_recv()
-                .is_ok_and(|e| matches!(e, DataEvent::Instrument(_)));
+                .is_ok_and(|e| matches!(e, DataEvent::Data(Data::Instrument(_))));
             async move { found }
         },
         Duration::from_secs(5),
@@ -1965,7 +1991,7 @@ async fn test_subscribe_quotes() {
         || {
             let found = rx
                 .try_recv()
-                .is_ok_and(|e| matches!(e, DataEvent::Instrument(_)));
+                .is_ok_and(|e| matches!(e, DataEvent::Data(Data::Instrument(_))));
             async move { found }
         },
         Duration::from_secs(5),
@@ -2740,13 +2766,8 @@ async fn test_failed_unsubscribe_keeps_gate_closed() {
     };
 
     client.subscribe_book_deltas(subscribe(5)).unwrap();
-    let Data::BookDeltas(snapshot) = recv_data(&mut rx, Duration::from_secs(10))
-        .await
-        .expect("expected depth 5 snapshot")
-    else {
-        panic!("expected book deltas");
-    };
-    assert_eq!(snapshot.deltas.len(), 5 * 2 + 1);
+
+    recv_partial_snapshots(&mut rx, &state, 5).await;
 
     // A rejected unsubscribe yields no confirmation, so the gate fails closed
     client
@@ -2883,13 +2904,8 @@ async fn test_market_reconnect_does_not_clear_gate() {
     };
 
     client.subscribe_book_deltas(subscribe(5)).unwrap();
-    let Data::BookDeltas(snapshot) = recv_data(&mut rx, Duration::from_secs(10))
-        .await
-        .expect("expected depth 5 snapshot")
-    else {
-        panic!("expected book deltas");
-    };
-    assert_eq!(snapshot.deltas.len(), 5 * 2 + 1);
+
+    recv_partial_snapshots(&mut rx, &state, 5).await;
 
     // A rejected depth-5 unsubscribe leaves the gate armed with no confirmation coming
     client
@@ -2990,13 +3006,8 @@ async fn test_failed_unsubscribe_stays_closed_across_transitions() {
     };
 
     client.subscribe_book_deltas(subscribe(20)).unwrap();
-    let Data::BookDeltas(snapshot) = recv_data(&mut rx, Duration::from_secs(10))
-        .await
-        .expect("expected depth 20 snapshot")
-    else {
-        panic!("expected book deltas");
-    };
-    assert_eq!(snapshot.deltas.len(), 20 * 2 + 1);
+
+    recv_partial_snapshots(&mut rx, &state, 20).await;
 
     // The rejected depth-20 unsubscribe leaves its stream unresolved
     client
@@ -3075,13 +3086,8 @@ async fn test_partial_to_diff_depth_change_drops_in_flight_frames() {
             None,
         ))
         .unwrap();
-    let Data::BookDeltas(snapshot) = recv_data(&mut rx, Duration::from_secs(10))
-        .await
-        .expect("expected depth 5 snapshot")
-    else {
-        panic!("expected book deltas");
-    };
-    assert_eq!(snapshot.deltas.len(), 5 * 2 + 1);
+
+    recv_partial_snapshots(&mut rx, &state, 5).await;
 
     client
         .unsubscribe_book_deltas(&UnsubscribeBookDeltas::new(
@@ -3333,13 +3339,8 @@ async fn test_disconnect_clears_pending_unsubscribe_gate() {
     };
 
     client.subscribe_book_deltas(subscribe(20)).unwrap();
-    let Data::BookDeltas(snapshot) = recv_data(&mut rx, Duration::from_secs(10))
-        .await
-        .expect("expected depth 20 snapshot")
-    else {
-        panic!("expected book deltas");
-    };
-    assert_eq!(snapshot.deltas.len(), 20 * 2 + 1);
+
+    recv_partial_snapshots(&mut rx, &state, 20).await;
 
     // The rejected unsubscribe leaves the gate armed across the teardown
     client
@@ -3390,6 +3391,29 @@ async fn test_disconnect_clears_pending_unsubscribe_gate() {
     client.disconnect().await.unwrap();
 }
 
+async fn recv_partial_snapshots(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<DataEvent>,
+    state: &DataTestServerState,
+    depth: usize,
+) {
+    // Gates cannot retract snapshots already emitted before the subscription changes
+    for index in 0..state.depth_update_repetitions {
+        let Data::BookDeltas(snapshot) = recv_data(rx, Duration::from_secs(10))
+            .await
+            .expect("expected partial depth snapshot")
+        else {
+            panic!("expected book deltas");
+        };
+
+        assert_eq!(snapshot.deltas.len(), depth * 2 + 1);
+        assert_eq!(snapshot.deltas[0].action, BookAction::Clear);
+        assert_eq!(
+            snapshot.sequence,
+            state.depth_update_final_update_id + index as u64
+        );
+    }
+}
+
 #[rstest]
 #[tokio::test]
 async fn test_subscribe_book_deltas() {
@@ -3406,7 +3430,7 @@ async fn test_subscribe_book_deltas() {
         || {
             let found = rx
                 .try_recv()
-                .is_ok_and(|e| matches!(e, DataEvent::Instrument(_)));
+                .is_ok_and(|e| matches!(e, DataEvent::Data(Data::Instrument(_))));
             async move { found }
         },
         Duration::from_secs(5),
@@ -3473,6 +3497,100 @@ async fn test_subscribe_book_deltas() {
     assert_eq!(replayed.deltas[3].order.price.as_decimal(), dec!(50002.00));
     assert_eq!(replayed.deltas[3].order.size.as_decimal(), dec!(1.500));
     assert_eq!(replayed.deltas[3].flags, RecordFlag::F_LAST as u8);
+}
+
+#[rstest]
+#[case::usd_m(BinanceProductType::UsdM, "BTCUSDT-PERP.BINANCE")]
+#[case::coin_m(BinanceProductType::CoinM, "BTCUSD_260925.BINANCE")]
+#[tokio::test]
+async fn test_request_book_snapshot_keeps_weight_budget_after_extended_cooldown(
+    #[case] product: BinanceProductType,
+    #[case] instrument_id: &str,
+) {
+    let config = DataTestServerState::default();
+    let times = config.depth_request_times.clone();
+    let addr = start_data_test_server_with_state(config).await;
+    let url = format!("http://{addr}");
+    let (mut client, mut rx) =
+        create_test_data_client_for_product_type(url.clone(), format!("ws://{addr}/ws"), product);
+    client.connect().await.unwrap();
+
+    while rx.try_recv().is_ok() {}
+    // USD-M and COIN-M share the IP cooldown scope.
+    let throttle = BinanceRawFuturesHttpClient::new(
+        BinanceProductType::UsdM,
+        BinanceEnvironment::Live,
+        Some("test-key".into()),
+        Some("test-secret".into()),
+        Some(url),
+        None,
+        None,
+        None,
+    )
+    .unwrap();
+
+    let started = tokio::time::Instant::now();
+
+    let initial_and_queue = async {
+        let initial = throttle
+            .post::<_, serde_json::Value>(
+                "cooldown",
+                Some(&HashMap::from([("seconds", 11)])),
+                None,
+                true,
+                false,
+            )
+            .await;
+
+        for _ in 0..70 {
+            client
+                .request_book_snapshot(RequestBookSnapshot::new(
+                    InstrumentId::from(instrument_id),
+                    Some(NonZeroUsize::new(1000).unwrap()),
+                    Some(*BINANCE_CLIENT_ID),
+                    UUID4::new(),
+                    UnixNanos::default(),
+                    None,
+                ))
+                .unwrap();
+        }
+
+        initial
+    };
+
+    let extension_params = HashMap::from([("seconds", 16), ("hold", 5)]);
+    let extension = throttle.post::<_, serde_json::Value>(
+        "cooldown",
+        Some(&extension_params),
+        None,
+        true,
+        false,
+    );
+    let (initial, extension) = tokio::join!(initial_and_queue, extension);
+    tokio::time::sleep(Duration::from_secs(105)).await;
+    let times = times.lock().clone();
+    let responses = std::iter::from_fn(|| rx.try_recv().ok())
+        .filter(|event| matches!(event, DataEvent::Response(DataResponse::Book(_))))
+        .count();
+
+    assert!(initial.is_err());
+    assert!(extension.is_err());
+    assert_eq!(times.len(), 70);
+    assert_eq!(responses, 70);
+    assert!(
+        times
+            .iter()
+            .all(|time| *time >= started + Duration::from_secs(21))
+    );
+
+    for start in &times {
+        let weight = times
+            .iter()
+            .filter(|time| **time >= *start && **time < *start + Duration::from_secs(60))
+            .count()
+            * 20;
+        assert!(weight <= 1_200, "snapshot weight exceeded budget: {weight}");
+    }
 }
 
 #[rstest]
@@ -3556,7 +3674,7 @@ async fn test_subscribe_book_deltas_accepts_first_overlapping_diff_with_older_pu
         || {
             let found = rx
                 .try_recv()
-                .is_ok_and(|e| matches!(e, DataEvent::Instrument(_)));
+                .is_ok_and(|e| matches!(e, DataEvent::Data(Data::Instrument(_))));
             async move { found }
         },
         Duration::from_secs(5),
@@ -3626,7 +3744,7 @@ async fn test_subscribe_book_deltas_rejects_gap_after_snapshot_seam_update() {
         || {
             let found = rx
                 .try_recv()
-                .is_ok_and(|e| matches!(e, DataEvent::Instrument(_)));
+                .is_ok_and(|e| matches!(e, DataEvent::Data(Data::Instrument(_))));
             async move { found }
         },
         Duration::from_secs(5),
@@ -3683,7 +3801,7 @@ async fn test_subscribe_book_deltas_waits_for_first_depth_update_before_snapshot
         || {
             let found = rx
                 .try_recv()
-                .is_ok_and(|e| matches!(e, DataEvent::Instrument(_)));
+                .is_ok_and(|e| matches!(e, DataEvent::Data(Data::Instrument(_))));
             async move { found }
         },
         Duration::from_secs(5),
@@ -3765,7 +3883,7 @@ async fn test_subscribe_book_deltas_keeps_buffered_diffs_across_overlap_retry() 
         || {
             let found = rx
                 .try_recv()
-                .is_ok_and(|e| matches!(e, DataEvent::Instrument(_)));
+                .is_ok_and(|e| matches!(e, DataEvent::Data(Data::Instrument(_))));
             async move { found }
         },
         Duration::from_secs(5),
@@ -3840,7 +3958,7 @@ async fn test_subscribe_book_deltas_recovers_live_sequence_gap() {
         || {
             let found = rx
                 .try_recv()
-                .is_ok_and(|e| matches!(e, DataEvent::Instrument(_)));
+                .is_ok_and(|e| matches!(e, DataEvent::Data(Data::Instrument(_))));
             async move { found }
         },
         Duration::from_secs(5),
@@ -3912,7 +4030,7 @@ async fn test_subscribe_book_deltas_empty_diff_advances_sequence() {
         || {
             let found = rx
                 .try_recv()
-                .is_ok_and(|e| matches!(e, DataEvent::Instrument(_)));
+                .is_ok_and(|e| matches!(e, DataEvent::Data(Data::Instrument(_))));
             async move { found }
         },
         Duration::from_secs(5),
@@ -3978,7 +4096,7 @@ async fn test_subscribe_book_deltas_retries_transient_depth_snapshot_failure() {
         || {
             let found = rx
                 .try_recv()
-                .is_ok_and(|e| matches!(e, DataEvent::Instrument(_)));
+                .is_ok_and(|e| matches!(e, DataEvent::Data(Data::Instrument(_))));
             async move { found }
         },
         Duration::from_secs(5),
@@ -4049,7 +4167,7 @@ async fn test_subscribe_mark_prices() {
         || {
             let found = rx
                 .try_recv()
-                .is_ok_and(|e| matches!(e, DataEvent::Instrument(_)));
+                .is_ok_and(|e| matches!(e, DataEvent::Data(Data::Instrument(_))));
             async move { found }
         },
         Duration::from_secs(5),
@@ -4117,7 +4235,7 @@ async fn test_subscribe_custom_ticker_for_instrument_emits_custom_data() {
         || {
             let found = rx
                 .try_recv()
-                .is_ok_and(|e| matches!(e, DataEvent::Instrument(_)));
+                .is_ok_and(|e| matches!(e, DataEvent::Data(Data::Instrument(_))));
             async move { found }
         },
         Duration::from_secs(5),
@@ -4192,7 +4310,7 @@ async fn test_unsubscribed_custom_ticker_frame_is_ignored() {
         || {
             let found = rx
                 .try_recv()
-                .is_ok_and(|e| matches!(e, DataEvent::Instrument(_)));
+                .is_ok_and(|e| matches!(e, DataEvent::Data(Data::Instrument(_))));
             async move { found }
         },
         Duration::from_secs(5),
@@ -4238,7 +4356,7 @@ async fn test_subscribe_custom_liquidations_for_instrument() {
         || {
             let found = rx
                 .try_recv()
-                .is_ok_and(|e| matches!(e, DataEvent::Instrument(_)));
+                .is_ok_and(|e| matches!(e, DataEvent::Data(Data::Instrument(_))));
             async move { found }
         },
         Duration::from_secs(5),
@@ -4299,7 +4417,7 @@ async fn test_subscribe_custom_liquidations_all_market() {
         || {
             let found = rx
                 .try_recv()
-                .is_ok_and(|e| matches!(e, DataEvent::Instrument(_)));
+                .is_ok_and(|e| matches!(e, DataEvent::Data(Data::Instrument(_))));
             async move { found }
         },
         Duration::from_secs(5),
@@ -4357,7 +4475,7 @@ async fn test_subscribe_custom_liquidations_overlap_routes_single_event() {
         || {
             let found = rx
                 .try_recv()
-                .is_ok_and(|e| matches!(e, DataEvent::Instrument(_)));
+                .is_ok_and(|e| matches!(e, DataEvent::Data(Data::Instrument(_))));
             async move { found }
         },
         Duration::from_secs(5),
@@ -4454,7 +4572,7 @@ async fn test_unsubscribe_all_market_restores_specific_liquidation_streams() {
         || {
             let found = rx
                 .try_recv()
-                .is_ok_and(|e| matches!(e, DataEvent::Instrument(_)));
+                .is_ok_and(|e| matches!(e, DataEvent::Data(Data::Instrument(_))));
             async move { found }
         },
         Duration::from_secs(5),
@@ -4564,7 +4682,7 @@ async fn test_rapid_all_market_unsubscribe_does_not_route_all_market_as_specific
         || {
             let found = rx
                 .try_recv()
-                .is_ok_and(|e| matches!(e, DataEvent::Instrument(_)));
+                .is_ok_and(|e| matches!(e, DataEvent::Data(Data::Instrument(_))));
             async move { found }
         },
         Duration::from_secs(5),
@@ -4696,7 +4814,7 @@ async fn test_unsubscribe_trades() {
         || {
             let found = rx
                 .try_recv()
-                .is_ok_and(|e| matches!(e, DataEvent::Instrument(_)));
+                .is_ok_and(|e| matches!(e, DataEvent::Data(Data::Instrument(_))));
             async move { found }
         },
         Duration::from_secs(5),
@@ -4758,7 +4876,7 @@ async fn test_unsubscribe_quotes() {
         || {
             let found = rx
                 .try_recv()
-                .is_ok_and(|e| matches!(e, DataEvent::Instrument(_)));
+                .is_ok_and(|e| matches!(e, DataEvent::Data(Data::Instrument(_))));
             async move { found }
         },
         Duration::from_secs(5),
@@ -4819,7 +4937,7 @@ async fn test_unsubscribe_custom_ticker_for_instrument_sends_stream_unsubscribe(
         || {
             let found = rx
                 .try_recv()
-                .is_ok_and(|e| matches!(e, DataEvent::Instrument(_)));
+                .is_ok_and(|e| matches!(e, DataEvent::Data(Data::Instrument(_))));
             async move { found }
         },
         Duration::from_secs(5),
@@ -4934,7 +5052,7 @@ async fn test_unsubscribe_custom_liquidations_for_instrument() {
         || {
             let found = rx
                 .try_recv()
-                .is_ok_and(|e| matches!(e, DataEvent::Instrument(_)));
+                .is_ok_and(|e| matches!(e, DataEvent::Data(Data::Instrument(_))));
             async move { found }
         },
         Duration::from_secs(5),
@@ -4995,7 +5113,7 @@ async fn test_unsubscribe_custom_liquidations_all_market() {
         || {
             let found = rx
                 .try_recv()
-                .is_ok_and(|e| matches!(e, DataEvent::Instrument(_)));
+                .is_ok_and(|e| matches!(e, DataEvent::Data(Data::Instrument(_))));
             async move { found }
         },
         Duration::from_secs(5),
@@ -5058,7 +5176,7 @@ async fn test_connect_disconnect_reconnect() {
         || {
             let found = rx
                 .try_recv()
-                .is_ok_and(|e| matches!(e, DataEvent::Instrument(_)));
+                .is_ok_and(|e| matches!(e, DataEvent::Data(Data::Instrument(_))));
             async move { found }
         },
         Duration::from_secs(5),
@@ -5077,7 +5195,7 @@ async fn test_connect_disconnect_reconnect() {
         || {
             let found = rx
                 .try_recv()
-                .is_ok_and(|e| matches!(e, DataEvent::Instrument(_)));
+                .is_ok_and(|e| matches!(e, DataEvent::Data(Data::Instrument(_))));
             async move { found }
         },
         Duration::from_secs(5),
@@ -5101,7 +5219,7 @@ async fn test_subscribe_trades_and_quotes_simultaneously() {
         || {
             let found = rx
                 .try_recv()
-                .is_ok_and(|e| matches!(e, DataEvent::Instrument(_)));
+                .is_ok_and(|e| matches!(e, DataEvent::Data(Data::Instrument(_))));
             async move { found }
         },
         Duration::from_secs(5),
@@ -5284,8 +5402,8 @@ async fn test_instrument_status_updates_do_not_overlap(#[case] poll_first: bool)
 
     while let Ok(event) = events.try_recv() {
         match event {
-            DataEvent::InstrumentStatus(status) => statuses.push(status),
-            DataEvent::Instrument(instrument) => instruments.push(instrument.id()),
+            DataEvent::Data(Data::InstrumentStatus(status)) => statuses.push(status),
+            DataEvent::Data(Data::Instrument(instrument)) => instruments.push(instrument.id()),
             _ => {}
         }
     }

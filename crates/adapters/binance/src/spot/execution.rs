@@ -20,6 +20,7 @@ use std::{future::Future, sync::Arc, time::Duration};
 use ahash::{AHashMap, AHashSet};
 use anyhow::Context;
 use async_trait::async_trait;
+use indexmap::IndexMap;
 use jiff::Timestamp;
 use nautilus_common::{
     cache::fifo::FifoCache,
@@ -49,13 +50,14 @@ use nautilus_model::{
     accounts::AccountAny,
     enums::{ContingencyType, LiquiditySide, OmsType, OrderStatus, OrderType},
     events::{
-        AccountState, OrderAccepted, OrderCancelRejected, OrderCanceled, OrderDeniedReason,
-        OrderEventAny, OrderExpired, OrderFilled, OrderModifyRejected, OrderRejected, OrderUpdated,
+        AccountState, OrderAccepted, OrderCancelDenied, OrderCancelRejected, OrderCanceled,
+        OrderDeniedReason, OrderEventAny, OrderExpired, OrderFilled, OrderModifyDenied,
+        OrderModifyRejected, OrderRejected, OrderUpdated,
     },
     identifiers::{
         AccountId, ClientId, ClientOrderId, InstrumentId, StrategyId, TradeId, Venue, VenueOrderId,
     },
-    instruments::Instrument,
+    instruments::{Instrument, InstrumentAny},
     orders::{Order, OrderAny},
     reports::{ExecutionMassStatus, FillReport, OrderStatusReport, PositionStatusReport},
     types::{AccountBalance, Currency, MarginBalance, Money, Price, Quantity},
@@ -89,6 +91,7 @@ use crate::{
         encoder::{decode_client_order_id, encode_broker_id},
         enums::{BinanceEnvironment, BinanceOrderStatus, BinanceSide, BinanceTimeInForce},
         failure::{classify_spot_http_failure, classify_venue_failure, sanitize_reason},
+        instruments::BinanceInstrumentSelector,
         parse::{
             parse_micros, parse_micros_or_init, parse_millis_or_init, parse_required_decimal,
             parse_required_price_at_precision, parse_required_quantity_at_precision,
@@ -261,6 +264,24 @@ impl BinanceSpotExecutionClient {
         })
     }
 
+    fn restore_active_orders(&self) {
+        for order in crate::common::execution::active_orders(&self.core) {
+            let Some(instrument) = self
+                .http_client
+                .get_instrument(&order.instrument_id().symbol.inner())
+            else {
+                continue;
+            };
+
+            if instrument.id() != order.instrument_id() {
+                continue;
+            }
+
+            self.dispatch_state
+                .restore_order(&order, None, instrument.price_precision());
+        }
+    }
+
     fn resolve_ws_trading_url(base_url: Option<String>, environment: BinanceEnvironment) -> String {
         base_url.unwrap_or_else(|| {
             match environment {
@@ -384,6 +405,7 @@ impl BinanceSpotExecutionClient {
             dispatch_state.pending_requests.insert(
                 request_id.clone(),
                 PendingRequest {
+                    command_id: None,
                     client_order_id,
                     venue_order_id: None,
                     operation: PendingOperation::Place,
@@ -498,6 +520,7 @@ impl BinanceSpotExecutionClient {
             dispatch_state.pending_requests.insert(
                 request_id.clone(),
                 PendingRequest {
+                    command_id: Some(command.command_id),
                     client_order_id: command.client_order_id,
                     venue_order_id: command.venue_order_id,
                     operation: PendingOperation::Cancel,
@@ -515,7 +538,7 @@ impl BinanceSpotExecutionClient {
                         dispatch_state.pending_requests.remove(&request_id);
                         let ts_now = clock.get_time_ns();
 
-                        let rejected = OrderCancelRejected::new(
+                        let mut rejected = OrderCancelDenied::new(
                             trader_id,
                             command.strategy_id,
                             command.instrument_id,
@@ -528,11 +551,11 @@ impl BinanceSpotExecutionClient {
                             UUID4::new(),
                             ts_now,
                             ts_now,
-                            false,
                             command.venue_order_id,
                             Some(account_id),
                         );
-                        event_emitter.send_order_event(OrderEventAny::CancelRejected(rejected));
+                        rejected.causation_id = Some(command.command_id);
+                        event_emitter.send_order_event(OrderEventAny::CancelDenied(rejected));
                     })?;
 
                 let result = ws_client
@@ -595,10 +618,30 @@ impl BinanceSpotExecutionClient {
                                     command.client_order_id
                                 );
                             }
-                            CommandFailure::NotSent(reason)
-                            | CommandFailure::VenueRejected(reason) => {
+                            CommandFailure::NotSent(reason) => {
                                 let ts_now = clock.get_time_ns();
-                                let rejected_event = OrderCancelRejected::new(
+
+                                let mut rejected_event = OrderCancelDenied::new(
+                                    trader_id,
+                                    command.strategy_id,
+                                    command.instrument_id,
+                                    command.client_order_id,
+                                    format!("cancel-order-error: {}", sanitize_reason(&reason))
+                                        .into(),
+                                    UUID4::new(),
+                                    ts_now,
+                                    ts_now,
+                                    command.venue_order_id,
+                                    Some(account_id),
+                                );
+                            rejected_event.causation_id = Some(command.command_id);
+                                event_emitter
+                                    .send_order_event(OrderEventAny::CancelDenied(rejected_event));
+                            }
+                            CommandFailure::VenueRejected(reason) => {
+                                let ts_now = clock.get_time_ns();
+
+                                let mut rejected_event = OrderCancelRejected::new(
                                     trader_id,
                                     command.strategy_id,
                                     command.instrument_id,
@@ -612,6 +655,7 @@ impl BinanceSpotExecutionClient {
                                     command.venue_order_id,
                                     Some(account_id),
                                 );
+        rejected_event.causation_id = Some(command.command_id);
                                 event_emitter
                                     .send_order_event(OrderEventAny::CancelRejected(rejected_event));
                             }
@@ -903,6 +947,11 @@ impl ExecutionClient for BinanceSpotExecutionClient {
         self.core.oms_type
     }
 
+    // Spot position reports are empty, so an absent report is not evidence of a flat position
+    fn provides_bulk_position_coverage(&self, _instrument_id: InstrumentId) -> bool {
+        false
+    }
+
     fn get_account(&self) -> Option<AccountAny> {
         self.core.cache().account_owned(&self.core.account_id)
     }
@@ -962,6 +1011,8 @@ impl ExecutionClient for BinanceSpotExecutionClient {
 
             self.core.set_instruments_initialized();
         }
+
+        self.restore_active_orders();
 
         // Request initial account state
         let account_state = self
@@ -1648,8 +1699,6 @@ impl ExecutionClient for BinanceSpotExecutionClient {
             .transpose()?
             .map(|lookback| ts_now.saturating_sub(lookback));
 
-        // Binance requires instrument_id for historical orders (open_only=false).
-        // Use open_only=true for mass status to get all open orders across instruments.
         let order_cmd = GenerateOrderStatusReportsBuilder::default()
             .log_receipt_level(LogLevel::Off)
             .ts_init(ts_now)
@@ -1676,6 +1725,19 @@ impl ExecutionClient for BinanceSpotExecutionClient {
             .collect();
         {
             let cache = self.core.cache();
+            instrument_ids.extend(cache.external_order_claim_instrument_ids(None));
+            instrument_ids.extend(
+                cache
+                    .positions_open(
+                        Some(&BINANCE_VENUE),
+                        None,
+                        None,
+                        Some(&self.core.account_id),
+                        None,
+                    )
+                    .into_iter()
+                    .map(|position| position.instrument_id),
+            );
             instrument_ids.extend(
                 cache
                     .orders_open(
@@ -1701,12 +1763,73 @@ impl ExecutionClient for BinanceSpotExecutionClient {
                     }),
             );
         }
+
+        let selector = BinanceInstrumentSelector::new(
+            &self.config.instrument_provider,
+            self.config.product_type,
+        )?;
+        instrument_ids.extend(
+            self.http_client
+                .instrument_ids_reconciliation()
+                .into_iter()
+                .filter(|id| selector.is_explicit(*id, id.symbol.as_str())),
+        );
+
+        {
+            let cache = self.core.cache();
+            instrument_ids.retain(|id| {
+                id.venue == *BINANCE_VENUE
+                    && !self.config.instrument_provider.excludes(*id)
+                    && cache.instrument(id).is_none_or(|instrument| {
+                        matches!(instrument, InstrumentAny::CurrencyPair(_))
+                    })
+            });
+        }
+
         instrument_ids.sort_unstable();
         instrument_ids.dedup();
 
+        let mut order_reports: IndexMap<_, _> = order_reports
+            .into_iter()
+            .map(|report| (report.venue_order_id, report))
+            .collect();
+        let mut reports_complete = true;
         let mut fill_reports = Vec::new();
 
         for instrument_id in instrument_ids {
+            if self
+                .http_client
+                .get_instrument(&instrument_id.symbol.inner())
+                .is_none_or(|instrument| instrument.id() != instrument_id)
+            {
+                log::warn!("Cannot recover Binance Spot history for unresolved {instrument_id}");
+                reports_complete = false;
+                continue;
+            }
+
+            match self
+                .http_client
+                .request_order_history(self.core.account_id, instrument_id, start, ts_now)
+                .await
+            {
+                Ok(mut history) => {
+                    normalize_spot_order_status_reports(
+                        &mut history,
+                        self.config.treat_expired_as_canceled,
+                    );
+                    crate::common::execution::merge_order_history(
+                        &mut order_reports,
+                        history,
+                        start,
+                        ts_now,
+                    );
+                }
+                Err(e) => {
+                    log::warn!("Failed to recover Binance Spot history for {instrument_id}: {e}");
+                    reports_complete = false;
+                }
+            }
+
             let fill_cmd = GenerateFillReportsBuilder::default()
                 .log_receipt_level(LogLevel::Off)
                 .ts_init(ts_now)
@@ -1730,24 +1853,23 @@ impl ExecutionClient for BinanceSpotExecutionClient {
             None,
         );
 
-        let reported_order_ids: AHashSet<_> = order_reports
-            .iter()
-            .map(|report| report.venue_order_id)
-            .collect();
         let cache = self.core.cache();
-        let reports_complete = fill_reports.iter().all(|fill| {
-            reported_order_ids.contains(&fill.venue_order_id)
-                || cache
-                    .client_order_id(&fill.venue_order_id)
-                    .and_then(|client_order_id| cache.order(client_order_id))
-                    .is_some_and(|order| {
-                        order.instrument_id() == fill.instrument_id
-                            && order.account_id() == Some(fill.account_id)
-                            && order.order_side() == fill.order_side
-                    })
-        });
-        mass_status.set_report_window(start, reports_complete);
-        mass_status.add_order_reports(order_reports);
+
+        let reports_complete = reports_complete
+            && fill_reports.iter().all(|fill| {
+                order_reports.contains_key(&fill.venue_order_id)
+                    || cache
+                        .client_order_id(&fill.venue_order_id)
+                        .and_then(|client_order_id| cache.order(client_order_id))
+                        .is_some_and(|order| {
+                            order.instrument_id() == fill.instrument_id
+                                && order.account_id() == Some(fill.account_id)
+                                && order.order_side() == fill.order_side
+                        })
+            });
+
+        mass_status.set_report_window(Some(start.unwrap_or_default()), reports_complete);
+        mass_status.add_order_reports(order_reports.into_values().collect());
         mass_status.add_fill_reports(fill_reports);
         mass_status.add_position_reports(position_reports);
 
@@ -1900,7 +2022,8 @@ impl ExecutionClient for BinanceSpotExecutionClient {
                 cmd.client_order_id
             );
             let ts_init = self.clock.get_time_ns();
-            let rejected_event = OrderModifyRejected::new(
+
+            let mut rejected_event = OrderModifyDenied::new(
                 self.core.trader_id,
                 cmd.strategy_id,
                 cmd.instrument_id,
@@ -1909,13 +2032,13 @@ impl ExecutionClient for BinanceSpotExecutionClient {
                 UUID4::new(),
                 ts_init, // no venue timestamp, rejected locally
                 ts_init,
-                false,
                 cmd.venue_order_id,
                 Some(self.core.account_id),
             );
+            rejected_event.causation_id = Some(cmd.command_id);
 
             self.emitter
-                .send_order_event(OrderEventAny::ModifyRejected(rejected_event));
+                .send_order_event(OrderEventAny::ModifyDenied(rejected_event));
             return Ok(());
         };
 
@@ -1953,6 +2076,7 @@ impl ExecutionClient for BinanceSpotExecutionClient {
             dispatch_state.pending_requests.insert(
                 request_id.clone(),
                 PendingRequest {
+                    command_id: Some(command.command_id),
                     client_order_id: command.client_order_id,
                     venue_order_id: command.venue_order_id,
                     operation: PendingOperation::Modify,
@@ -2044,13 +2168,14 @@ impl ExecutionClient for BinanceSpotExecutionClient {
                             anyhow::bail!("Spot replacement response has no price");
                         };
 
-                        if !dispatch_state.record_order_update(
+                        if dispatch_state.record_order_update(
                             command.client_order_id,
                             report.venue_order_id,
                             report.quantity,
                             price,
                             report.trigger_price,
-                        ) {
+                        ) != Some(true)
+                        {
                             return Ok(());
                         }
                         let ts_now = clock.get_time_ns();
@@ -2277,9 +2402,7 @@ fn validate_order(order: &impl Order, use_gtd: bool) -> Result<(), OrderDeniedRe
     }
 
     if order.is_quote_quantity() && order_type != OrderType::Market {
-        return Err(OrderDeniedReason::ValidationFailed {
-            detail: "Quote quantity requires a MARKET order on Binance Spot".to_string(),
-        });
+        return Err(OrderDeniedReason::unsupported_quote_quantity());
     }
 
     Ok(())
@@ -2478,7 +2601,8 @@ fn dispatch_ws_trading_message(
                     .get(&pending.client_order_id)
                 {
                     let ts_now = clock.get_time_ns();
-                    let rejected = OrderCancelRejected::new(
+
+                    let mut rejected = OrderCancelRejected::new(
                         emitter.trader_id(),
                         identity.strategy_id,
                         identity.instrument_id,
@@ -2491,6 +2615,7 @@ fn dispatch_ws_trading_message(
                         pending.venue_order_id,
                         Some(account_id),
                     );
+                    rejected.causation_id = pending.command_id;
                     emitter.send_order_event(OrderEventAny::CancelRejected(rejected));
                 }
             }
@@ -2554,7 +2679,8 @@ fn dispatch_ws_trading_message(
                     .get(&pending.client_order_id)
                 {
                     let ts_now = clock.get_time_ns();
-                    let rejected = OrderModifyRejected::new(
+
+                    let mut rejected = OrderModifyRejected::new(
                         emitter.trader_id(),
                         identity.strategy_id,
                         identity.instrument_id,
@@ -2567,6 +2693,7 @@ fn dispatch_ws_trading_message(
                         pending.venue_order_id,
                         Some(account_id),
                     );
+                    rejected.causation_id = pending.command_id;
                     emitter.send_order_event(OrderEventAny::ModifyRejected(rejected));
                 }
             }
@@ -3182,7 +3309,7 @@ fn build_spot_oco_order_list_params(
     }
 
     if first.is_quote_quantity() || second.is_quote_quantity() {
-        return Err("Binance Spot OCO order-list legs do not support quote quantity".to_string());
+        return Err(OrderDeniedReason::unsupported_quote_quantity().to_string());
     }
 
     let mut above = None;
@@ -3403,9 +3530,7 @@ fn emit_canceled_after_rejected_replace(
     emitter.send_order_event(OrderEventAny::Canceled(canceled));
 }
 
-/// Handles a failed HTTP cancel-replace: emits `OrderModifyRejected` for a
-/// definitive rejection and replays the withheld cancel report if it already
-/// arrived.
+// Replay a withheld cancel report only after the modify outcome is definitive
 fn handle_http_modify_failure(
     error: &anyhow::Error,
     command: &ModifyOrder,
@@ -3427,14 +3552,38 @@ fn handle_http_modify_failure(
                 command.client_order_id
             );
         }
-        CommandFailure::NotSent(reason) | CommandFailure::VenueRejected(reason) => {
+        CommandFailure::NotSent(reason) => {
+            if let Some(canceled) = state.reject_replace(command.client_order_id) {
+                state.cleanup_terminal(command.client_order_id);
+                emitter.send_order_event(OrderEventAny::Canceled(canceled));
+            }
+
+            let mut rejected_event = OrderModifyDenied::new(
+                emitter.trader_id(),
+                command.strategy_id,
+                command.instrument_id,
+                command.client_order_id,
+                format!("modify-order-error: {}", sanitize_reason(&reason)).into(),
+                UUID4::new(),
+                ts_now,
+                ts_now,
+                command.venue_order_id,
+                Some(account_id),
+            );
+            rejected_event.causation_id = Some(command.command_id);
+            emitter.send_order_event(OrderEventAny::ModifyDenied(rejected_event));
+            if let Some(report) = state.on_cancel_replace_rejected(cancel_id) {
+                emit_canceled_after_rejected_replace(emitter, state, account_id, report, ts_now);
+            }
+        }
+        CommandFailure::VenueRejected(reason) => {
             if let Some(canceled) = state.reject_replace(command.client_order_id) {
                 state.cleanup_terminal(command.client_order_id);
                 emitter.send_order_event(OrderEventAny::Canceled(canceled));
                 return;
             }
 
-            let rejected_event = OrderModifyRejected::new(
+            let mut rejected_event = OrderModifyRejected::new(
                 emitter.trader_id(),
                 command.strategy_id,
                 command.instrument_id,
@@ -3447,6 +3596,7 @@ fn handle_http_modify_failure(
                 command.venue_order_id,
                 Some(account_id),
             );
+            rejected_event.causation_id = Some(command.command_id);
             emitter.send_order_event(OrderEventAny::ModifyRejected(rejected_event));
 
             if let Some(report) = state.on_cancel_replace_rejected(cancel_id) {
@@ -3629,7 +3779,7 @@ fn dispatch_tracked_execution_report(
             log::warn!("Skipping unknown Spot execution type for {}", report.symbol);
         }
         BinanceSpotExecutionType::New => {
-            if state.has_filled(&client_order_id) {
+            if state.is_order_new_stale(&client_order_id, venue_order_id) {
                 log::debug!("Skipping New for already-filled {client_order_id}");
                 return;
             }
@@ -3666,6 +3816,12 @@ fn dispatch_tracked_execution_report(
                 None
             };
 
+            let Some(changed) = identity.is_quote_quantity.then_some(false).or_else(|| {
+                state.record_order_update(client_order_id, venue_order_id, quantity, price, trigger)
+            }) else {
+                return;
+            };
+
             let first_list_report =
                 state
                     .order_lists
@@ -3676,15 +3832,6 @@ fn dispatch_tracked_execution_report(
                         list.execution_report_seen = true;
                         first
                     });
-
-            let changed = !identity.is_quote_quantity
-                && state.record_order_update(
-                    client_order_id,
-                    venue_order_id,
-                    quantity,
-                    price,
-                    trigger,
-                );
 
             if state.has_emitted_accepted(&client_order_id) {
                 if !changed || first_list_report {
@@ -3727,7 +3874,7 @@ fn dispatch_tracked_execution_report(
         }
         BinanceSpotExecutionType::Trade => {
             let dedup_key = (report.symbol, report.trade_id);
-            let is_duplicate = seen_trade_ids.lock().contains(&dedup_key);
+            let is_duplicate = state.has_trade(&client_order_id, &dedup_key, seen_trade_ids);
 
             if is_duplicate {
                 log::debug!(
@@ -3795,60 +3942,21 @@ fn dispatch_tracked_execution_report(
                 LiquiditySide::Taker
             };
 
-            if identity.is_quote_quantity {
-                let Some(quantity) = parse_spot_execution_report_quantity(
-                    report,
-                    &report.original_qty,
-                    size_precision,
-                    "original_qty",
-                ) else {
-                    return;
-                };
-
-                let Some(cumulative_qty) = parse_spot_execution_report_decimal(
-                    report,
-                    &report.cumulative_filled_qty,
-                    "cumulative_filled_qty",
-                ) else {
-                    return;
-                };
-
-                if quantity.is_zero() || quantity.as_decimal() < cumulative_qty {
-                    log::warn!(
-                        "Cannot normalize Spot quote quantity for {client_order_id}: \
-                         original_qty={}, cumulative_filled_qty={cumulative_qty}",
-                        report.original_qty,
-                    );
-                    return;
-                }
-
-                if state.record_order_update(
-                    client_order_id,
-                    venue_order_id,
-                    quantity,
-                    Price::zero(price_precision),
-                    None,
-                ) {
-                    let updated = OrderUpdated::new(
-                        emitter.trader_id(),
-                        identity.strategy_id,
-                        identity.instrument_id,
-                        client_order_id,
-                        quantity,
-                        UUID4::new(),
-                        ts_event,
-                        ts_init,
-                        false,
-                        Some(venue_order_id),
-                        Some(account_id),
-                        None,
-                        None,
-                        None,
-                        false,
-                    );
-                    emitter.send_order_event(OrderEventAny::Updated(updated));
-                }
-            }
+            let Some(()) = emit_order_update_from_fill(
+                report,
+                identity,
+                client_order_id,
+                venue_order_id,
+                account_id,
+                price_precision,
+                size_precision,
+                ts_event,
+                ts_init,
+                emitter,
+                state,
+            ) else {
+                return;
+            };
 
             let filled = OrderFilled::new(
                 emitter.trader_id(),
@@ -3993,6 +4101,96 @@ fn dispatch_tracked_execution_report(
             );
         }
     }
+}
+
+#[expect(clippy::too_many_arguments)]
+fn emit_order_update_from_fill(
+    report: &BinanceSpotExecutionReport,
+    identity: &OrderIdentity,
+    client_order_id: ClientOrderId,
+    venue_order_id: VenueOrderId,
+    account_id: AccountId,
+    price_precision: u8,
+    size_precision: u8,
+    ts_event: UnixNanos,
+    ts_init: UnixNanos,
+    emitter: &ExecutionEventEmitter,
+    state: &WsDispatchState,
+) -> Option<()> {
+    let quantity = parse_spot_execution_report_quantity(
+        report,
+        &report.original_qty,
+        size_precision,
+        "original_qty",
+    )?;
+    let cumulative_qty = parse_spot_execution_report_decimal(
+        report,
+        &report.cumulative_filled_qty,
+        "cumulative_filled_qty",
+    )?;
+
+    if quantity.is_zero() || quantity.as_decimal() < cumulative_qty {
+        log::warn!(
+            "Invalid Spot order quantity for {client_order_id}: \
+             original_qty={}, cumulative_filled_qty={cumulative_qty}",
+            report.original_qty,
+        );
+        return None;
+    }
+
+    let (price, trigger_price) = if identity.is_quote_quantity {
+        (Price::zero(price_precision), None)
+    } else {
+        let price =
+            parse_spot_execution_report_price(report, &report.price, price_precision, "price")?;
+        let stop_price =
+            parse_spot_execution_report_decimal(report, &report.stop_price, "stop_price")?;
+
+        let trigger_price = if stop_price > Decimal::ZERO {
+            Some(parse_spot_execution_report_price(
+                report,
+                &report.stop_price,
+                price_precision,
+                "stop_price",
+            )?)
+        } else {
+            None
+        };
+
+        (price, trigger_price)
+    };
+
+    if state.record_order_update_from_fill(
+        client_order_id,
+        venue_order_id,
+        quantity,
+        price,
+        trigger_price,
+        identity,
+    ) != Some(true)
+    {
+        return Some(());
+    }
+
+    let updated = OrderUpdated::new(
+        emitter.trader_id(),
+        identity.strategy_id,
+        identity.instrument_id,
+        client_order_id,
+        quantity,
+        UUID4::new(),
+        ts_event,
+        ts_init,
+        false,
+        Some(venue_order_id),
+        Some(account_id),
+        identity.price.map(|_| price),
+        trigger_price,
+        None,
+        false,
+    );
+    emitter.send_order_event(OrderEventAny::Updated(updated));
+    Some(())
 }
 
 fn parse_spot_execution_report_quantity(
@@ -4213,7 +4411,12 @@ mod tests {
         false,
         Some(OrderDeniedReason::UnsupportedReduceOnly)
     )]
-    #[case::limit_quote_quantity(OrderType::Limit, false, true, Some(OrderDeniedReason::ValidationFailed { detail: "Quote quantity requires a MARKET order on Binance Spot".to_string() }))]
+    #[case::limit_quote_quantity(
+        OrderType::Limit,
+        false,
+        true,
+        Some(OrderDeniedReason::unsupported_quote_quantity())
+    )]
     #[case::market_quote_quantity(OrderType::Market, false, true, None)]
     fn test_validate_order_fields(
         #[case] order_type: OrderType,
@@ -4304,6 +4507,7 @@ mod tests {
         dispatch_state.pending_requests.insert(
             "req-cancel".to_string(),
             PendingRequest {
+                command_id: None,
                 client_order_id: ClientOrderId::from("TEST"),
                 venue_order_id: Some(VenueOrderId::from("12345")),
                 operation: PendingOperation::Cancel,
@@ -4374,6 +4578,7 @@ mod tests {
         dispatch_state.pending_requests.insert(
             "req-submit".to_string(),
             PendingRequest {
+                command_id: None,
                 client_order_id,
                 venue_order_id: None,
                 operation: PendingOperation::Place,
@@ -4428,6 +4633,7 @@ mod tests {
         dispatch_state.pending_requests.insert(
             "req-submit".to_string(),
             PendingRequest {
+                command_id: None,
                 client_order_id,
                 venue_order_id: None,
                 operation: PendingOperation::Place,
@@ -4495,6 +4701,7 @@ mod tests {
         dispatch_state.pending_requests.insert(
             "req-modify".to_string(),
             PendingRequest {
+                command_id: None,
                 client_order_id: ClientOrderId::from("TEST"),
                 venue_order_id: Some(VenueOrderId::from("12345")),
                 operation: PendingOperation::Modify,
@@ -4900,6 +5107,7 @@ mod tests {
             state.pending_requests.insert(
                 child.client_order_id.clone(),
                 PendingRequest {
+                    command_id: None,
                     client_order_id: ClientOrderId::from(child.client_order_id.as_str()),
                     venue_order_id: None,
                     operation: PendingOperation::Place,
@@ -5318,6 +5526,7 @@ mod tests {
             state.pending_requests.insert(
                 request_id.to_string(),
                 PendingRequest {
+                    command_id: None,
                     client_order_id,
                     venue_order_id: None,
                     operation: PendingOperation::Cancel,
@@ -5563,10 +5772,16 @@ mod tests {
         let (emitter, mut rx) = create_test_emitter(clock);
         let http_client = create_test_http_client(clock);
         let client_order_id = ClientOrderId::from("x-TD67BGP9-T0000000000000");
+        let local_client_order_id = ClientOrderId::from("O-20200101-000000-000-000-0");
         let dispatch_state = create_tracked_dispatch_state(
-            ClientOrderId::from("O-20200101-000000-000-000-0"),
+            local_client_order_id,
             InstrumentId::from("ETHUSDT.BINANCE"),
         );
+        dispatch_state
+            .order_identities
+            .get_mut(&local_client_order_id)
+            .unwrap()
+            .price = Some(Price::from("2500.00"));
         let ws_authenticated = tokio::sync::Notify::new();
         let ws_user_data_subscribed = tokio::sync::Notify::new();
         let (ws_setup_error_tx, _ws_setup_error_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -5610,6 +5825,26 @@ mod tests {
         while let Ok(event) = rx.try_recv() {
             events.push(event);
         }
+
+        assert_eq!(events.len(), 2);
+
+        let ExecutionEvent::Order(OrderEventAny::Accepted(accepted)) = &events[0] else {
+            panic!("Expected acceptance before the first fill")
+        };
+
+        let expected = OrderAccepted::new(
+            TraderId::from("TESTER-001"),
+            StrategyId::from("TEST-STRATEGY"),
+            InstrumentId::from("ETHUSDT.BINANCE"),
+            local_client_order_id,
+            VenueOrderId::from("12345678"),
+            AccountId::from("BINANCE-001"),
+            accepted.event_id,
+            accepted.ts_init,
+            accepted.ts_init,
+            false,
+        );
+        assert_eq!(*accepted, expected);
 
         let fills: Vec<_> = events
             .iter()
@@ -6300,6 +6535,7 @@ mod tests {
         dispatch_state.pending_requests.insert(
             "req-modify".to_string(),
             PendingRequest {
+                command_id: None,
                 client_order_id,
                 venue_order_id: Some(VenueOrderId::from("12345678")),
                 operation: PendingOperation::Modify,
@@ -6489,6 +6725,7 @@ mod tests {
         dispatch_state.pending_requests.insert(
             "req-modify".to_string(),
             PendingRequest {
+                command_id: None,
                 client_order_id,
                 venue_order_id: Some(VenueOrderId::from("12345678")),
                 operation: PendingOperation::Modify,
@@ -6659,13 +6896,16 @@ mod tests {
         replacement.original_qty = "2.00000".to_string();
 
         if http_first {
-            assert!(state.record_order_update(
-                client_order_id,
-                new_id,
-                Quantity::from("2.00000"),
-                Price::from("2501.00"),
-                None
-            ));
+            assert_eq!(
+                state.record_order_update(
+                    client_order_id,
+                    new_id,
+                    Quantity::from("2.00000"),
+                    Price::from("2501.00"),
+                    None
+                ),
+                Some(true)
+            );
         }
         let mut canceled = original.clone();
         canceled.execution_type = BinanceSpotExecutionType::Canceled;
@@ -6685,13 +6925,16 @@ mod tests {
             dispatch(&replacement);
             dispatch(&canceled);
             assert!(state.order_identities.contains_key(&client_order_id));
-            assert!(!state.record_order_update(
-                client_order_id,
-                new_id,
-                Quantity::from("2.00000"),
-                Price::from("2501.00"),
-                None
-            ));
+            assert_eq!(
+                state.record_order_update(
+                    client_order_id,
+                    new_id,
+                    Quantity::from("2.00000"),
+                    Price::from("2501.00"),
+                    None
+                ),
+                Some(false)
+            );
         }
         assert!(matches!(
             rx.try_recv().unwrap(),

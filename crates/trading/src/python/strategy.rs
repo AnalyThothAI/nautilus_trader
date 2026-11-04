@@ -75,11 +75,11 @@ use nautilus_model::{
     },
     enums::{BookType, OmsType, OrderSide, PositionSide, TimeInForce},
     events::{
-        OrderAccepted, OrderCancelRejected, OrderCanceled, OrderDenied, OrderEmulated,
-        OrderEventAny, OrderExpired, OrderFillVoided, OrderFilled, OrderInitialized,
-        OrderModifyRejected, OrderPendingCancel, OrderPendingUpdate, OrderRejected, OrderReleased,
-        OrderSubmitted, OrderTriggered, OrderUpdated, PositionChanged, PositionClosed,
-        PositionEvent, PositionOpened,
+        OrderAccepted, OrderCancelDenied, OrderCancelRejected, OrderCanceled, OrderDenied,
+        OrderEmulated, OrderEventAny, OrderExpired, OrderFillVoided, OrderFilled, OrderInitialized,
+        OrderModifyDenied, OrderModifyRejected, OrderPendingCancel, OrderPendingUpdate,
+        OrderRejected, OrderReleased, OrderSubmitted, OrderTriggered, OrderUpdated,
+        PositionChanged, PositionClosed, PositionEvent, PositionOpened,
     },
     identifiers::{
         AccountId, ActorId, ClientId, ClientOrderId, InstrumentId, OptionSeriesId, PositionId,
@@ -99,7 +99,7 @@ use nautilus_portfolio::{portfolio::Portfolio, python::PyPortfolio};
 use pyo3::{
     IntoPyObjectExt,
     prelude::*,
-    types::{PyBytes, PyDict, PyList, PyWeakrefReference},
+    types::{PyBytes, PyDict, PyList, PySet, PyWeakrefReference},
 };
 use ustr::Ustr;
 
@@ -546,12 +546,32 @@ impl PyStrategyInner {
         Ok(())
     }
 
+    fn dispatch_on_order_modify_denied(&self, event: OrderModifyDenied) -> PyResult<()> {
+        if let Some(py_self) = self.python_instance()? {
+            Python::attach(|py| {
+                py_self.call_method1(py, "on_order_modify_denied", (event.into_py_any(py)?,))
+            })?;
+        }
+
+        Ok(())
+    }
+
     fn dispatch_on_order_modify_rejected(&self, event: OrderModifyRejected) -> PyResult<()> {
         if let Some(py_self) = self.python_instance()? {
             Python::attach(|py| {
                 py_self.call_method1(py, "on_order_modify_rejected", (event.into_py_any(py)?,))
             })?;
         }
+        Ok(())
+    }
+
+    fn dispatch_on_order_cancel_denied(&self, event: OrderCancelDenied) -> PyResult<()> {
+        if let Some(py_self) = self.python_instance()? {
+            Python::attach(|py| {
+                py_self.call_method1(py, "on_order_cancel_denied", (event.into_py_any(py)?,))
+            })?;
+        }
+
         Ok(())
     }
 
@@ -1047,10 +1067,24 @@ impl Strategy for PyStrategyInner {
         );
     }
 
+    fn on_order_modify_denied(&mut self, event: OrderModifyDenied) {
+        self.logger.log_callback_error(
+            "on_order_modify_denied",
+            self.dispatch_on_order_modify_denied(event),
+        );
+    }
+
     fn on_order_modify_rejected(&mut self, event: OrderModifyRejected) {
         self.logger.log_callback_error(
             "on_order_modify_rejected",
             self.dispatch_on_order_modify_rejected(event),
+        );
+    }
+
+    fn on_order_cancel_denied(&mut self, event: OrderCancelDenied) {
+        self.logger.log_callback_error(
+            "on_order_cancel_denied",
+            self.dispatch_on_order_cancel_denied(event),
         );
     }
 
@@ -1115,6 +1149,7 @@ impl DataActor for PyStrategyInner {
         nautilus_common::python::response::response_handler(
             self.core().actor_id().inner(),
             Self::python_instance,
+            None,
         )
     }
 
@@ -2452,8 +2487,16 @@ impl PyStrategy {
     fn py_on_order_pending_cancel(_slf: &Bound<'_, Self>, event: OrderPendingCancel) {}
 
     #[allow(unused_variables)]
+    #[pyo3(name = "on_order_modify_denied")]
+    fn py_on_order_modify_denied(_slf: &Bound<'_, Self>, event: OrderModifyDenied) {}
+
+    #[allow(unused_variables)]
     #[pyo3(name = "on_order_modify_rejected")]
     fn py_on_order_modify_rejected(_slf: &Bound<'_, Self>, event: OrderModifyRejected) {}
+
+    #[allow(unused_variables)]
+    #[pyo3(name = "on_order_cancel_denied")]
+    fn py_on_order_cancel_denied(_slf: &Bound<'_, Self>, event: OrderCancelDenied) {}
 
     #[allow(unused_variables)]
     #[pyo3(name = "on_order_cancel_rejected")]
@@ -3533,17 +3576,26 @@ impl PyStrategy {
     }
 
     #[pyo3(name = "request_data")]
-    #[pyo3(signature = (data_type, client_id, start=None, end=None, limit=None, params=None))]
+    #[pyo3(signature = (data_type, client_id, start=None, end=None, limit=None, params=None, callback=None))]
+    #[expect(clippy::too_many_arguments)]
     fn py_request_data(
-        &mut self,
+        slf: &Bound<'_, Self>,
+        py: Python<'_>,
         data_type: DataType,
         client_id: ClientId,
         start: Option<Timestamp>,
         end: Option<Timestamp>,
         limit: Option<usize>,
         params: Option<Py<PyDict>>,
+        #[gen_stub(override_type(type_repr = "typing.Callable[[str], None] | None"))]
+        callback: Option<Py<PyAny>>,
     ) -> PyResult<String> {
-        self.ensure_registered_for_data()?;
+        let actor = Self {
+            inner: Rc::clone(&slf.try_borrow()?.inner),
+        };
+
+        actor.ensure_registered_for_data()?;
+
         let params_map = Python::attach(|py| -> PyResult<Option<Params>> {
             match params {
                 Some(dict) => from_pydict(py, &dict),
@@ -3551,23 +3603,32 @@ impl PyStrategy {
             }
         })?;
         let limit = limit.and_then(NonZeroUsize::new);
-        let request_id = DataActor::request_data(
-            self.inner_mut(),
+        let handler = nautilus_common::python::response::request_handler(
+            py,
+            actor.inner().core().actor_id().inner(),
+            PyStrategyInner::python_instance,
+            callback,
+        )?;
+        let request_id = DataActorCore::request_data(
+            actor.inner().core(),
             data_type,
             client_id,
             start,
             end,
             limit,
             params_map,
+            handler,
         )
         .map_err(to_pyvalue_err)?;
         Ok(request_id.to_string())
     }
 
     #[pyo3(name = "request_instrument")]
-    #[pyo3(signature = (instrument_id, start=None, end=None, client_id=None, params=None))]
+    #[pyo3(signature = (instrument_id, start=None, end=None, client_id=None, params=None, callback=None))]
+    #[expect(clippy::too_many_arguments)]
     fn py_request_instrument(
-        &mut self,
+        slf: &Bound<'_, Self>,
+        py: Python<'_>,
         #[gen_stub(override_type(
             type_repr = "model.InstrumentId | typing.Sequence[model.InstrumentId]"
         ))]
@@ -3576,60 +3637,93 @@ impl PyStrategy {
         end: Option<Timestamp>,
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
+        #[gen_stub(override_type(type_repr = "typing.Callable[[str], None] | None"))]
+        callback: Option<Py<PyAny>>,
     ) -> PyResult<String> {
+        let actor = Self {
+            inner: Rc::clone(&slf.try_borrow()?.inner),
+        };
+
         let instrument_id = extract_instrument_ids(instrument_id)?;
-        self.ensure_registered_for_data()?;
+        actor.ensure_registered_for_data()?;
+
         let params_map = Python::attach(|py| -> PyResult<Option<Params>> {
             match params {
                 Some(dict) => from_pydict(py, &dict),
                 None => Ok(None),
             }
         })?;
-        let request_id = DataActor::request_instrument(
-            self.inner_mut(),
+
+        let handler = nautilus_common::python::response::request_handler(
+            py,
+            actor.inner().core().actor_id().inner(),
+            PyStrategyInner::python_instance,
+            callback,
+        )?;
+        let request_id = DataActorCore::request_instrument(
+            actor.inner().core(),
             instrument_id,
             start,
             end,
             client_id,
             params_map,
+            handler,
         )
         .map_err(to_pyvalue_err)?;
         Ok(request_id.to_string())
     }
 
     #[pyo3(name = "request_instruments")]
-    #[pyo3(signature = (venue=None, start=None, end=None, client_id=None, params=None))]
+    #[pyo3(signature = (venue=None, start=None, end=None, client_id=None, params=None, callback=None))]
+    #[expect(clippy::too_many_arguments)]
     fn py_request_instruments(
-        &mut self,
+        slf: &Bound<'_, Self>,
+        py: Python<'_>,
         venue: Option<Venue>,
         start: Option<Timestamp>,
         end: Option<Timestamp>,
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
+        #[gen_stub(override_type(type_repr = "typing.Callable[[str], None] | None"))]
+        callback: Option<Py<PyAny>>,
     ) -> PyResult<String> {
-        self.ensure_registered_for_data()?;
+        let actor = Self {
+            inner: Rc::clone(&slf.try_borrow()?.inner),
+        };
+
+        actor.ensure_registered_for_data()?;
+
         let params_map = Python::attach(|py| -> PyResult<Option<Params>> {
             match params {
                 Some(dict) => from_pydict(py, &dict),
                 None => Ok(None),
             }
         })?;
-        let request_id = DataActor::request_instruments(
-            self.inner_mut(),
+
+        let handler = nautilus_common::python::response::request_handler(
+            py,
+            actor.inner().core().actor_id().inner(),
+            PyStrategyInner::python_instance,
+            callback,
+        )?;
+        let request_id = DataActorCore::request_instruments(
+            actor.inner().core(),
             venue,
             start,
             end,
             client_id,
             params_map,
+            handler,
         )
         .map_err(to_pyvalue_err)?;
         Ok(request_id.to_string())
     }
 
     #[pyo3(name = "request_book_snapshot")]
-    #[pyo3(signature = (instrument_id, depth=None, client_id=None, params=None))]
+    #[pyo3(signature = (instrument_id, depth=None, client_id=None, params=None, callback=None))]
     fn py_request_book_snapshot(
-        &mut self,
+        slf: &Bound<'_, Self>,
+        py: Python<'_>,
         #[gen_stub(override_type(
             type_repr = "model.InstrumentId | typing.Sequence[model.InstrumentId]"
         ))]
@@ -3637,9 +3731,16 @@ impl PyStrategy {
         depth: Option<usize>,
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
+        #[gen_stub(override_type(type_repr = "typing.Callable[[str], None] | None"))]
+        callback: Option<Py<PyAny>>,
     ) -> PyResult<String> {
+        let actor = Self {
+            inner: Rc::clone(&slf.try_borrow()?.inner),
+        };
+
         let instrument_id = extract_instrument_ids(instrument_id)?;
-        self.ensure_registered_for_data()?;
+        actor.ensure_registered_for_data()?;
+
         let params_map = Python::attach(|py| -> PyResult<Option<Params>> {
             match params {
                 Some(dict) => from_pydict(py, &dict),
@@ -3648,21 +3749,30 @@ impl PyStrategy {
         })?;
         let depth = depth.and_then(NonZeroUsize::new);
 
-        let request_id = DataActor::request_book_snapshot(
-            self.inner_mut(),
+        let handler = nautilus_common::python::response::request_handler(
+            py,
+            actor.inner().core().actor_id().inner(),
+            PyStrategyInner::python_instance,
+            callback,
+        )?;
+        let request_id = DataActorCore::request_book_snapshot(
+            actor.inner().core(),
             instrument_id,
             depth,
             client_id,
             params_map,
+            handler,
         )
         .map_err(to_pyvalue_err)?;
         Ok(request_id.to_string())
     }
 
     #[pyo3(name = "request_book_deltas")]
-    #[pyo3(signature = (instrument_id, start=None, end=None, limit=None, client_id=None, params=None))]
+    #[pyo3(signature = (instrument_id, start=None, end=None, limit=None, client_id=None, params=None, callback=None))]
+    #[expect(clippy::too_many_arguments)]
     fn py_request_book_deltas(
-        &mut self,
+        slf: &Bound<'_, Self>,
+        py: Python<'_>,
         #[gen_stub(override_type(
             type_repr = "model.InstrumentId | typing.Sequence[model.InstrumentId]"
         ))]
@@ -3672,9 +3782,16 @@ impl PyStrategy {
         limit: Option<usize>,
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
+        #[gen_stub(override_type(type_repr = "typing.Callable[[str], None] | None"))]
+        callback: Option<Py<PyAny>>,
     ) -> PyResult<String> {
+        let actor = Self {
+            inner: Rc::clone(&slf.try_borrow()?.inner),
+        };
+
         let instrument_id = extract_instrument_ids(instrument_id)?;
-        self.ensure_registered_for_data()?;
+        actor.ensure_registered_for_data()?;
+
         let params_map = Python::attach(|py| -> PyResult<Option<Params>> {
             match params {
                 Some(dict) => from_pydict(py, &dict),
@@ -3682,24 +3799,32 @@ impl PyStrategy {
             }
         })?;
         let limit = limit.and_then(NonZeroUsize::new);
-        let request_id = DataActor::request_book_deltas(
-            self.inner_mut(),
+        let handler = nautilus_common::python::response::request_handler(
+            py,
+            actor.inner().core().actor_id().inner(),
+            PyStrategyInner::python_instance,
+            callback,
+        )?;
+        let request_id = DataActorCore::request_book_deltas(
+            actor.inner().core(),
             instrument_id,
             start,
             end,
             limit,
             client_id,
             params_map,
+            handler,
         )
         .map_err(to_pyvalue_err)?;
         Ok(request_id.to_string())
     }
 
     #[pyo3(name = "request_book_depth")]
-    #[pyo3(signature = (instrument_id, start=None, end=None, limit=None, depth=None, client_id=None, params=None))]
+    #[pyo3(signature = (instrument_id, start=None, end=None, limit=None, depth=None, client_id=None, params=None, callback=None))]
     #[expect(clippy::too_many_arguments)]
     fn py_request_book_depth(
-        &mut self,
+        slf: &Bound<'_, Self>,
+        py: Python<'_>,
         #[gen_stub(override_type(
             type_repr = "model.InstrumentId | typing.Sequence[model.InstrumentId]"
         ))]
@@ -3710,9 +3835,16 @@ impl PyStrategy {
         depth: Option<usize>,
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
+        #[gen_stub(override_type(type_repr = "typing.Callable[[str], None] | None"))]
+        callback: Option<Py<PyAny>>,
     ) -> PyResult<String> {
+        let actor = Self {
+            inner: Rc::clone(&slf.try_borrow()?.inner),
+        };
+
         let instrument_id = extract_instrument_ids(instrument_id)?;
-        self.ensure_registered_for_data()?;
+        actor.ensure_registered_for_data()?;
+
         let params_map = Python::attach(|py| -> PyResult<Option<Params>> {
             match params {
                 Some(dict) => from_pydict(py, &dict),
@@ -3721,8 +3853,14 @@ impl PyStrategy {
         })?;
         let limit = limit.and_then(NonZeroUsize::new);
         let depth = depth.and_then(NonZeroUsize::new);
-        let request_id = DataActor::request_book_depth(
-            self.inner_mut(),
+        let handler = nautilus_common::python::response::request_handler(
+            py,
+            actor.inner().core().actor_id().inner(),
+            PyStrategyInner::python_instance,
+            callback,
+        )?;
+        let request_id = DataActorCore::request_book_depth(
+            actor.inner().core(),
             instrument_id,
             start,
             end,
@@ -3730,15 +3868,18 @@ impl PyStrategy {
             depth,
             client_id,
             params_map,
+            handler,
         )
         .map_err(to_pyvalue_err)?;
         Ok(request_id.to_string())
     }
 
     #[pyo3(name = "request_quotes")]
-    #[pyo3(signature = (instrument_id, start=None, end=None, limit=None, client_id=None, params=None))]
+    #[pyo3(signature = (instrument_id, start=None, end=None, limit=None, client_id=None, params=None, callback=None))]
+    #[expect(clippy::too_many_arguments)]
     fn py_request_quotes(
-        &mut self,
+        slf: &Bound<'_, Self>,
+        py: Python<'_>,
         #[gen_stub(override_type(
             type_repr = "model.InstrumentId | typing.Sequence[model.InstrumentId]"
         ))]
@@ -3748,9 +3889,16 @@ impl PyStrategy {
         limit: Option<usize>,
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
+        #[gen_stub(override_type(type_repr = "typing.Callable[[str], None] | None"))]
+        callback: Option<Py<PyAny>>,
     ) -> PyResult<String> {
+        let actor = Self {
+            inner: Rc::clone(&slf.try_borrow()?.inner),
+        };
+
         let instrument_id = extract_instrument_ids(instrument_id)?;
-        self.ensure_registered_for_data()?;
+        actor.ensure_registered_for_data()?;
+
         let params_map = Python::attach(|py| -> PyResult<Option<Params>> {
             match params {
                 Some(dict) => from_pydict(py, &dict),
@@ -3758,23 +3906,32 @@ impl PyStrategy {
             }
         })?;
         let limit = limit.and_then(NonZeroUsize::new);
-        let request_id = DataActor::request_quotes(
-            self.inner_mut(),
+        let handler = nautilus_common::python::response::request_handler(
+            py,
+            actor.inner().core().actor_id().inner(),
+            PyStrategyInner::python_instance,
+            callback,
+        )?;
+        let request_id = DataActorCore::request_quotes(
+            actor.inner().core(),
             instrument_id,
             start,
             end,
             limit,
             client_id,
             params_map,
+            handler,
         )
         .map_err(to_pyvalue_err)?;
         Ok(request_id.to_string())
     }
 
     #[pyo3(name = "request_trades")]
-    #[pyo3(signature = (instrument_id, start=None, end=None, limit=None, client_id=None, params=None))]
+    #[pyo3(signature = (instrument_id, start=None, end=None, limit=None, client_id=None, params=None, callback=None))]
+    #[expect(clippy::too_many_arguments)]
     fn py_request_trades(
-        &mut self,
+        slf: &Bound<'_, Self>,
+        py: Python<'_>,
         #[gen_stub(override_type(
             type_repr = "model.InstrumentId | typing.Sequence[model.InstrumentId]"
         ))]
@@ -3784,9 +3941,16 @@ impl PyStrategy {
         limit: Option<usize>,
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
+        #[gen_stub(override_type(type_repr = "typing.Callable[[str], None] | None"))]
+        callback: Option<Py<PyAny>>,
     ) -> PyResult<String> {
+        let actor = Self {
+            inner: Rc::clone(&slf.try_borrow()?.inner),
+        };
+
         let instrument_id = extract_instrument_ids(instrument_id)?;
-        self.ensure_registered_for_data()?;
+        actor.ensure_registered_for_data()?;
+
         let params_map = Python::attach(|py| -> PyResult<Option<Params>> {
             match params {
                 Some(dict) => from_pydict(py, &dict),
@@ -3794,23 +3958,32 @@ impl PyStrategy {
             }
         })?;
         let limit = limit.and_then(NonZeroUsize::new);
-        let request_id = DataActor::request_trades(
-            self.inner_mut(),
+        let handler = nautilus_common::python::response::request_handler(
+            py,
+            actor.inner().core().actor_id().inner(),
+            PyStrategyInner::python_instance,
+            callback,
+        )?;
+        let request_id = DataActorCore::request_trades(
+            actor.inner().core(),
             instrument_id,
             start,
             end,
             limit,
             client_id,
             params_map,
+            handler,
         )
         .map_err(to_pyvalue_err)?;
         Ok(request_id.to_string())
     }
 
     #[pyo3(name = "request_funding_rates")]
-    #[pyo3(signature = (instrument_id, start=None, end=None, limit=None, client_id=None, params=None))]
+    #[pyo3(signature = (instrument_id, start=None, end=None, limit=None, client_id=None, params=None, callback=None))]
+    #[expect(clippy::too_many_arguments)]
     fn py_request_funding_rates(
-        &mut self,
+        slf: &Bound<'_, Self>,
+        py: Python<'_>,
         #[gen_stub(override_type(
             type_repr = "model.InstrumentId | typing.Sequence[model.InstrumentId]"
         ))]
@@ -3820,9 +3993,16 @@ impl PyStrategy {
         limit: Option<usize>,
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
+        #[gen_stub(override_type(type_repr = "typing.Callable[[str], None] | None"))]
+        callback: Option<Py<PyAny>>,
     ) -> PyResult<String> {
+        let actor = Self {
+            inner: Rc::clone(&slf.try_borrow()?.inner),
+        };
+
         let instrument_id = extract_instrument_ids(instrument_id)?;
-        self.ensure_registered_for_data()?;
+        actor.ensure_registered_for_data()?;
+
         let params_map = Python::attach(|py| -> PyResult<Option<Params>> {
             match params {
                 Some(dict) => from_pydict(py, &dict),
@@ -3830,23 +4010,32 @@ impl PyStrategy {
             }
         })?;
         let limit = limit.and_then(NonZeroUsize::new);
-        let request_id = DataActor::request_funding_rates(
-            self.inner_mut(),
+        let handler = nautilus_common::python::response::request_handler(
+            py,
+            actor.inner().core().actor_id().inner(),
+            PyStrategyInner::python_instance,
+            callback,
+        )?;
+        let request_id = DataActorCore::request_funding_rates(
+            actor.inner().core(),
             instrument_id,
             start,
             end,
             limit,
             client_id,
             params_map,
+            handler,
         )
         .map_err(to_pyvalue_err)?;
         Ok(request_id.to_string())
     }
 
     #[pyo3(name = "request_bars")]
-    #[pyo3(signature = (bar_type, start=None, end=None, limit=None, client_id=None, params=None))]
+    #[pyo3(signature = (bar_type, start=None, end=None, limit=None, client_id=None, params=None, callback=None))]
+    #[expect(clippy::too_many_arguments)]
     fn py_request_bars(
-        &mut self,
+        slf: &Bound<'_, Self>,
+        py: Python<'_>,
         #[gen_stub(override_type(type_repr = "model.BarType | typing.Sequence[model.BarType]"))]
         bar_type: &Bound<'_, PyAny>,
         start: Option<Timestamp>,
@@ -3854,9 +4043,16 @@ impl PyStrategy {
         limit: Option<usize>,
         client_id: Option<ClientId>,
         params: Option<Py<PyDict>>,
+        #[gen_stub(override_type(type_repr = "typing.Callable[[str], None] | None"))]
+        callback: Option<Py<PyAny>>,
     ) -> PyResult<String> {
+        let actor = Self {
+            inner: Rc::clone(&slf.try_borrow()?.inner),
+        };
+
         let bar_type = extract_bar_types(bar_type)?;
-        self.ensure_registered_for_data()?;
+        actor.ensure_registered_for_data()?;
+
         let params_map = Python::attach(|py| -> PyResult<Option<Params>> {
             match params {
                 Some(dict) => from_pydict(py, &dict),
@@ -3864,17 +4060,80 @@ impl PyStrategy {
             }
         })?;
         let limit = limit.and_then(NonZeroUsize::new);
-        let request_id = DataActor::request_bars(
-            self.inner_mut(),
+        let handler = nautilus_common::python::response::request_handler(
+            py,
+            actor.inner().core().actor_id().inner(),
+            PyStrategyInner::python_instance,
+            callback,
+        )?;
+        let request_id = DataActorCore::request_bars(
+            actor.inner().core(),
             bar_type,
             start,
             end,
             limit,
             client_id,
             params_map,
+            handler,
         )
         .map_err(to_pyvalue_err)?;
         Ok(request_id.to_string())
+    }
+
+    #[pyo3(name = "request_join", signature = (request_ids, callback=None, request_id=None))]
+    fn py_request_join(
+        slf: &Bound<'_, Self>,
+        py: Python<'_>,
+        #[gen_stub(override_type(type_repr = "typing.Sequence[str | core.UUID4]", imports = ("typing", "nautilus_trader.core")))]
+        request_ids: Vec<Bound<'_, PyAny>>,
+        #[gen_stub(override_type(type_repr = "typing.Callable[[str], None] | None"))]
+        callback: Option<Py<PyAny>>,
+        #[gen_stub(override_type(type_repr = "str | core.UUID4 | None", imports = ("nautilus_trader.core",)))]
+        request_id: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<String> {
+        let actor_id = {
+            let actor = slf.try_borrow()?;
+            actor.ensure_registered_for_data()?;
+            actor.inner().core().actor_id().inner()
+        };
+
+        let request_ids = request_ids
+            .into_iter()
+            .map(|id| nautilus_common::python::response::extract_request_id(&id))
+            .collect::<PyResult<Vec<_>>>()?;
+        let request_id = request_id
+            .map(nautilus_common::python::response::extract_request_id)
+            .transpose()?;
+        nautilus_common::python::response::request_join::<PyStrategyInner>(
+            py,
+            actor_id,
+            PyStrategyInner::python_instance,
+            request_ids,
+            request_id,
+            callback,
+        )
+    }
+
+    #[pyo3(name = "is_pending_request")]
+    fn py_is_pending_request(
+        &self,
+        #[gen_stub(override_type(type_repr = "str | core.UUID4", imports = ("nautilus_trader.core",)))]
+        request_id: &Bound<'_, PyAny>,
+    ) -> PyResult<bool> {
+        let id = nautilus_common::python::response::extract_request_id(request_id)?;
+        Ok(self.inner().core().is_pending_request(&id))
+    }
+
+    #[pyo3(name = "has_pending_requests")]
+    fn py_has_pending_requests(&self) -> bool {
+        !self.inner().core().pending_requests().is_empty()
+    }
+
+    #[pyo3(name = "pending_requests")]
+    #[gen_stub(override_return_type(type_repr = "set[str]"))]
+    fn py_pending_requests(&self, py: Python<'_>) -> PyResult<Py<PySet>> {
+        let ids = self.inner().core().pending_requests();
+        PySet::new(py, ids.iter().map(ToString::to_string)).map(Bound::unbind)
     }
 
     /// Requests reconnect of one socket endpoint owned by `client_id`.
@@ -4051,10 +4310,11 @@ mod tests {
             OmsType, OrderSide, OrderStatus, OrderType, PositionSide, TimeInForce,
         },
         events::{
-            OrderAccepted, OrderCancelRejected, OrderCanceled, OrderDenied, OrderEmulated,
-            OrderEventAny, OrderExpired, OrderInitialized, OrderModifyRejected, OrderPendingCancel,
-            OrderPendingUpdate, OrderRejected, OrderReleased, OrderSubmitted, OrderTriggered,
-            OrderUpdated, PositionChanged, PositionClosed, PositionEvent, PositionOpened,
+            OrderAccepted, OrderCancelDenied, OrderCancelRejected, OrderCanceled, OrderDenied,
+            OrderEmulated, OrderEventAny, OrderExpired, OrderInitialized, OrderModifyDenied,
+            OrderModifyRejected, OrderPendingCancel, OrderPendingUpdate, OrderRejected,
+            OrderReleased, OrderSubmitted, OrderTriggered, OrderUpdated, PositionChanged,
+            PositionClosed, PositionEvent, PositionOpened,
             order::spec::{OrderFillVoidedSpec, OrderFilledSpec},
         },
         identifiers::{
@@ -4135,7 +4395,9 @@ class TrackingStrategy:
         "on_order_triggered",
         "on_order_pending_update",
         "on_order_pending_cancel",
+        "on_order_modify_denied",
         "on_order_modify_rejected",
+        "on_order_cancel_denied",
         "on_order_cancel_rejected",
         "on_order_updated",
         "on_order_canceled",
@@ -6555,7 +6817,9 @@ class IndicatorEventStrategy:
     #[case("on_order_triggered")]
     #[case("on_order_pending_update")]
     #[case("on_order_pending_cancel")]
+    #[case("on_order_modify_denied")]
     #[case("on_order_modify_rejected")]
+    #[case("on_order_cancel_denied")]
     #[case("on_order_cancel_rejected")]
     #[case("on_order_updated")]
     #[case("on_order_canceled")]
@@ -6654,10 +6918,24 @@ class IndicatorEventStrategy:
                         );
                         Ok(())
                     }
+                    "on_order_modify_denied" => {
+                        Strategy::on_order_modify_denied(
+                            rust_strategy.inner_mut(),
+                            OrderModifyDenied::default(),
+                        );
+                        Ok(())
+                    }
                     "on_order_modify_rejected" => {
                         Strategy::on_order_modify_rejected(
                             rust_strategy.inner_mut(),
                             OrderModifyRejected::default(),
+                        );
+                        Ok(())
+                    }
+                    "on_order_cancel_denied" => {
+                        Strategy::on_order_cancel_denied(
+                            rust_strategy.inner_mut(),
+                            OrderCancelDenied::default(),
                         );
                         Ok(())
                     }
@@ -6892,7 +7170,9 @@ class IndicatorEventStrategy:
     #[case("on_order_triggered")]
     #[case("on_order_pending_update")]
     #[case("on_order_pending_cancel")]
+    #[case("on_order_modify_denied")]
     #[case("on_order_modify_rejected")]
+    #[case("on_order_cancel_denied")]
     #[case("on_order_cancel_rejected")]
     #[case("on_order_updated")]
     #[case("on_order_canceled")]
@@ -6954,8 +7234,14 @@ class IndicatorEventStrategy:
                 "on_order_pending_cancel" => {
                     Some(OrderPendingCancel::default().into_py_any(py).unwrap())
                 }
+                "on_order_modify_denied" => {
+                    Some(OrderModifyDenied::default().into_py_any(py).unwrap())
+                }
                 "on_order_modify_rejected" => {
                     Some(OrderModifyRejected::default().into_py_any(py).unwrap())
+                }
+                "on_order_cancel_denied" => {
+                    Some(OrderCancelDenied::default().into_py_any(py).unwrap())
                 }
                 "on_order_cancel_rejected" => {
                     Some(OrderCancelRejected::default().into_py_any(py).unwrap())

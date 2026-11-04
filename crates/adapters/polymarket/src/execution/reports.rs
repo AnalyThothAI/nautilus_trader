@@ -46,10 +46,13 @@ use super::{
         FillContext, FillReportScope, ResolvedBalanceScope, TargetOrderReportScope,
         apply_fill_time_filters, apply_logical_order_quantity, build_fill_reports_from_trades,
         build_reconciliation_position_reports, build_target_order_report,
-        cap_order_report_filled_qty, normalize_terminal_order_report_quantity,
-        venue_leg_filled_before_and_quantity,
+        cap_order_report_filled_qty, filter_unsupported_orders, filter_unsupported_positions,
+        normalize_terminal_order_report_quantity, order_status_recovery_status,
+        order_status_scope_awaits_application, venue_leg_filled_before_and_quantity,
+        without_order_status_pending_trades,
     },
     responses::confirm_modify_replacement,
+    settlement::SettlementRegistry,
 };
 use crate::{
     common::enums::{PolymarketSignatureType, PolymarketSignerType},
@@ -224,7 +227,9 @@ impl PolymarketExecutionClient {
             .context("failed to fetch trades for order recovery")?;
 
         let resolved_client_order_id = authority.client_order_id;
-        let cached = authority.cached_order;
+        let cached = resolved_client_order_id
+            .and_then(|id| self.core.cache().order_owned(&id))
+            .or(authority.cached_order);
         let cached_order_type = cached.as_ref().map_or(OrderType::Limit, Order::order_type);
         let cached_tif = cached
             .as_ref()
@@ -233,6 +238,16 @@ impl PolymarketExecutionClient {
         let cached_side = cached.as_ref().map(|order| order.order_side());
         let expected_order_side = authority.order_side;
 
+        let awaits_application = order_status_scope_awaits_application(
+            &ctx.settlement,
+            &trades,
+            cached.as_ref(),
+            &venue_order_id,
+        );
+        let keeps_cached_fill = cached
+            .as_ref()
+            .is_some_and(|order| ctx.settlement.order_status_keeps_cached_fill(order));
+        let trades = without_order_status_pending_trades(&ctx.settlement, trades);
         let (order_fills, fill_discards) = build_fill_reports_from_trades(
             &trades,
             &ctx,
@@ -244,18 +259,20 @@ impl PolymarketExecutionClient {
             None,
         )?;
 
-        if fill_discards.has_pending_target {
+        if fill_discards.has_pending_target || awaits_application || keeps_cached_fill {
             let Some(cached) = cached.as_ref() else {
                 log::debug!(
                     "Order {venue_order_id} has unsettled trades but no cached order; deferring recovery"
                 );
                 return Ok(None);
             };
-            let order_status = if cached.filled_qty().is_zero() {
-                OrderStatus::Accepted
-            } else {
-                OrderStatus::PartiallyFilled
-            };
+
+            let order_status = order_status_recovery_status(
+                cached.status(),
+                cached.filled_qty().is_zero(),
+                keeps_cached_fill,
+            );
+
             let mut report = OrderStatusReport::new(
                 self.core.account_id,
                 instrument_id,
@@ -390,6 +407,7 @@ impl PolymarketExecutionClient {
         let clock = self.clock;
         let signature_type = self.config.signature_type;
         let collateral_locks = self.collateral_locks.clone();
+        let settlement = self.settlement.clone();
 
         self.spawn_task("query_account", async move {
             fetch_and_emit_account_state(
@@ -398,6 +416,7 @@ impl PolymarketExecutionClient {
                 clock,
                 signature_type,
                 &collateral_locks,
+                &settlement,
             )
             .await
         });
@@ -570,6 +589,7 @@ impl PolymarketExecutionClient {
                         .with_expected_order_side(report.order_side),
                     clock.get_time_ns(),
                     load_ids.as_deref(),
+                    ConfirmedQuantityPolicy::FailOnUnresolved,
                 )
                 .await?
                 .as_deref()
@@ -665,16 +685,8 @@ impl PolymarketExecutionClient {
             let cached_filled = cached_authority
                 .as_ref()
                 .map_or_else(|| Quantity::zero(size_prec), Order::filled_qty);
-            let filled_before_leg = cached_authority
-                .as_ref()
-                .map(|cached_order| {
-                    venue_leg_filled_before_and_quantity(cached_order, venue_order_id, size_prec)
-                        .map(|(filled_before, _)| filled_before)
-                })
-                .transpose()?
-                .unwrap_or_else(|| Quantity::zero(size_prec));
 
-            let confirmed_filled = if report.filled_qty > cached_filled {
+            let confirmed_reports = if report.filled_qty > cached_filled {
                 fetch_confirmed_fill_reports(
                     &self.http_client,
                     &ctx,
@@ -684,12 +696,34 @@ impl PolymarketExecutionClient {
                         .with_expected_order_side(report.order_side),
                     self.clock.get_time_ns(),
                     self.config.reconciliation_load_ids(),
+                    ConfirmedQuantityPolicy::OmitPendingApplication,
                 )
                 .await?
+            } else {
+                None
+            };
+
+            let cached_authority = authority
+                .client_order_id
+                .and_then(|id| self.core.cache().order_owned(&id))
+                .or(cached_authority);
+            let cached_filled = cached_authority
+                .as_ref()
+                .map_or_else(|| Quantity::zero(size_prec), Order::filled_qty);
+            let filled_before_leg = cached_authority
+                .as_ref()
+                .map(|cached_order| {
+                    venue_leg_filled_before_and_quantity(cached_order, venue_order_id, size_prec)
+                        .map(|(filled_before, _)| filled_before)
+                })
+                .transpose()?
+                .unwrap_or_else(|| Quantity::zero(size_prec));
+
+            let confirmed_filled = confirmed_reports
                 .as_deref()
                 .map(|fills| {
                     ctx.settlement
-                        .report_filled_quantities(fills, cached_authority.iter())
+                        .order_status_filled_quantities(fills, cached_authority.iter())
                 })
                 .transpose()?
                 .and_then(|quantities| {
@@ -697,13 +731,12 @@ impl PolymarketExecutionClient {
                         .get(&venue_order_id)
                         .copied()
                         .map(|filled| filled_before_leg.as_decimal() + filled)
-                })
-            } else {
-                None
-            };
+                });
 
-            cap_order_report_filled_qty(
+            cap_order_status_report(
                 &mut report,
+                cached_authority.as_ref(),
+                &ctx.settlement,
                 cached_filled,
                 confirmed_filled,
                 cached_authority
@@ -797,6 +830,16 @@ impl PolymarketExecutionClient {
         } else {
             self.config.reconciliation_load_ids()
         };
+
+        filter_unsupported_orders(
+            &self.http_client,
+            &mut orders,
+            &self.shared_token_instruments,
+            &ctx,
+            cmd.instrument_id,
+            collection_load_ids,
+        )
+        .await?;
         let (mut reports, _) = super::reconciliation::build_order_reports_from_orders(
             &orders,
             &self.shared_token_instruments,
@@ -863,6 +906,7 @@ impl PolymarketExecutionClient {
                         Some(old_venue_order_id),
                         "Replacement order rejected during reconciliation",
                         report.ts_last,
+                        None,
                     );
 
                     if let Some(cancel_ts) = cancel_ts {
@@ -960,6 +1004,7 @@ impl PolymarketExecutionClient {
                 .await
             {
                 Ok(trades) => {
+                    let trades = without_order_status_pending_trades(&ctx.settlement, trades);
                     let (fills, _) = build_fill_reports_from_trades(
                         &trades,
                         &ctx,
@@ -977,8 +1022,10 @@ impl PolymarketExecutionClient {
                         Some(&self.core.account_id),
                         None,
                     );
-                    ctx.settlement
-                        .report_filled_quantities(&fills, orders.iter().map(|order| &**order))?
+                    ctx.settlement.order_status_filled_quantities(
+                        &fills,
+                        orders.iter().map(|order| &**order),
+                    )?
                 }
                 Err(e) => {
                     log::warn!("Failed to fetch confirmed fills for open-order check: {e}");
@@ -1007,8 +1054,10 @@ impl PolymarketExecutionClient {
                 Order::non_reopened_voided_qty,
             );
 
-            cap_order_report_filled_qty(
+            cap_order_status_report(
                 report,
+                cached_order.as_ref(),
+                &ctx.settlement,
                 cached_filled,
                 confirmed_fills
                     .get(&report.venue_order_id)
@@ -1083,13 +1132,23 @@ impl PolymarketExecutionClient {
             "Session positions cannot be inferred from wallet-wide holdings"
         );
         let ctx = self.fill_context();
-        let positions = self
+        let mut positions = self
             .data_api_client
             .get_positions(ctx.user_address)
             .await
             .context("failed to fetch positions from Data API")?;
 
         let ts_now = self.clock.get_time_ns();
+        let resolved_balances = self.resolved_balance_scope();
+        filter_unsupported_positions(
+            &self.http_client,
+            &mut positions,
+            &self.shared_token_instruments,
+            cmd.instrument_id,
+            self.config.reconciliation_load_ids(),
+            &resolved_balances,
+        )
+        .await?;
         let reports = build_reconciliation_position_reports(
             &positions,
             self.core.account_id,
@@ -1097,7 +1156,7 @@ impl PolymarketExecutionClient {
             &self.shared_token_instruments,
             cmd.instrument_id,
             self.config.reconciliation_load_ids(),
-            &self.resolved_balance_scope(),
+            &resolved_balances,
         )?;
 
         log::debug!("Generated {} position status reports", reports.len());
@@ -1152,7 +1211,41 @@ impl PolymarketExecutionClient {
     }
 }
 
+#[derive(Clone, Copy)]
+enum ConfirmedQuantityPolicy {
+    FailOnUnresolved,
+    OmitPendingApplication,
+}
+
+fn cap_order_status_report(
+    report: &mut OrderStatusReport,
+    cached_order: Option<&OrderAny>,
+    settlement: &SettlementRegistry,
+    cached_filled: Quantity,
+    confirmed_filled: Option<Decimal>,
+    non_reopened_voided: Quantity,
+) {
+    // Another confirmed trade must not raise this report while a fill or void on the order is
+    // still waiting. Core would infer that difference, then apply the real fill again.
+    if let Some(order) = cached_order.filter(|order| {
+        settlement.order_status_keeps_cached_fill(order)
+            || order_status_scope_awaits_application(
+                settlement,
+                &[],
+                Some(order),
+                &report.venue_order_id,
+            )
+    }) {
+        report.filled_qty = order.filled_qty();
+        report.order_status = order.status();
+        return;
+    }
+
+    cap_order_report_filled_qty(report, cached_filled, confirmed_filled, non_reopened_voided);
+}
+
 /// Returns `Ok(None)` only when confirmed trades are unavailable; decoded semantic errors propagate.
+#[expect(clippy::too_many_arguments)]
 async fn fetch_confirmed_fill_reports(
     http_client: &PolymarketClobHttpClient,
     ctx: &FillContext<'_>,
@@ -1161,6 +1254,7 @@ async fn fetch_confirmed_fill_reports(
     scope: FillReportScope,
     ts_init: UnixNanos,
     load_ids: Option<&[InstrumentId]>,
+    quantity_policy: ConfirmedQuantityPolicy,
 ) -> anyhow::Result<Option<Vec<FillReport>>> {
     let trades = match http_client.get_trades(params).await {
         Ok(trades) => trades,
@@ -1169,6 +1263,14 @@ async fn fetch_confirmed_fill_reports(
             return Ok(None);
         }
     };
+
+    let trades = match quantity_policy {
+        ConfirmedQuantityPolicy::OmitPendingApplication => {
+            without_order_status_pending_trades(&ctx.settlement, trades)
+        }
+        ConfirmedQuantityPolicy::FailOnUnresolved => trades,
+    };
+
     let (reports, _) = build_fill_reports_from_trades(
         &trades,
         ctx,
@@ -1191,14 +1293,22 @@ pub(super) async fn fetch_and_emit_account_state(
     clock: &'static AtomicTime,
     signature_type: PolymarketSignatureType,
     collateral_locks: &Mutex<CollateralLocks>,
+    settlement: &SettlementRegistry,
 ) -> anyhow::Result<()> {
-    let ticket = collateral_locks.lock().begin_refresh();
+    let mut ticket = collateral_locks.lock().begin_refresh(settlement);
 
     let params = GetBalanceAllowanceParams {
         asset_type: Some(crate::http::query::AssetType::Collateral),
         signature_type: Some(signature_type),
         ..Default::default()
     };
+
+    if !ticket.confirmed.is_empty() {
+        http_client
+            .update_balance_allowance(params.clone())
+            .await
+            .context("failed to refresh confirmed Polymarket collateral")?;
+    }
 
     let balance = http_client
         .get_balance(params)
@@ -1210,8 +1320,13 @@ pub(super) async fn fetch_and_emit_account_state(
         parse_balance_allowance(balance, pusd).context("failed to parse balance")?;
     let now = clock.get_time_ns();
 
-    let AppliedBalance::Fresh(account_balance) = collateral_locks
-        .lock()
+    let mut locks = collateral_locks.lock();
+    let confirmed = settlement.confirmed_fills();
+    ticket
+        .confirmed
+        .retain(|trade_id| confirmed.contains(trade_id));
+
+    let AppliedBalance::Fresh(account_balance) = locks
         .apply_refresh(ticket, account_balance.total, now)
         .context("failed to apply Polymarket balance reservations")?
     else {
@@ -1219,11 +1334,14 @@ pub(super) async fn fetch_and_emit_account_state(
         return Ok(());
     };
 
+    emitter.emit_account_state(vec![account_balance], vec![], true, now, None);
+    drop(confirmed);
+    drop(locks);
+
     log::debug!(
         "Account state updated: balance={} pUSD",
         account_balance.total
     );
-    emitter.emit_account_state(vec![account_balance], vec![], true, now, None);
     Ok(())
 }
 
@@ -1248,9 +1366,149 @@ pub(super) async fn fetch_collateral_balance_pusd(
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        time::Duration,
+    };
+
+    use axum::{Json, Router, routing::get};
+    use nautilus_common::messages::ExecutionEvent;
+    use nautilus_model::{
+        enums::AccountType,
+        identifiers::{AccountId, TraderId},
+        types::{AccountBalance, Money},
+    };
     use rstest::rstest;
+    use serde_json::json;
 
     use super::*;
+    use crate::common::credential::Credential;
+
+    #[tokio::test]
+    async fn overlapping_account_refreshes_publish_only_the_newest_balance() {
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let requests = Arc::new(AtomicUsize::new(0));
+
+        let app = Router::new().route(
+            "/balance-allowance",
+            get({
+                let started = started.clone();
+                let release = release.clone();
+                let requests = requests.clone();
+                move || {
+                    let started = started.clone();
+                    let release = release.clone();
+                    let requests = requests.clone();
+                    async move {
+                        let first = requests.fetch_add(1, Ordering::AcqRel) == 0;
+                        if first {
+                            started.notify_one();
+                            release.notified().await;
+                        }
+
+                        Json(json!({"balance": if first { "1011000000" } else { "1012000000" }}))
+                    }
+                }
+            }),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let credential =
+            Credential::new("test-key".into(), "dGVzdA==".into(), "test-pass".into()).unwrap();
+        let client = PolymarketClobHttpClient::new(
+            credential,
+            "0x1111111111111111111111111111111111111111".to_string(),
+            Some(format!("http://{addr}")),
+            5,
+        )
+        .unwrap();
+        let account_id = AccountId::from("POLYMARKET-001");
+        let clock: &'static AtomicTime =
+            Box::leak(Box::new(AtomicTime::new(false, UnixNanos::from(1))));
+
+        let mut emitter = ExecutionEventEmitter::new(
+            clock,
+            TraderId::from("TRADER-001"),
+            account_id,
+            AccountType::Cash,
+            Some(Currency::pUSD()),
+        );
+        let (sender, mut events) = tokio::sync::mpsc::unbounded_channel();
+        emitter.set_sender(sender);
+        let locks = Arc::new(Mutex::new(CollateralLocks::default()));
+        let settlement = Arc::new(SettlementRegistry::new(account_id));
+
+        let first = tokio::spawn({
+            let client = client.clone();
+            let emitter = emitter.clone();
+            let locks = locks.clone();
+            let settlement = settlement.clone();
+            async move {
+                fetch_and_emit_account_state(
+                    &client,
+                    &emitter,
+                    clock,
+                    PolymarketSignatureType::Eoa,
+                    &locks,
+                    &settlement,
+                )
+                .await
+                .unwrap();
+            }
+        });
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            started.notified().await;
+            fetch_and_emit_account_state(
+                &client,
+                &emitter,
+                clock,
+                PolymarketSignatureType::Eoa,
+                &locks,
+                &settlement,
+            )
+            .await
+            .unwrap();
+            release.notify_one();
+            first.await.unwrap();
+        })
+        .await
+        .unwrap();
+
+        server.abort();
+
+        let ExecutionEvent::Account(event) = events.try_recv().unwrap() else {
+            panic!("expected account state");
+        };
+
+        assert_eq!(requests.load(Ordering::Acquire), 2);
+        assert_eq!(event.account_id, account_id);
+        assert_eq!(event.account_type, AccountType::Cash);
+        assert_eq!(event.base_currency, Some(Currency::pUSD()));
+        assert!(event.is_reported);
+        assert!(event.margins.is_empty());
+        assert_eq!(event.ts_event, UnixNanos::from(1));
+        assert_eq!(event.ts_init, UnixNanos::from(1));
+        assert_eq!(event.info, None);
+        assert_eq!(
+            event.balances,
+            vec![AccountBalance::new(
+                Money::from("1012 pUSD"),
+                Money::from("0 pUSD"),
+                Money::from("1012 pUSD"),
+            )]
+        );
+        assert!(matches!(
+            events.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+    }
 
     #[rstest]
     #[case::ioc_dust(TimeInForce::Ioc, "5.202910", "5.202897", OrderStatus::Canceled)]

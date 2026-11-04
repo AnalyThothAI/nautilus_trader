@@ -15,11 +15,11 @@
 
 //! Provides a [`BacktestNode`] that orchestrates catalog-driven backtests.
 
-use std::{iter::Peekable, mem};
+use std::{fmt::Debug, iter::Peekable, mem};
 
 use ahash::{AHashMap, AHashSet};
 use nautilus_core::{Params, UnixNanos};
-use nautilus_data::replay::{DataIterator, ReplayBatch};
+use nautilus_data::replay::{DataIterator, ReplayBatch, ReplayPoll, ReplaySource};
 use nautilus_model::{
     data::{Data, DataBatch, HasTsInit, NautilusDataType, OrderBookDelta, OrderBookDeltas},
     enums::{BookType, OtoTriggerMode, RecordFlag},
@@ -29,10 +29,9 @@ use nautilus_model::{
 use nautilus_persistence::{
     backend::default_catalog_factories,
     catalog::{
-        factory as catalog_factory,
+        factory::{self as catalog_factory, CatalogFactoryRegistry},
         traits::{CatalogInstrumentQuery, CatalogQuery, DataCatalog},
     },
-    config::DataCatalogConfig,
 };
 
 use crate::{
@@ -45,7 +44,6 @@ use crate::{
 ///
 /// `BacktestNode` connects the catalog with [`BacktestEngine`] to load
 /// historical data and run backtests. Supports both oneshot and streaming modes.
-#[derive(Debug)]
 #[cfg_attr(
     feature = "python",
     pyo3::pyclass(module = "nautilus_trader.backtest", unsendable)
@@ -56,12 +54,13 @@ use crate::{
 )]
 pub struct BacktestNode {
     configs: Vec<BacktestRunConfig>,
+    catalog_factories: CatalogFactoryRegistry,
     engines: AHashMap<String, BacktestEngine>,
     disposed: bool,
 }
 
 impl BacktestNode {
-    /// Creates a new [`BacktestNode`] instance.
+    /// Creates a [`BacktestNode`] with the default catalog factory registry.
     ///
     /// Validates that configs are non-empty and internally consistent:
     /// - All data config instrument venues must have a matching venue config.
@@ -72,13 +71,20 @@ impl BacktestNode {
     ///
     /// Returns an error if `configs` is empty or validation fails.
     pub fn new(configs: Vec<BacktestRunConfig>) -> anyhow::Result<Self> {
-        anyhow::ensure!(!configs.is_empty(), "At least one run config is required");
-        validate_configs(&configs)?;
-        Ok(Self {
+        Self::builder(configs).build()
+    }
+
+    /// Creates a builder with the default catalog factory registry.
+    ///
+    /// Validates the run configurations when [`BacktestNodeBuilder::build`] creates the node.
+    #[must_use]
+    pub fn builder(configs: Vec<BacktestRunConfig>) -> BacktestNodeBuilder {
+        let catalog_factories = default_catalog_factories();
+
+        BacktestNodeBuilder {
             configs,
-            engines: AHashMap::new(),
-            disposed: false,
-        })
+            catalog_factories,
+        }
     }
 
     /// Returns the run configurations.
@@ -109,7 +115,7 @@ impl BacktestNode {
                 continue;
             }
 
-            match build_engine(config) {
+            match build_engine(config, &self.catalog_factories) {
                 Ok(engine) => {
                     self.engines.insert(config.id().to_string(), engine);
                 }
@@ -175,8 +181,10 @@ impl BacktestNode {
             };
 
             let run_result = match config.chunk_size() {
-                None => run_oneshot(engine, config),
-                Some(chunk_size) => run_streaming(engine, config, chunk_size),
+                None => run_oneshot(engine, config, &self.catalog_factories),
+                Some(chunk_size) => {
+                    run_streaming(engine, config, chunk_size, &self.catalog_factories)
+                }
             };
 
             if let Err(e) = run_result {
@@ -202,16 +210,16 @@ impl BacktestNode {
         Ok(results)
     }
 
-    /// Creates a catalog from a data config.
+    /// Creates a catalog from a data config using the default factory registry.
     ///
     /// # Errors
     ///
     /// Returns an error if the catalog cannot be created from the URI.
     pub fn load_catalog(config: &BacktestDataConfig) -> anyhow::Result<DataCatalog> {
-        create_catalog(config)
+        create_catalog(config, &default_catalog_factories())
     }
 
-    /// Loads data from the catalog for a specific data config.
+    /// Loads data for a specific data config using the default catalog factory registry.
     ///
     /// # Errors
     ///
@@ -221,7 +229,7 @@ impl BacktestNode {
         start: Option<UnixNanos>,
         end: Option<UnixNanos>,
     ) -> anyhow::Result<Vec<Data>> {
-        load_data(config, start, end)
+        load_data(config, start, end, &default_catalog_factories())
     }
 
     /// Disposes all engines and releases resources.
@@ -245,7 +253,69 @@ impl BacktestNode {
     }
 }
 
-fn build_engine(config: &BacktestRunConfig) -> anyhow::Result<BacktestEngine> {
+impl Debug for BacktestNode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct(stringify!(BacktestNode))
+            .field("configs", &self.configs)
+            .field("catalog_factories", &self.catalog_factories.keys())
+            .field("engines", &self.engines)
+            .field("disposed", &self.disposed)
+            .finish()
+    }
+}
+
+/// Builder for constructing a [`BacktestNode`] with a fluent API.
+///
+/// Engines are initialized separately by [`BacktestNode::build`] or [`BacktestNode::run`].
+pub struct BacktestNodeBuilder {
+    configs: Vec<BacktestRunConfig>,
+    catalog_factories: CatalogFactoryRegistry,
+}
+
+impl BacktestNodeBuilder {
+    /// Replaces the catalog factory registry for instrument and replay data loading.
+    ///
+    /// Use [`nautilus_persistence::backend::extend_catalog_factories`] to retain built-in backends
+    /// alongside external factories. Both oneshot and streaming runs use this registry.
+    #[must_use]
+    pub fn with_catalog_factories(mut self, catalog_factories: CatalogFactoryRegistry) -> Self {
+        self.catalog_factories = catalog_factories;
+        self
+    }
+
+    /// Validates the run configurations and creates the node without initializing its engines.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `configs` is empty or validation fails.
+    pub fn build(self) -> anyhow::Result<BacktestNode> {
+        anyhow::ensure!(
+            !self.configs.is_empty(),
+            "At least one run config is required"
+        );
+        validate_configs(&self.configs)?;
+        Ok(BacktestNode {
+            configs: self.configs,
+            catalog_factories: self.catalog_factories,
+            engines: AHashMap::new(),
+            disposed: false,
+        })
+    }
+}
+
+impl Debug for BacktestNodeBuilder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct(stringify!(BacktestNodeBuilder))
+            .field("configs", &self.configs)
+            .field("catalog_factories", &self.catalog_factories.keys())
+            .finish()
+    }
+}
+
+fn build_engine(
+    config: &BacktestRunConfig,
+    catalog_factories: &CatalogFactoryRegistry,
+) -> anyhow::Result<BacktestEngine> {
     let engine_config = config.engine().clone();
     let mut engine = BacktestEngine::new(engine_config)?;
 
@@ -259,13 +329,6 @@ fn build_engine(config: &BacktestRunConfig) -> anyhow::Result<BacktestEngine> {
 
         let default_leverage = venue_config.default_leverage();
         let leverages = venue_config.leverages().cloned().unwrap_or_default();
-        let margin_model = venue_config.margin_model().cloned().map(Into::into);
-        let modules = venue_config
-            .modules()
-            .iter()
-            .cloned()
-            .map(Into::into)
-            .collect();
         let fill_model = venue_config
             .fill_model()
             .cloned()
@@ -283,7 +346,17 @@ fn build_engine(config: &BacktestRunConfig) -> anyhow::Result<BacktestEngine> {
             })?
             .into();
 
+        let margin_model = venue_config.margin_model().cloned().map(Into::into);
+
         let latency_model = venue_config.latency_model().cloned().map(Into::into);
+
+        let modules = venue_config
+            .modules()
+            .iter()
+            .cloned()
+            .map(Into::into)
+            .collect();
+
         let sim_config = SimulatedVenueConfig::builder()
             .venue(Venue::from(venue_config.name().as_str()))
             .oms_type(venue_config.oms_type())
@@ -293,11 +366,11 @@ fn build_engine(config: &BacktestRunConfig) -> anyhow::Result<BacktestEngine> {
             .maybe_base_currency(venue_config.base_currency())
             .maybe_default_leverage(default_leverage)
             .leverages(leverages)
-            .maybe_margin_model(margin_model)
-            .modules(modules)
             .fill_model(fill_model)
             .fee_model(fee_model)
+            .maybe_margin_model(margin_model)
             .maybe_latency_model(latency_model)
+            .modules(modules)
             .routing(venue_config.routing())
             .reject_stop_orders(venue_config.reject_stop_orders())
             .support_gtd_orders(venue_config.support_gtd_orders())
@@ -323,7 +396,7 @@ fn build_engine(config: &BacktestRunConfig) -> anyhow::Result<BacktestEngine> {
     }
 
     for data_config in config.data() {
-        let mut catalog = create_catalog(data_config)?;
+        let mut catalog = create_catalog(data_config, catalog_factories)?;
         let instr_ids: Vec<InstrumentId> = data_config.get_instrument_ids()?;
         let filter: Option<Vec<String>> = if instr_ids.is_empty() {
             None
@@ -424,9 +497,13 @@ fn validate_configs(configs: &[BacktestRunConfig]) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn run_oneshot(engine: &mut BacktestEngine, config: &BacktestRunConfig) -> anyhow::Result<()> {
+fn run_oneshot(
+    engine: &mut BacktestEngine,
+    config: &BacktestRunConfig,
+    catalog_factories: &CatalogFactoryRegistry,
+) -> anyhow::Result<()> {
     for data_config in config.data() {
-        let data = load_data(data_config, config.start(), config.end())?;
+        let data = load_data(data_config, config.start(), config.end(), catalog_factories)?;
         if data.is_empty() {
             log::warn!("No data found for config: {:?}", data_config.data_type());
             continue;
@@ -447,13 +524,14 @@ fn run_streaming(
     engine: &mut BacktestEngine,
     config: &BacktestRunConfig,
     chunk_size: usize,
+    catalog_factories: &CatalogFactoryRegistry,
 ) -> anyhow::Result<()> {
     let data_configs = config.data();
 
     // Equal timestamps and incomplete book frames can extend beyond the target chunk size
     let mut catalogs = data_configs
         .iter()
-        .map(create_catalog)
+        .map(|config| create_catalog(config, catalog_factories))
         .collect::<anyhow::Result<Vec<_>>>()?;
     let mut streams = Vec::with_capacity(catalogs.len());
 
@@ -498,47 +576,46 @@ fn run_streaming(
     )
 }
 
-// Sources are synchronous and fixed before consumption; refills happen on the next call so a
-// producer failure cannot swallow the row just selected.
-fn merge_streams<I: Iterator<Item = anyhow::Result<ReplayBatch>>>(
+fn merge_streams<I: Iterator<Item = anyhow::Result<ReplayBatch>> + 'static>(
     streams: Vec<(String, I)>,
 ) -> anyhow::Result<impl Iterator<Item = anyhow::Result<Data>>> {
     let mut iterator = DataIterator::new();
-    let (names, mut streams): (Vec<_>, Vec<_>) = streams.into_iter().unzip();
-    for (stream, name) in streams.iter_mut().zip(&names) {
-        if let Some(batch) = stream.next() {
-            iterator.add_batch(name, batch?, true);
-        }
+    for (name, stream) in streams {
+        iterator.add_source(&name, Box::new(BatchSource(stream)), true)?;
     }
 
-    let mut refill: Option<usize> = None;
     let mut failed = false;
     Ok(std::iter::from_fn(move || {
         if failed {
             return None;
         }
 
-        let load = (|| -> anyhow::Result<()> {
-            if let Some(index) = refill.take() {
-                let name = &names[index];
-                match streams[index].next() {
-                    Some(batch) => iterator.refill_batch(name, batch?)?,
-                    None => iterator.remove_data(name, true),
-                }
+        match iterator.next_stream_item() {
+            Ok(ReplayPoll::Ready((data, _))) => Some(Ok(data)),
+            Ok(ReplayPoll::Complete) => None,
+            Err(e) => {
+                failed = true;
+                Some(Err(e))
             }
-
-            Ok(())
-        })();
-
-        if let Err(e) = load {
-            failed = true;
-            return Some(Err(e));
+            Ok(ReplayPoll::Pending { .. }) => {
+                failed = true;
+                Some(Err(anyhow::anyhow!(
+                    "Synchronous replay source returned Pending"
+                )))
+            }
         }
-
-        let (data, exhausted) = iterator.next_stream_item()?;
-        refill = exhausted.and_then(|name| names.iter().position(|candidate| candidate == name));
-        Some(Ok(data))
     }))
+}
+
+struct BatchSource<I>(I);
+
+impl<I: Iterator<Item = anyhow::Result<ReplayBatch>>> ReplaySource for BatchSource<I> {
+    fn poll_batch(&mut self) -> anyhow::Result<ReplayPoll<ReplayBatch>> {
+        self.0.next().transpose().map(|batch| match batch {
+            Some(batch) => ReplayPoll::Ready(batch),
+            None => ReplayPoll::Complete,
+        })
+    }
 }
 
 // Feeds data from an iterator to the engine in timestamp-aligned chunks.
@@ -633,22 +710,15 @@ fn take_aligned_chunk<I: Iterator<Item = anyhow::Result<Data>>>(
     Ok(chunk)
 }
 
-fn create_catalog(config: &BacktestDataConfig) -> anyhow::Result<DataCatalog> {
-    let catalog_config = DataCatalogConfig::new(
-        config.catalog_path().to_string(),
-        config.catalog_fs_protocol().map(str::to_string),
-        Some(config.catalog_backend()),
-    )
-    .with_storage_options(
-        config
-            .catalog_fs_rust_storage_options()
-            .cloned()
-            .or_else(|| config.catalog_fs_storage_options().cloned()),
-    );
+fn create_catalog(
+    config: &BacktestDataConfig,
+    catalog_factories: &CatalogFactoryRegistry,
+) -> anyhow::Result<DataCatalog> {
+    let catalog_config = config.catalog();
     catalog_factory::create_catalog(
         catalog_config.catalog_backend(),
         &catalog_config.connect_config(),
-        &default_catalog_factories(),
+        catalog_factories,
     )
 }
 
@@ -656,8 +726,9 @@ fn load_data(
     config: &BacktestDataConfig,
     run_start: Option<UnixNanos>,
     run_end: Option<UnixNanos>,
+    catalog_factories: &CatalogFactoryRegistry,
 ) -> anyhow::Result<Vec<Data>> {
-    let mut catalog = create_catalog(config)?;
+    let mut catalog = create_catalog(config, catalog_factories)?;
     let result = dispatch_query(&mut catalog, config, run_start, run_end)?;
     result.collect::<Result<Vec<_>, _>>()
 }
@@ -906,7 +977,7 @@ mod tests {
         ReplayBatch::Typed(batch)
     }
 
-    fn merge_rows<I: Iterator<Item = anyhow::Result<Data>>>(
+    fn merge_rows<I: Iterator<Item = anyhow::Result<Data>> + 'static>(
         streams: Vec<Peekable<I>>,
     ) -> impl Iterator<Item = anyhow::Result<Data>> {
         let batches = streams
@@ -916,7 +987,7 @@ mod tests {
         merge_batches(batches).expect("initial batches must load")
     }
 
-    fn merge_batches<I: Iterator<Item = anyhow::Result<ReplayBatch>>>(
+    fn merge_batches<I: Iterator<Item = anyhow::Result<ReplayBatch>> + 'static>(
         streams: Vec<I>,
     ) -> anyhow::Result<impl Iterator<Item = anyhow::Result<Data>>> {
         merge_streams(
@@ -1537,7 +1608,7 @@ mod tests {
                 .data(Vec::new())
                 .build()
                 .unwrap();
-            let mut engine = build_engine(&config).unwrap();
+            let mut engine = build_engine(&config, &default_catalog_factories()).unwrap();
 
             engine.run(None, None, None, false).unwrap();
 
@@ -1563,7 +1634,7 @@ mod tests {
             .data(Vec::new())
             .build()
             .unwrap();
-        let err = build_engine(&config).unwrap_err();
+        let err = build_engine(&config, &default_catalog_factories()).unwrap_err();
         assert!(
             err.to_string().contains("explicit fee_model"),
             "unexpected error: {err}"

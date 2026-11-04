@@ -58,8 +58,8 @@ use nautilus_model::{
         AccountType, OmsType, OrderType, PositionSide, TimeInForce, TrailingOffsetType, TriggerType,
     },
     events::{
-        AccountState, OrderCancelRejected, OrderCanceled, OrderDeniedReason, OrderEventAny,
-        OrderModifyRejected, OrderRejected, OrderUpdated,
+        AccountState, OrderCancelDenied, OrderCancelRejected, OrderCanceled, OrderDeniedReason,
+        OrderEventAny, OrderModifyDenied, OrderModifyRejected, OrderRejected, OrderUpdated,
     },
     identifiers::{
         AccountId, ClientId, ClientOrderId, InstrumentId, PositionId, Venue, VenueOrderId,
@@ -116,6 +116,7 @@ use crate::{
             BinanceProductType, BinanceSide, BinanceTimeInForce, BinanceWorkingType,
         },
         failure::{classify_futures_http_failure, sanitize_reason},
+        instruments::BinanceInstrumentSelector,
         symbol::{format_binance_symbol, format_instrument_id},
         urls::{get_usdm_ws_route_base_url, get_ws_private_base_url},
     },
@@ -315,6 +316,37 @@ impl BinanceFuturesExecutionClient {
             is_hedge_mode: AtomicBool::new(false),
             shutdown_errors: Vec::new(),
         })
+    }
+
+    fn restore_active_orders(&self) -> anyhow::Result<()> {
+        for order in crate::common::execution::active_orders(&self.core) {
+            let Some(instrument) = self
+                .http_client
+                .instrument_reconciliation(&order.instrument_id())
+            else {
+                continue;
+            };
+
+            let (_, venue_position_id) = resolve_order_position_identity(
+                self.is_hedge_mode(),
+                self.config.use_position_ids,
+                &order,
+            )
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to restore Binance Futures order {}: {e}",
+                    order.client_order_id()
+                )
+            })?;
+
+            self.dispatch_state.restore_order(
+                &order,
+                venue_position_id,
+                instrument.price_precision(),
+            );
+        }
+
+        Ok(())
     }
 
     /// Returns whether the account is in hedge mode (dual side position).
@@ -657,6 +689,7 @@ impl BinanceFuturesExecutionClient {
             dispatch_state.pending_requests.insert(
                 request_id.clone(),
                 PendingRequest {
+                    command_id: None,
                     client_order_id,
                     venue_order_id: None,
                     operation: PendingOperation::Place,
@@ -845,6 +878,7 @@ impl BinanceFuturesExecutionClient {
             dispatch_state.pending_requests.insert(
                 request_id.clone(),
                 PendingRequest {
+                    command_id: Some(command.command_id),
                     client_order_id,
                     venue_order_id,
                     operation: PendingOperation::Cancel,
@@ -860,13 +894,14 @@ impl BinanceFuturesExecutionClient {
                         &params.symbol,
                         &mut params.order_id,
                         &mut params.orig_client_order_id,
+                        false,
                     )
                     .await
                     .inspect_err(|e| {
                         dispatch_state.pending_requests.remove(&request_id);
                         let ts_now = clock.get_time_ns();
 
-                        let rejected = OrderCancelRejected::new(
+                        let mut rejected = OrderCancelDenied::new(
                             trader_id,
                             command.strategy_id,
                             command.instrument_id,
@@ -879,11 +914,11 @@ impl BinanceFuturesExecutionClient {
                             UUID4::new(),
                             ts_now,
                             ts_now,
-                            false,
                             command.venue_order_id,
                             Some(account_id),
                         );
-                        emitter.send_order_event(OrderEventAny::CancelRejected(rejected));
+                        rejected.causation_id = Some(command.command_id);
+                        emitter.send_order_event(OrderEventAny::CancelDenied(rejected));
                     })?;
 
                 let result = ws_client
@@ -904,26 +939,9 @@ impl BinanceFuturesExecutionClient {
         let http_client = self.http_client.clone();
 
         self.spawn_task("cancel_order", async move {
-            let result = if use_algo_cancel {
-                // Try algo cancel first; if it fails, the order may have been triggered
-                // before this session started, so fall back to regular cancel
-                match http_client.cancel_algo_order(client_order_id).await {
-                    Ok(()) => Ok(()),
-                    Err(algo_err) if !should_retry_regular_cancel(client_order_id, &algo_err) => Err(algo_err),
-                    Err(algo_err) => {
-                        log::debug!("Algo cancel failed, trying regular cancel: {algo_err}");
-                        http_client
-                            .cancel_order(instrument_id, venue_order_id, Some(client_order_id))
-                            .await
-                            .map(|_| ())
-                    }
-                }
-            } else {
-                http_client
-                    .cancel_order(instrument_id, venue_order_id, Some(client_order_id))
-                    .await
-                    .map(|_| ())
-            };
+            let result = cancel_order_http(
+                &http_client, instrument_id, venue_order_id, client_order_id, use_algo_cancel,
+            ).await;
 
             match result {
                 Ok(()) => {
@@ -941,10 +959,29 @@ impl BinanceFuturesExecutionClient {
                                 "Ambiguous cancel failure for {client_order_id}, awaiting reconciliation: {reason}"
                             );
                         }
-                        CommandFailure::NotSent(reason) | CommandFailure::VenueRejected(reason) => {
+                        CommandFailure::NotSent(reason) => {
                             let ts_now = clock.get_time_ns();
 
-                            let rejected = OrderCancelRejected::new(
+                            let mut rejected = OrderCancelDenied::new(
+                                trader_id,
+                                command.strategy_id,
+                                command.instrument_id,
+                                client_order_id,
+                                format!("cancel-order-error: {}", sanitize_reason(&reason)).into(),
+                                UUID4::new(),
+                                ts_now,
+                                ts_now,
+                                command.venue_order_id,
+                                Some(account_id),
+                            );
+                            rejected.causation_id = Some(command.command_id);
+
+                            emitter.send_order_event(OrderEventAny::CancelDenied(rejected));
+                        }
+                        CommandFailure::VenueRejected(reason) => {
+                            let ts_now = clock.get_time_ns();
+
+                            let mut rejected = OrderCancelRejected::new(
                                 trader_id,
                                 command.strategy_id,
                                 command.instrument_id,
@@ -957,6 +994,7 @@ impl BinanceFuturesExecutionClient {
                                 command.venue_order_id,
                                 Some(account_id),
                             );
+                            rejected.causation_id = Some(command.command_id);
 
                             emitter.send_order_event(OrderEventAny::CancelRejected(rejected));
                         }
@@ -977,9 +1015,13 @@ impl BinanceFuturesExecutionClient {
             let mut regular = Vec::new();
             let mut algo = Vec::new();
 
-            for order in
-                cache.orders_open(None, Some(&cmd.instrument_id), None, None, cmd.order_side)
-            {
+            for order in cache.orders_open(
+                None,
+                Some(&cmd.instrument_id),
+                None,
+                Some(&self.core.account_id),
+                cmd.order_side,
+            ) {
                 let cancel = CancelOrder {
                     trader_id: order.trader_id(),
                     client_id: cmd.client_id,
@@ -1356,6 +1398,75 @@ impl BinanceFuturesExecutionClient {
         Ok(reports)
     }
 
+    async fn generate_order_history(
+        &self,
+        instrument_id: InstrumentId,
+        start: UnixNanos,
+        end: UnixNanos,
+    ) -> anyhow::Result<Vec<OrderStatusReport>> {
+        let instrument = self
+            .http_client
+            .instrument_reconciliation(&instrument_id)
+            .context("unresolved Binance Futures history instrument")?;
+        let (orders, algo_orders) = self
+            .http_client
+            .query_order_history(instrument_id, start, end)
+            .await?;
+
+        let mut reports = IndexMap::new();
+
+        for order in orders.values() {
+            let report = order.to_order_status_report(
+                self.core.account_id,
+                instrument_id,
+                instrument.price_precision(),
+                instrument.size_precision(),
+                self.config.treat_expired_as_canceled,
+                end,
+            )?;
+            let venue_position_id = make_venue_position_id(
+                self.config.use_position_ids,
+                instrument_id,
+                order.position_side,
+            )?;
+            reports.insert(
+                report.venue_order_id,
+                with_venue_position_id(report, venue_position_id),
+            );
+        }
+
+        for algo in algo_orders.into_values() {
+            let actual =
+                if let Some(id) = algo.actual_order_id.as_deref().filter(|id| !id.is_empty()) {
+                    let id = id.parse::<i64>().context("invalid algo actual order ID")?;
+                    if let Some(order) = orders.get(&id) {
+                        Some(order.clone())
+                    } else {
+                        self.http_client
+                            .query_algo_order_actual(instrument_id, id)
+                            .await?
+                    }
+                } else {
+                    None
+                };
+
+            let result = BinanceFuturesAlgoOrderQueryResult { algo, actual };
+            let report = create_algo_order_status_report(
+                &result,
+                self.core.account_id,
+                instrument_id,
+                instrument.price_precision(),
+                instrument.size_precision(),
+                self.config.treat_expired_as_canceled,
+                self.config.use_position_ids,
+                end,
+            )?;
+            reports.insert(report.venue_order_id, report);
+        }
+
+        Ok(reports.into_values().collect())
+    }
+
     async fn apply_futures_config(&self) -> anyhow::Result<()> {
         if let Some(ref leverages) = self.config.futures_leverages {
             for (symbol, leverage) in leverages {
@@ -1549,7 +1660,7 @@ fn build_futures_order_list_batch(
     let mut batch_items = Vec::with_capacity(orders.len());
     for order in orders {
         if price_match.is_some() && order.is_post_only() {
-            return Err("price_match cannot be combined with post-only orders".to_string());
+            return Err(OrderDeniedReason::unsupported_post_only().to_string());
         }
 
         if price_match.is_some() && order.order_type() != OrderType::Limit {
@@ -1655,9 +1766,7 @@ fn determine_futures_order_lifetime(
     }
 
     if post_only {
-        return Err(OrderDeniedReason::ValidationFailed {
-            detail: "Binance Futures GTD cannot be post-only".to_string(),
-        });
+        return Err(OrderDeniedReason::unsupported_post_only());
     }
 
     if product_type != BinanceProductType::UsdM {
@@ -1891,6 +2000,8 @@ impl ExecutionClient for BinanceFuturesExecutionClient {
             log::debug!("Loaded {} Futures instruments", instruments.len());
         }
         self.core.set_instruments_initialized();
+
+        self.restore_active_orders()?;
 
         // Apply configured leverage and margin types
         self.apply_futures_config()
@@ -2934,6 +3045,7 @@ impl ExecutionClient for BinanceFuturesExecutionClient {
             .collect();
         {
             let cache = self.core.cache();
+            instrument_ids.extend(cache.external_order_claim_instrument_ids(None));
             instrument_ids.extend(
                 cache
                     .orders_open(
@@ -2976,9 +3088,27 @@ impl ExecutionClient for BinanceFuturesExecutionClient {
                 })
             });
         }
+
+        let selector =
+            BinanceInstrumentSelector::new(&self.config.instrument_provider, self.product_type)?;
+        instrument_ids.extend(
+            self.http_client
+                .instrument_ids_reconciliation()
+                .into_iter()
+                .filter(|id| selector.is_explicit(*id, &format_binance_symbol(id))),
+        );
+
+        instrument_ids.retain(|id| {
+            id.venue == *BINANCE_VENUE && !self.config.instrument_provider.excludes(*id)
+        });
+
         instrument_ids.sort_unstable();
         instrument_ids.dedup();
 
+        let mut order_reports: IndexMap<_, _> = order_reports
+            .into_iter()
+            .map(|report| (report.venue_order_id, report))
+            .collect();
         let mut fill_reports = Vec::new();
 
         for instrument_id in instrument_ids {
@@ -2999,18 +3129,39 @@ impl ExecutionClient for BinanceFuturesExecutionClient {
                 }
                 continue;
             }
+
+            match self
+                .generate_order_history(instrument_id, report_start, ts_now)
+                .await
+            {
+                Ok(history) => crate::common::execution::merge_order_history(
+                    &mut order_reports,
+                    history,
+                    Some(report_start),
+                    ts_now,
+                ),
+
+                Err(e) => {
+                    log::warn!(
+                        "Failed to recover Binance Futures history for {instrument_id}: {e}"
+                    );
+                    reports_complete = false;
+                }
+            }
+
             let fill_cmd = GenerateFillReportsBuilder::default()
                 .log_receipt_level(LogLevel::Off)
                 .ts_init(ts_now)
                 .instrument_id(Some(instrument_id))
                 .start(fill_start)
+                .end(fill_start.map(|_| ts_now))
                 .build()
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
             fill_reports.extend(
                 self.generate_fill_reports(fill_cmd)
                     .await?
                     .into_iter()
-                    .filter(|report| report.ts_event >= report_start),
+                    .filter(|report| report.ts_event >= report_start && report.ts_event <= ts_now),
             );
         }
 
@@ -3026,7 +3177,7 @@ impl ExecutionClient for BinanceFuturesExecutionClient {
             None,
         );
 
-        mass_status.add_order_reports(order_reports);
+        mass_status.add_order_reports(order_reports.into_values().collect());
         mass_status.add_fill_reports(fill_reports);
         mass_status.add_position_reports(position_reports);
         mass_status.set_report_window(Some(report_start), reports_complete);
@@ -3483,7 +3634,7 @@ impl ExecutionClient for BinanceFuturesExecutionClient {
             );
             let ts_init = self.clock.get_time_ns();
 
-            let rejected = OrderModifyRejected::new(
+            let mut rejected = OrderModifyDenied::new(
                 self.core.trader_id,
                 cmd.strategy_id,
                 cmd.instrument_id,
@@ -3492,13 +3643,13 @@ impl ExecutionClient for BinanceFuturesExecutionClient {
                 UUID4::new(),
                 ts_init, // no venue timestamp, rejected locally
                 ts_init,
-                false,
                 cmd.venue_order_id,
                 Some(self.core.account_id),
             );
+            rejected.causation_id = Some(cmd.command_id);
 
             self.emitter
-                .send_order_event(OrderEventAny::ModifyRejected(rejected));
+                .send_order_event(OrderEventAny::ModifyDenied(rejected));
             return Ok(());
         };
 
@@ -3520,7 +3671,7 @@ impl ExecutionClient for BinanceFuturesExecutionClient {
             );
             let ts_init = self.clock.get_time_ns();
 
-            let rejected = OrderModifyRejected::new(
+            let mut rejected = OrderModifyDenied::new(
                 self.core.trader_id,
                 cmd.strategy_id,
                 cmd.instrument_id,
@@ -3529,13 +3680,13 @@ impl ExecutionClient for BinanceFuturesExecutionClient {
                 UUID4::new(),
                 ts_init, // no venue timestamp, rejected locally
                 ts_init,
-                false,
                 cmd.venue_order_id,
                 Some(self.core.account_id),
             );
+            rejected.causation_id = Some(cmd.command_id);
 
             self.emitter
-                .send_order_event(OrderEventAny::ModifyRejected(rejected));
+                .send_order_event(OrderEventAny::ModifyDenied(rejected));
             return Ok(());
         };
         let command = cmd;
@@ -3577,6 +3728,7 @@ impl ExecutionClient for BinanceFuturesExecutionClient {
             dispatch_state.pending_requests.insert(
                 request_id.clone(),
                 PendingRequest {
+                    command_id: Some(command.command_id),
                     client_order_id: command.client_order_id,
                     venue_order_id,
                     operation: PendingOperation::Modify,
@@ -3592,13 +3744,14 @@ impl ExecutionClient for BinanceFuturesExecutionClient {
                         &params.symbol,
                         &mut params.order_id,
                         &mut params.orig_client_order_id,
+                        true,
                     )
                     .await
                     .inspect_err(|e| {
                         dispatch_state.pending_requests.remove(&request_id);
                         let ts_now = clock.get_time_ns();
 
-                        let rejected = OrderModifyRejected::new(
+                        let mut rejected = OrderModifyDenied::new(
                             trader_id,
                             command.strategy_id,
                             command.instrument_id,
@@ -3611,11 +3764,11 @@ impl ExecutionClient for BinanceFuturesExecutionClient {
                             UUID4::new(),
                             ts_now,
                             ts_now,
-                            false,
                             command.venue_order_id,
                             Some(account_id),
                         );
-                        emitter.send_order_event(OrderEventAny::ModifyRejected(rejected));
+                        rejected.causation_id = Some(command.command_id);
+                        emitter.send_order_event(OrderEventAny::ModifyDenied(rejected));
                     })?;
 
                 let result = ws_client
@@ -3652,7 +3805,7 @@ impl ExecutionClient for BinanceFuturesExecutionClient {
 
             match result {
                 Ok(report) => {
-                    if !dispatch_state.record_order_update(command.client_order_id, report.venue_order_id, quantity, price, None) {
+                    if dispatch_state.record_order_update(command.client_order_id, report.venue_order_id, quantity, price, None) != Some(true) {
                         return Ok(());
                     }
                     let ts_now = clock.get_time_ns();
@@ -3689,10 +3842,29 @@ impl ExecutionClient for BinanceFuturesExecutionClient {
                                 command.client_order_id
                             );
                         }
-                        CommandFailure::NotSent(reason) | CommandFailure::VenueRejected(reason) => {
+                        CommandFailure::NotSent(reason) => {
                             let ts_now = clock.get_time_ns();
 
-                            let rejected = OrderModifyRejected::new(
+                            let mut rejected = OrderModifyDenied::new(
+                                trader_id,
+                                command.strategy_id,
+                                command.instrument_id,
+                                command.client_order_id,
+                                format!("modify-order-error: {}", sanitize_reason(&reason)).into(),
+                                UUID4::new(),
+                                ts_now,
+                                ts_now,
+                                command.venue_order_id,
+                                Some(account_id),
+                            );
+                            rejected.causation_id = Some(command.command_id);
+
+                            emitter.send_order_event(OrderEventAny::ModifyDenied(rejected));
+                        }
+                        CommandFailure::VenueRejected(reason) => {
+                            let ts_now = clock.get_time_ns();
+
+                            let mut rejected = OrderModifyRejected::new(
                                 trader_id,
                                 command.strategy_id,
                                 command.instrument_id,
@@ -3705,6 +3877,7 @@ impl ExecutionClient for BinanceFuturesExecutionClient {
                                 command.venue_order_id,
                                 Some(account_id),
                             );
+                            rejected.causation_id = Some(command.command_id);
 
                             emitter.send_order_event(OrderEventAny::ModifyRejected(rejected));
                         }
@@ -3841,16 +4014,37 @@ impl ExecutionClient for BinanceFuturesExecutionClient {
                                         ));
                                     }
                                     BatchOrderResult::Error(error) => {
-                                        let rejected = OrderCancelRejected::new(
+                                        let reason = format!(
+                                            "batch-cancel-error: code={}, msg={}",
+                                            error.code, error.msg
+                                        );
+
+                                        if error.not_sent {
+                                            let mut denied = OrderCancelDenied::new(
+                                                trader_id,
+                                                cancel.strategy_id,
+                                                cancel.instrument_id,
+                                                cancel.client_order_id,
+                                                reason.into(),
+                                                UUID4::new(),
+                                                clock.get_time_ns(),
+                                                cancel.ts_init,
+                                                cancel.venue_order_id,
+                                                Some(account_id),
+                                            );
+                                            denied.causation_id = Some(cancel.command_id);
+                                            emitter.send_order_event(OrderEventAny::CancelDenied(
+                                                denied,
+                                            ));
+                                            continue;
+                                        }
+
+                                        let mut rejected = OrderCancelRejected::new(
                                             trader_id,
                                             cancel.strategy_id,
                                             cancel.instrument_id,
                                             cancel.client_order_id,
-                                            format!(
-                                                "batch-cancel-error: code={}, msg={}",
-                                                error.code, error.msg
-                                            )
-                                            .into(),
+                                            reason.into(),
                                             UUID4::new(),
                                             clock.get_time_ns(),
                                             cancel.ts_init,
@@ -3858,6 +4052,7 @@ impl ExecutionClient for BinanceFuturesExecutionClient {
                                             cancel.venue_order_id,
                                             Some(account_id),
                                         );
+                                        rejected.causation_id = Some(cancel.command_id);
 
                                         emitter.send_order_event(OrderEventAny::CancelRejected(
                                             rejected,
@@ -3872,7 +4067,7 @@ impl ExecutionClient for BinanceFuturesExecutionClient {
                                     for cancel in &batch_cancels {
                                         let ts_now = clock.get_time_ns();
 
-                                        let rejected = OrderCancelRejected::new(
+                                        let mut rejected = OrderCancelDenied::new(
                                             trader_id,
                                             cancel.strategy_id,
                                             cancel.instrument_id,
@@ -3881,11 +4076,13 @@ impl ExecutionClient for BinanceFuturesExecutionClient {
                                             UUID4::new(),
                                             ts_now,
                                             ts_now,
-                                            false,
                                             cancel.venue_order_id,
                                             Some(account_id),
                                         );
-                                        emitter.send_order_event(OrderEventAny::CancelRejected(rejected));
+                                        rejected.causation_id = Some(cancel.command_id);
+                                        emitter.send_order_event(OrderEventAny::CancelDenied(
+                                            rejected,
+                                        ));
                                     }
                                 }
                                 CommandFailure::VenueRejected(reason)
@@ -3999,9 +4196,7 @@ fn validate_order(
         let order_type = order.order_type();
 
         if order.is_post_only() {
-            return Err(OrderDeniedReason::ValidationFailed {
-                detail: "price_match cannot be combined with post-only orders".to_string(),
-            });
+            return Err(OrderDeniedReason::unsupported_post_only());
         }
 
         if order_type != OrderType::Limit {
@@ -4121,11 +4316,62 @@ fn user_trades_complete_start(ts_init: UnixNanos, ts_now: UnixNanos) -> UnixNano
         .saturating_sub(USER_TRADES_COMPLETE_INTERVAL)
 }
 
+async fn cancel_order_http(
+    http_client: &BinanceFuturesHttpClient,
+    instrument_id: InstrumentId,
+    venue_order_id: Option<VenueOrderId>,
+    client_order_id: ClientOrderId,
+    use_algo_cancel: bool,
+) -> anyhow::Result<()> {
+    if !use_algo_cancel {
+        return http_client
+            .cancel_order(instrument_id, venue_order_id, Some(client_order_id))
+            .await
+            .map(|_| ());
+    }
+
+    // The algo may have triggered before this session, so a regular cancel can still be needed
+    let algo_err = match http_client.cancel_algo_order(client_order_id).await {
+        Ok(()) => return Ok(()),
+        Err(e) => e,
+    };
+
+    if !should_retry_regular_cancel(client_order_id, &algo_err) {
+        return Err(algo_err);
+    }
+
+    log::debug!("Algo cancel failed, trying regular cancel: {algo_err}");
+
+    match http_client
+        .cancel_order(instrument_id, venue_order_id, Some(client_order_id))
+        .await
+        .map(|_| ())
+    {
+        Err(e)
+            if e.downcast_ref::<BinanceFuturesHttpError>()
+                .is_some_and(|e| {
+                    matches!(classify_futures_http_failure(e), CommandFailure::NotSent(_))
+                }) =>
+        {
+            Err(algo_err)
+        }
+        result => result,
+    }
+}
+
 fn should_retry_regular_cancel(client_order_id: ClientOrderId, error: &anyhow::Error) -> bool {
     let encoded = encode_broker_id(&client_order_id, BINANCE_NAUTILUS_FUTURES_BROKER_ID);
+
+    let error = error
+        .downcast_ref::<BinanceFuturesHttpError>()
+        .map(|e| match e {
+            BinanceFuturesHttpError::IdentityLookup(source) => source.as_ref(),
+            e => e,
+        });
+
     legacy_client_order_id(&encoded, BINANCE_NAUTILUS_FUTURES_BROKER_ID).is_none()
         || matches!(
-            error.downcast_ref::<BinanceFuturesHttpError>(),
+            error,
             Some(BinanceFuturesHttpError::BinanceError {
                 code: -2011 | -2013,
                 ..
@@ -4317,14 +4563,25 @@ mod tests {
     fn test_tagged_algo_cancel_fallback_requires_missing_order(
         #[case] code: i64,
         #[case] expected: bool,
+        #[values(false, true)] lookup: bool,
     ) {
         let id = ClientOrderId::new("O-20260922-160119-V2-000-8");
-        let error = anyhow::anyhow!(BinanceFuturesHttpError::BinanceError {
+
+        let error = BinanceFuturesHttpError::BinanceError {
             code,
             message: "test".to_string(),
             status: 400,
             retry_after: None,
-        });
+        };
+
+        let error = if lookup {
+            BinanceFuturesHttpError::IdentityLookup(Box::new(error))
+        } else {
+            error
+        };
+
+        let error = anyhow::Error::new(error);
+
         assert_eq!(should_retry_regular_cancel(id, &error), expected);
         assert!(!should_retry_regular_cancel(
             id,
@@ -4523,7 +4780,7 @@ mod tests {
         OrderType::Limit,
         UnixNanos::from_seconds(1_700_000_601),
         true,
-        "cannot be post-only"
+        "UNSUPPORTED_POST_ONLY"
     )]
     fn test_futures_order_lifetime_rejects_invalid_gtd(
         #[case] product_type: BinanceProductType,

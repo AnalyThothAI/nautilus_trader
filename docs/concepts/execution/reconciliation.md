@@ -240,9 +240,9 @@ venue state that is already stale when collection starts.
 
 ### Order-only fill projection
 
-During startup reconciliation, a bounded historical fill does not change a position or the portfolio
-when that instrument has no in-scope explicit position report. Omission is not a flat report. The
-order still reaches the reported status and filled quantity.
+During startup reconciliation, a bounded historical fill normally updates only order state when its
+instrument has no in-scope explicit position report. Omission is not a flat report. Explicit closing fills
+can reduce a retained position under the [retained closing recovery](#retained-closing-recovery) rules.
 
 An explicit position report, open or flat, is the quantity target. The engine applies the available fills,
 generates the difference when configured, or leaves the position unresolved.
@@ -728,9 +728,9 @@ the bounded window to decide whether the report is authoritative.
 The engine applies the available orders and fills, and by default generates the orders and fills
 required to reach the report. Disabling `generate_missing_orders` does not allow a mismatch to stand.
 
-Without an in-scope explicit position report for its instrument, a bounded fill does not open, close, or
-change a position. It also does not update portfolio economics. The order still reaches the reported status
-and filled quantity. Raw reconciliation reports stay available.
+Without an in-scope explicit position report, bounded fills update order state only, except for
+[retained closing recovery](#retained-closing-recovery). They cannot open or flip exposure through that
+exception. Raw reconciliation reports stay available.
 
 For compatibility, a mass status without a declared `lookback_start` can still apply historical fills when no
 position report exists. This exception does not treat a missing report as flat. Retained-fill deduplication
@@ -739,11 +739,45 @@ and projection of older lifecycles continue to apply in both paths.
 Reports with an explicit `venue_position_id` follow the position-specific reconciliation path and
 do not require NETTING lifecycle inference.
 
+#### Retained closing recovery
+
+Explicit venue fills can reduce or close a retained position even when its opening trade predates the
+lookback window. Each fill records its price and commission once. Recovery requires:
+
+- A bounded, complete history with `filter_position_reports=False`, no explicit position report for the instrument,
+  and no bulk position coverage for it.
+- A cached order, including one created during reconciliation, whose normal routing resolves an open,
+  unsettled position for the same account and instrument. HEDGING requires an existing order-to-position
+  link or an explicit position ID.
+- An explicit fill from the position's current lifecycle, on its closing side, no larger than its remaining
+  quantity. Orders with active inferred fill history are excluded. Other historical projection exclusions apply.
+
+Recovery applies fills independently in event order. It does not validate the instrument's entire history
+as a batch: a skipped, unresolved, or inferred execution does not veto another order's valid closing fill.
+A valid close can therefore apply while another execution stays order-only. Recovery cannot open or flip a
+position, and it does not split a fill that exceeds the remaining quantity.
+
+This automatic recovery covers straightforward offline closes. Histories containing additions to a position,
+re-entry, fill corrections, missing executions, or mixed inferred and explicit fills may require manual
+reconciliation of exposure and PnL. An order reaching `FILLED` does not establish that every execution updated
+the position. Reconcile the retained state before resuming trading in those cases.
+
 ### Failure handling
+
+During startup, an execution client's mass-status request has three outcomes:
+
+- **Available (`Ok(Some(...))`)**: Reconcile the supplied reports. An unresolved in-scope position
+  report prevents actors and strategies from starting.
+- **Unavailable (`Ok(None)`)**: Log a warning and continue startup. This compatibility policy does
+  not establish that the venue is flat; no position target can be inferred from the missing report.
+- **Failed (`Err(...)`) or timed out**: Abort startup and follow the startup cleanup path.
+
+Report processing also follows these rules:
 
 - An adapter can preserve successful report legs after an individual source failure. Explicitly
   bounded mass statuses must mark the result incomplete. Incompleteness does not veto an explicit
-  position report. A bounded fill with no explicit position report does not change a position.
+  position report. A bounded fill from incomplete history with no explicit position report does not change
+  a position.
 - Fill reports arriving before order status reports are deferred until order state is available.
 
 #### Commission failures
@@ -806,8 +840,21 @@ A batch ready exactly at the deadline is discarded.
 
 Once the batch is accepted, deferred adapter processing and report application run synchronously,
 without another deadline check or cancellation point. Slow processing does not discard accepted reports.
-Targeted follow-up queries use a separate bounded task. Discarding a batch skips deferred adapter work;
-it cannot undo state changes an adapter makes during collection.
+Discarding a batch or targeted response skips deferred adapter work; it cannot undo state changes an adapter
+makes during collection.
+
+Targeted follow-up queries use one timeout budget starting when their task starts. For each order, the node
+tries available responsible clients in order and stops at the first matching status. It queries any required
+companion fills before starting the next order's status query. Each status query keeps its client busy until
+deferred processing or disposal. A companion fill query releases that client before the next order's query.
+
+The node accepts each status or fill response only before the original deadline, then runs deferred
+processing.
+A response ready exactly at the deadline is discarded. Accepted results stay under node ownership until
+reconciliation, including after fill timeout, fill error, cancellation, or normal shutdown. Slow processing
+cannot discard accepted results. A canceled or expired status with unaccounted fills stays deferred until
+those fills arrive. A timed out or canceled task does not resolve orders as missing. Fatal callback failure
+stops further dispatch and discards the retained results.
 
 The table below applies when cache state differs from venue state. A missing open-order report does not by
 itself prove a pending modify or cancel outcome. Thus, these checks leave those states unresolved until
@@ -900,6 +947,10 @@ The engine caps single-order queries per cycle with `max_single_order_queries_pe
 deferred to the next cycle. `single_order_query_delay_ms` spaces out consecutive queries to avoid rate limits.
 This handles bulk query failures across hundreds of orders without overwhelming the venue API.
 
+Targeted tasks apply the delay between available-client status attempts across all orders in the task.
+Unavailable clients consume no delay. A companion fill request follows its matching status without an extra
+pacing delay; the next status attempt uses the configured delay and the remaining timeout budget.
+
 ## Common reconciliation scenarios
 
 The tables below cover startup reconciliation (mass status), runtime checks (in-flight order
@@ -907,28 +958,28 @@ checks, open-order polls, own-books audits), fill adjustment, and bounded histor
 
 ### Startup scenarios
 
-| Scenario                               | Description                                                                            | System behavior                                                                                          |
-| -------------------------------------- | -------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------- |
-| **Order state discrepancy**            | Local state differs from venue (for example, local `SUBMITTED`, venue `REJECTED`).     | Updates local order to match venue state, emits missing events.                                          |
-| **Missed fills**                       | Complete venue history contains a fill the engine missed.                              | Generates the missing `OrderFilled` event and applies its economics.                                     |
-| **Multiple fills**                     | A complete, coherent report set contains several fills for an order.                   | Reconstructs the reported fill history in event order.                                                   |
-| **Incomplete bounded history**         | A required order, fill, or position source failed or could not be mapped.              | Aligns an explicit position report, or leaves it unresolved. Fills with no report stay order-only.       |
-| **Ambiguous bounded lifecycle**        | The bounded reports do not prove one coherent NETTING position transition.             | An explicit position report is still the quantity target. Fills with no report stay order-only.          |
-| **External orders**                    | Orders exist on venue but not in local cache.                                          | Creates unclaimed orders with strategy ID `EXTERNAL` and tag `VENUE`.                                    |
-| **Missing client origin**              | A cached order in the mass status has no recorded execution-client origin.             | Logs one aggregated warning with a count and sample IDs. Reconciles against the reporting client.        |
-| **Conflicting client origin**          | A cached order's origin differs from the client that supplied the report.              | Logs one aggregated deprecation warning. Reconciliation proceeds during the compatibility period.        |
-| **Partially filled then canceled**     | Order partially filled then canceled by venue.                                         | Updates state to `CANCELED`, preserves fill history.                                                     |
-| **Different fill data**                | Venue reports different fill price/commission than cached.                             | Preserves cached data, logs discrepancies.                                                               |
-| **Filtered orders**                    | Orders marked for filtering through config.                                            | Skips based on `filtered_client_order_ids` or instrument filters.                                        |
-| **Unresolved instrument**              | A report references an in-scope instrument the adapter has not loaded.                 | Fails startup for open order and position reports. Warns and marks bounded history incomplete otherwise. |
-| **Fill commission failure**            | An adapter cannot represent a required fill commission while building reports.         | Fails mass-status generation and stops startup before applying that client's reports.                    |
-| **Inferred-fill commission failure**   | The responsible execution client cannot calculate a required commission.               | Defers inferred work. An external order stays absent, while valid explicit fills can still apply.        |
-| **Duplicate order reports**            | Multiple orders share the same identifier.                                             | Deduplicates with warning logged.                                                                        |
-| **Position quantity mismatch (long)**  | Internal long position differs from venue (for example, 100 vs 150).                   | Generates BUY MARKET with calculated price when `generate_missing_orders=True`.                          |
-| **Position quantity mismatch (short)** | Internal short position differs from venue (for example, -100 vs -150).                | Generates SELL MARKET with calculated price when `generate_missing_orders=True`.                         |
-| **Position reduction**                 | Venue position smaller than internal (for example, internal 150 long, venue 100 long). | Generates opposite-side MARKET order with calculated price.                                              |
-| **Position side flip**                 | Internal position opposite of venue (for example, internal 100 long, venue 50 short).  | Generates MARKET order to close internal and open external position.                                     |
-| **Internal reconciliation orders**     | Orders generated to align position discrepancies.                                      | Tags `RECONCILIATION`. Uses a claim when configured, otherwise `EXTERNAL`.                               |
+| Scenario                               | Description                                                                            | System behavior                                                                                                 |
+| -------------------------------------- | -------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------- |
+| **Order state discrepancy**            | Local state differs from venue (for example, local `SUBMITTED`, venue `REJECTED`).     | Updates local order to match venue state, emits missing events.                                                 |
+| **Missed fills**                       | Complete venue history contains a fill the engine missed.                              | Generates the missing `OrderFilled` event and applies its economics.                                            |
+| **Multiple fills**                     | A complete, coherent report set contains several fills for an order.                   | Reconstructs the reported fill history in event order.                                                          |
+| **Incomplete bounded history**         | A required order, fill, or position source failed or could not be mapped.              | Aligns an explicit position report, or leaves it unresolved. Fills with no report stay order-only.              |
+| **Ambiguous bounded lifecycle**        | The bounded reports do not prove one coherent NETTING position transition.             | An explicit position report remains the target. Without one, only eligible retained closes can affect exposure. |
+| **External orders**                    | Orders exist on venue but not in local cache.                                          | Creates unclaimed orders with strategy ID `EXTERNAL` and tag `VENUE`.                                           |
+| **Missing client origin**              | A cached order in the mass status has no recorded execution-client origin.             | Logs one aggregated warning with a count and sample IDs. Reconciles against the reporting client.               |
+| **Conflicting client origin**          | A cached order's origin differs from the client that supplied the report.              | Logs one aggregated deprecation warning. Reconciliation proceeds during the compatibility period.               |
+| **Partially filled then canceled**     | Order partially filled then canceled by venue.                                         | Updates state to `CANCELED`, preserves fill history.                                                            |
+| **Different fill data**                | Venue reports different fill price/commission than cached.                             | Preserves cached data, logs discrepancies.                                                                      |
+| **Filtered orders**                    | Orders marked for filtering through config.                                            | Skips based on `filtered_client_order_ids` or instrument filters.                                               |
+| **Unresolved instrument**              | A report references an in-scope instrument the adapter has not loaded.                 | Fails startup for open order and position reports. Warns and marks bounded history incomplete otherwise.        |
+| **Fill commission failure**            | An adapter cannot represent a required fill commission while building reports.         | Fails mass-status generation and stops startup before applying that client's reports.                           |
+| **Inferred-fill commission failure**   | The responsible execution client cannot calculate a required commission.               | Defers inferred work. An external order stays absent, while valid explicit fills can still apply.               |
+| **Duplicate order reports**            | Multiple orders share the same identifier.                                             | Deduplicates with warning logged.                                                                               |
+| **Position quantity mismatch (long)**  | Internal long position differs from venue (for example, 100 vs 150).                   | Generates BUY MARKET with calculated price when `generate_missing_orders=True`.                                 |
+| **Position quantity mismatch (short)** | Internal short position differs from venue (for example, -100 vs -150).                | Generates SELL MARKET with calculated price when `generate_missing_orders=True`.                                |
+| **Position reduction**                 | Venue position smaller than internal (for example, internal 150 long, venue 100 long). | Generates opposite-side MARKET order with calculated price.                                                     |
+| **Position side flip**                 | Internal position opposite of venue (for example, internal 100 long, venue 50 short).  | Generates MARKET order to close internal and open external position.                                            |
+| **Internal reconciliation orders**     | Orders generated to align position discrepancies.                                      | Tags `RECONCILIATION`. Uses a claim when configured, otherwise `EXTERNAL`.                                      |
 
 ### Runtime scenarios
 
@@ -963,7 +1014,7 @@ These scenarios apply whether or not the mass status declares a `lookback_start`
 | ----------------- | --------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
 | **Explicit open** | Complete, incomplete, or ambiguous bounded history.       | Applies available reports and attempts recovery to the reported quantity and entry average. Unresolved differences block startup. |
 | **Explicit flat** | Complete, incomplete, or ambiguous bounded history.       | Applies available reports and closes residual exposure when generation is enabled. Unresolved quantity differences block startup. |
-| **Missing**       | Bounded history, with or without a cached predecessor.    | Recovers order state only. Fills do not change positions or portfolio economics.                                                  |
+| **Missing**       | Bounded history, with or without a cached predecessor.    | Recovers order state; eligible explicit closes can reduce retained exposure under the retained closing recovery rules.            |
 | **Filtered**      | Position-report or instrument filters exclude the report. | Position-report filtering makes bounded fills order-only. Instrument filtering excludes both orders and positions.                |
 
 ## Common reconciliation issues
@@ -1020,8 +1071,8 @@ The reconciliation path preserves these invariants for the reports and positions
 1. **Explicit position report**: an explicit open or flat report is the quantity target. The engine
    aligns to it, generating orders and fills when configured, or leaves it unresolved. A missing
    report is not flat.
-1. **Missing position report**: an explicitly bounded historical fill with no in-scope position report updates
-   order state only, without changing positions or portfolio economics.
+1. **Missing position report**: bounded fills update order state only unless they qualify for
+   [retained closing recovery](#retained-closing-recovery). That exception can only reduce existing exposure.
 1. **Position quantity**: reconciled positions match authoritative venue reports within the applicable
    quantity tolerance.
 1. **Entry price**: reported entry averages match within tolerance before startup proceeds, except averages a

@@ -16,10 +16,13 @@
 
 | Platform           | Rust   | Python    |
 | :----------------- | :----- | :-------- |
-| `Linux (x86_64)`   | 1.99.0 | 3.13-3.14 |
-| `Linux (ARM64)`    | 1.99.0 | 3.13-3.14 |
-| `macOS (ARM64)`    | 1.99.0 | 3.13-3.14 |
-| `Windows (x86_64)` | 1.99.0 | 3.13-3.14 |
+| `Linux (x86_64)`   | 1.99.1 | 3.13-3.15 |
+| `Linux (ARM64)`    | 1.99.1 | 3.13-3.15 |
+| `macOS (ARM64)`    | 1.99.1 | 3.13-3.15 |
+| `Windows (x86_64)` | 1.99.1 | 3.13-3.15 |
+
+Python 3.15 requires a [source build](docs/getting_started/installation.md#from-source)
+or a development wheel until the next PyPI release.
 
 - **Docs**: <https://nautilustrader.io/docs/>
 - **Website**: <https://nautilustrader.io>
@@ -117,7 +120,7 @@ The following integrations are available or planned; see [docs/integrations/](ht
 | [Deribit](https://www.deribit.com)                         | `DERIBIT`             | Crypto Exchange (CEX)   | ![status](https://img.shields.io/badge/stable-green)    | [Guide](docs/integrations/deribit.md)             |
 | [Derive](https://www.derive.xyz)                           | `DERIVE`              | Crypto Exchange (DEX)   | ![status](https://img.shields.io/badge/stable-green)    | [Guide](docs/integrations/derive.md)              |
 | [dYdX](https://dydx.trade)                                 | `DYDX`                | Crypto Exchange (DEX)   | ![status](https://img.shields.io/badge/stable-green)    | [Guide](docs/integrations/dydx.md)                |
-| [FinFeed](https://www.finfeedapi.com/?ref=nautilus)        | `FINFEED`             | Data Provider           | ![status](https://img.shields.io/badge/building-orange) | -                                                 |
+| [FinFeed](https://www.finfeedapi.com/?ref=nautilus)        | `FINFEED`             | Data Provider           | ![status](https://img.shields.io/badge/beta-yellow)     | [Guide](docs/integrations/finfeed.md)             |
 | [Hyperliquid](https://hyperliquid.xyz)                     | `HYPERLIQUID`         | Crypto Exchange (DEX)   | ![status](https://img.shields.io/badge/stable-green)    | [Guide](docs/integrations/hyperliquid.md)         |
 | [Interactive Brokers](https://www.interactivebrokers.com)  | `INTERACTIVE_BROKERS` | Brokerage (multi-venue) | ![status](https://img.shields.io/badge/stable-green)    | [Guide](docs/integrations/interactive_brokers.md) |
 | [Kalshi](https://kalshi.com)                               | `KALSHI`              | Prediction Market (CEX) | ![status](https://img.shields.io/badge/building-orange) | -                                                 |
@@ -253,7 +256,8 @@ nautilus-model = { version = "*", features = ["high-precision"] }
 
 ## Installation
 
-We recommend using the latest supported version of Python and installing [nautilus_trader](https://pypi.org/project/nautilus_trader/) inside a virtual environment to isolate dependencies.
+For PyPI binary wheels, use Python 3.14. Install [nautilus_trader](https://pypi.org/project/nautilus_trader/)
+in a virtual environment to isolate dependencies.
 
 **There are two supported ways to install**:
 

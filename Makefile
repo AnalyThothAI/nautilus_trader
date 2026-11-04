@@ -8,6 +8,7 @@ IMAGE_FULL?=$(IMAGE):$(GIT_TAG)
 
 # Shared and NautilusTrader-specific Cargo tool versions
 CARGO_AUDIT_VERSION := $(shell bash scripts/cargo-tool-version.sh cargo-audit)
+CARGO_BINSTALL_VERSION := $(shell bash scripts/cargo-tool-version.sh cargo-binstall)
 CARGO_CODSPEED_VERSION := $(shell bash scripts/cargo-tool-version.sh cargo-codspeed)
 CARGO_DENY_VERSION := $(shell bash scripts/cargo-tool-version.sh cargo-deny)
 CARGO_EDIT_VERSION := $(shell bash scripts/cargo-tool-version.sh cargo-edit)
@@ -17,6 +18,7 @@ CARGO_LLVM_COV_VERSION := $(shell bash scripts/cargo-tool-version.sh cargo-llvm-
 CARGO_MACHETE_VERSION := $(shell bash scripts/cargo-tool-version.sh cargo-machete)
 CARGO_NEXTEST_VERSION := $(shell bash scripts/cargo-tool-version.sh cargo-nextest)
 CARGO_VET_VERSION := $(shell bash scripts/cargo-tool-version.sh cargo-vet)
+RUST_CODE_ANALYSIS_VERSION := $(shell bash scripts/cargo-tool-version.sh rust-code-analysis-cli)
 CBINDGEN_VERSION := $(shell bash scripts/cargo-tool-version.sh cbindgen)
 FLAMEGRAPH_VERSION := $(shell bash scripts/cargo-tool-version.sh flamegraph)
 LYCHEE_VERSION := $(shell bash scripts/cargo-tool-version.sh lychee)
@@ -204,7 +206,8 @@ CORE_SELECTED_FEATURES := $(subst $(space),$(comma),$(strip $(CORE_SELECTED_FEAT
 STANDARD_PRECISION_ARGS := --workspace --exclude nautilus-blockchain --no-default-features --lib --tests --features "ffi,python"
 SIM_PACKAGES := -p nautilus-common -p nautilus-core -p nautilus-event-store \
 	-p nautilus-network -p nautilus-execution -p nautilus-live
-SIM_ADAPTER_PACKAGES := -p nautilus-okx -p nautilus-coinapi -p nautilus-derive
+SIM_ADAPTER_PACKAGES := -p nautilus-okx -p nautilus-coinapi -p nautilus-derive -p nautilus-finfeed
+SIM_ADAPTER_FILTERSET := test(dst::) + package(nautilus-finfeed)
 SIM_FILTERSET := package(nautilus-common) + package(nautilus-event-store) + \
 	package(nautilus-network) + \
 	package(nautilus-execution) + \
@@ -212,6 +215,7 @@ SIM_FILTERSET := package(nautilus-common) + package(nautilus-event-store) + \
 	(package(nautilus-live) & test(~task::tests)) + \
 	(package(nautilus-live) & test(test_bulk_report_acceptance)) + \
 	(package(nautilus-live) & test(test_position_report_acceptance)) + \
+	(package(nautilus-live) & (test(test_targeted_report_acceptance) | test(test_targeted_collection))) + \
 	(package(nautilus-core) & test(~virtual_time))
 SIM_HIGH_PRECISION_PACKAGES := -p nautilus-common -p nautilus-execution
 
@@ -258,6 +262,12 @@ NEXTEST_ENV_TARGETS := cargo-test cargo-test-extras cargo-test-postgres-ci cargo
 
 ifneq ($(strip $(CARGO_BUILD_JOBS_FOR_RUST)),)
 $(CARGO_BUILD_JOB_TARGETS): export CARGO_BUILD_JOBS=$(CARGO_BUILD_JOBS_FOR_RUST)
+ifeq ($(origin CARGO_BUILD_JOBS),undefined)
+check-features check-features-defi: export CARGO_BUILD_JOBS := $(shell \
+	n='$(CARGO_BUILD_JOBS_FOR_RUST)'; \
+	[ "$$n" -gt 16 ] && n=16; \
+	printf '%s' "$$n")
+endif
 endif
 
 ifneq ($(strip $(NEXTEST_TEST_THREADS_FOR_RUST)),)
@@ -276,7 +286,7 @@ CORE_CRATES := nautilus-analysis nautilus-backtest nautilus-common nautilus-core
 ADAPTER_CRATES := nautilus-architect-ax nautilus-betfair nautilus-binance \
     nautilus-blockchain nautilus-bybit nautilus-cli \
     nautilus-coinapi nautilus-coinbase nautilus-databento nautilus-deribit nautilus-derive \
-    nautilus-dydx nautilus-hyperliquid nautilus-interactive-brokers \
+    nautilus-dydx nautilus-finfeed nautilus-hyperliquid nautilus-interactive-brokers \
     nautilus-kraken nautilus-lighter nautilus-okx nautilus-polymarket nautilus-pyo3 \
     nautilus-sandbox nautilus-tardis
 
@@ -434,7 +444,9 @@ format:  #-- Format Rust (with nightly) and Python code
 .PHONY: pre-commit
 pre-commit: check-cargo-cooldown  #-- Run all pre-commit hooks on all files
 	@$(timer_start) \
-		prek run --all-files \
+		CHANGED_BASE_SHA="$${CHANGED_BASE_SHA:-origin/develop}" \
+			bash .pre-commit-hooks/check_formatting_rs.sh \
+		&& prek run --all-files \
 	$(call timer_end,Pre-commit)
 
 # The check-code target uses CARGO_FEATURES which is controlled by the HYPERSYNC flag.
@@ -540,12 +552,20 @@ clippy-strict-audit: check-cargo-cooldown  #-- Report candidate strict Clippy li
 		--profile "$(CARGO_CI_PROFILE)"
 
 .PHONY: clippy-pedantic-crate-%
-clippy-pedantic-crate-%: check-cargo-cooldown  #-- Audit pedantic and panic-prone lints for one crate (usage: make clippy-pedantic-crate-<crate_name>)
+clippy-pedantic-crate-%: check-cargo-cooldown check-clippy-allowances  #-- Audit pedantic and panic-prone lints for one crate (usage: make clippy-pedantic-crate-<crate_name>)
+	@allowances="$$(python3 -B scripts/update-clippy-allowances.py --flags)" && \
 	cargo clippy --locked --all-targets --all-features -p $* -- -D warnings \
 		-W clippy::pedantic \
 		-W clippy::todo \
 		-W clippy::unwrap_used \
-		-W clippy::expect_used
+		-W clippy::expect_used $$allowances
+
+.PHONY: check-clippy-allowances
+check-clippy-allowances:  #-- Check generated workspace allowances after source pedantic opt-ins
+	python3 -B scripts/update-clippy-allowances.py --check
+
+check-code check-code-standard-precision check-code-sim check-all-targets \
+	clippy clippy-fix clippy-fix-nightly clippy-strict-audit: check-clippy-allowances
 
 .PHONY: hawk
 hawk: check-cargo-cooldown check-hawk-installed  #-- Find unnecessary Rust public surface and restricted visibility
@@ -569,7 +589,7 @@ outdated: check-edit-installed  #-- Check for outdated dependencies
 	sh scripts/check-outdated.sh
 	@printf "\n$(CYAN)Checking tool versions...$(RESET)\n"
 	@outdated_count=0; \
-	for tool in cargo-audit:$(CARGO_AUDIT_VERSION) cargo-codspeed:$(CARGO_CODSPEED_VERSION) cargo-deny:$(CARGO_DENY_VERSION) cargo-edit:$(CARGO_EDIT_VERSION) cargo-fuzz:$(CARGO_FUZZ_VERSION) cargo-hawk:$(CARGO_HAWK_VERSION) cargo-llvm-cov:$(CARGO_LLVM_COV_VERSION) cargo-machete:$(CARGO_MACHETE_VERSION) cargo-nextest:$(CARGO_NEXTEST_VERSION) cargo-vet:$(CARGO_VET_VERSION) cbindgen:$(CBINDGEN_VERSION) flamegraph:$(FLAMEGRAPH_VERSION) lychee:$(LYCHEE_VERSION) tokei:$(TOKEI_VERSION); do \
+	for tool in cargo-audit:$(CARGO_AUDIT_VERSION) cargo-binstall:$(CARGO_BINSTALL_VERSION) cargo-codspeed:$(CARGO_CODSPEED_VERSION) cargo-deny:$(CARGO_DENY_VERSION) cargo-edit:$(CARGO_EDIT_VERSION) cargo-fuzz:$(CARGO_FUZZ_VERSION) cargo-hawk:$(CARGO_HAWK_VERSION) cargo-llvm-cov:$(CARGO_LLVM_COV_VERSION) cargo-machete:$(CARGO_MACHETE_VERSION) cargo-nextest:$(CARGO_NEXTEST_VERSION) cargo-vet:$(CARGO_VET_VERSION) cbindgen:$(CBINDGEN_VERSION) flamegraph:$(FLAMEGRAPH_VERSION) lychee:$(LYCHEE_VERSION) tokei:$(TOKEI_VERSION); do \
 		name=$${tool%%:*}; current=$${tool##*:}; \
 		latest=$$(cargo search $$name --limit 1 2>/dev/null | head -1 | awk -F\" '{print $$2}'); \
 		if [ "$$current" != "$$latest" ]; then \
@@ -595,7 +615,8 @@ install-uv:  #-- Install or upgrade uv to the version pinned in the shared tool 
 
 .PHONY: install-tools
 install-tools: check-binstall-installed install-uv  #-- Install required development tools at shared and local pinned versions
-	bash scripts/install-security-tools.sh \
+	cargo binstall cargo-binstall --version $(CARGO_BINSTALL_VERSION) --no-confirm --locked \
+	&& bash scripts/install-security-tools.sh \
 	&& cargo install cargo-codspeed --version $(CARGO_CODSPEED_VERSION) --locked \
 	&& cargo install cargo-edit --version $(CARGO_EDIT_VERSION) --locked \
 	&& cargo install cargo-fuzz --version $(CARGO_FUZZ_VERSION) --locked \
@@ -606,6 +627,7 @@ install-tools: check-binstall-installed install-uv  #-- Install required develop
 	&& cargo install cbindgen --version $(CBINDGEN_VERSION) --locked \
 	&& cargo install flamegraph --version $(FLAMEGRAPH_VERSION) --locked \
 	&& cargo install lychee --version $(LYCHEE_VERSION) --locked \
+	&& cargo install rust-code-analysis-cli --version $(RUST_CODE_ANALYSIS_VERSION) --locked \
 	&& cargo install tokei --version $(TOKEI_VERSION) --locked \
 	&& cargo binstall prek --version $(PREK_VERSION) --no-confirm --locked
 
@@ -762,7 +784,8 @@ check-deny-installed:  #-- Verify the pinned cargo-deny version is installed
 check-binstall-installed:  #-- Verify cargo-binstall is installed (one-off prerequisite for install-tools)
 	@if ! command -v cargo-binstall >/dev/null 2>&1; then \
 		printf "$(YELLOW)cargo-binstall is required but not installed$(RESET)\n"; \
-		printf "Install once per machine with: $(CYAN)cargo install cargo-binstall --locked$(RESET)\n"; \
+		printf "Install once per machine with: $(CYAN)cargo install cargo-binstall --version %s --locked$(RESET)\n" \
+			"$(CARGO_BINSTALL_VERSION)"; \
 		printf "See: https://github.com/cargo-bins/cargo-binstall\n"; \
 		exit 1; \
 	fi
@@ -815,7 +838,7 @@ check-hawk-installed:  #-- Verify the pinned cargo-hawk version is installed
 	fi
 	@INSTALLED=$$(cargo hawk --version | awk '{print $$3}'); \
 	if [ "$$INSTALLED" != "$(CARGO_HAWK_VERSION)" ]; then \
-		printf "$(RED)cargo-hawk version mismatch: installed %s, expected %s (from Cargo.toml)$(RESET)\n" \
+		printf "$(RED)cargo-hawk version mismatch: installed %s, expected %s (from the shared tool catalog)$(RESET)\n" \
 			"$$INSTALLED" "$(CARGO_HAWK_VERSION)"; \
 		exit 1; \
 	fi
@@ -875,6 +898,7 @@ test-scripts:  #-- Run repository script tests
 	$(info $(M) Running script tests...)
 	$Q bash .pre-commit-hooks/test_cargo_machete.sh
 	$Q bash .pre-commit-hooks/test_check_cargo_conventions.sh
+	$Q bash .pre-commit-hooks/test_check_comparison_locale.bash
 	$Q bash .pre-commit-hooks/test_check_copyright_year.bash
 	$Q python3 -B .pre-commit-hooks/test_check_dependency_features.py
 	$Q bash .pre-commit-hooks/test_check_docs_conventions.sh
@@ -883,6 +907,7 @@ test-scripts:  #-- Run repository script tests
 	$Q bash .pre-commit-hooks/test_check_formatting_rs.sh
 	$Q bash .pre-commit-hooks/test_check_jiff_features.sh
 	$Q bash .pre-commit-hooks/test_check_logging_conventions.sh
+	$Q bash .pre-commit-hooks/test_check_nautilus_conventions.bash
 	$Q bash .pre-commit-hooks/test_check_pyo3_conventions.sh
 	$Q bash .pre-commit-hooks/test_check_typos.sh
 	$Q bash .pre-commit-hooks/test_check_unicode_typography.sh
@@ -915,6 +940,8 @@ test-scripts:  #-- Run repository script tests
 	$Q bash scripts/test-check-cargo-cooldown.bash
 	$Q bash scripts/test-cargo-ci-benches.bash
 	$Q bash scripts/test-clippy-strict-audit.bash
+	$Q python3 -B scripts/test-security-audit.py
+	$Q python3 -B scripts/ci/test_clippy_allowances.py
 	$Q bash scripts/test-update-cargo-dependencies.bash
 	$Q python3 -B scripts/ci/test_check_commit_message.py
 	$Q python3 -B scripts/ci/test_check_test_network.py
@@ -1047,10 +1074,10 @@ endif
 # gate without a separate build. Feature-coherent runs execute every test that
 # is sim-compatible today: all of nautilus-common, nautilus-event-store,
 # nautilus-network, and nautilus-execution, plus the audited adapters' integration dst
-# tests without the crate's default high-precision feature. Transport-bound and
-# thread-blocking tests are gated out at the source. The lane also runs the
-# LiveNode startup reconciliation timeout regression and the cross-crate seam
-# pinning tests in nautilus-core.
+# tests and FinFeed's library and integration tests without adapter default features.
+# Transport-bound and thread-blocking tests are gated out at the source. The lane
+# also runs the LiveNode startup reconciliation timeout regression and the
+# cross-crate seam pinning tests in nautilus-core.
 # Precision-sensitive common and execution tests also run under `high-precision`,
 # so the seam-routed code paths are exercised under both `QuantityRaw` /
 # `PriceRaw` widths (u64 vs u128). See docs/concepts/dst.md for the full
@@ -1063,7 +1090,7 @@ cargo-test-sim:  #-- Run DST simulation smoke tests (cfg madsim + simulation fea
 	$(info $(M) Running in-scope DST tests under simulation...)
 	cargo nextest run --locked $(SIM_PACKAGES) --lib --tests --features simulation -E '$(SIM_FILTERSET)' $(FAIL_FAST_FLAG) --profile $(NEXTEST_PROFILE) --cargo-profile $(CARGO_CI_PROFILE) $(NEXTEST_OUTPUT_ARGS)
 	$(info $(M) Running adapter DST integration tests under simulation...)
-	cargo nextest run --locked $(SIM_ADAPTER_PACKAGES) --lib --test integration --no-default-features --features simulation -E 'test(dst::)' $(FAIL_FAST_FLAG) --profile $(NEXTEST_PROFILE) --cargo-profile $(CARGO_CI_PROFILE) $(NEXTEST_OUTPUT_ARGS)
+	cargo nextest run --locked $(SIM_ADAPTER_PACKAGES) --lib --test integration --no-default-features --features simulation -E '$(SIM_ADAPTER_FILTERSET)' $(FAIL_FAST_FLAG) --profile $(NEXTEST_PROFILE) --cargo-profile $(CARGO_CI_PROFILE) $(NEXTEST_OUTPUT_ARGS)
 	$(info $(M) Running precision-sensitive DST tests under simulation + high-precision...)
 	cargo nextest run --locked $(SIM_HIGH_PRECISION_PACKAGES) --lib --tests --features "simulation,high-precision" $(FAIL_FAST_FLAG) --profile $(NEXTEST_PROFILE) --cargo-profile $(CARGO_CI_PROFILE) $(NEXTEST_OUTPUT_ARGS)
 
@@ -1304,6 +1331,7 @@ CODSPEED_BENCH_ARGS := $(addprefix --package ,$(CODSPEED_BENCH_CRATES)) \
 cargo-ci-benches: check-cargo-cooldown  #-- Run Rust benches for the crates included in the CI performance workflow
 	@for crate in $(CI_BENCH_CRATES); do \
 	  echo "Running benches for $$crate"; \
+	  VALGRIND_OPTS="$${VALGRIND_OPTS:+$$VALGRIND_OPTS }--cachegrind:cache-sim=yes" \
 	  cargo bench --locked -p $$crate --profile bench --benches --no-fail-fast || exit $$?; \
 	done
 
@@ -1357,9 +1385,11 @@ init-services:  #-- Initialize development services eg. for integration tests (s
 .PHONY: start-services
 start-services:  #-- Start development services (without reinitializing database)
 	$(info $(M) Starting development services...)
-	bash scripts/ci/docker-pull-retry.sh public.ecr.aws/docker/library/postgres
-	bash scripts/ci/docker-pull-retry.sh dpage/pgadmin4
-	bash scripts/ci/docker-pull-retry.sh public.ecr.aws/docker/library/redis
+	@set -e; \
+	images=$$(docker compose -f .docker/docker-compose.yml config --images); \
+	for image in $$images; do \
+		bash scripts/ci/docker-pull-retry.sh "$$image"; \
+	done
 	docker compose -f .docker/docker-compose.yml up -d
 
 .PHONY: stop-services

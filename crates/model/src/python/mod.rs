@@ -324,8 +324,10 @@ pub fn model(_: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<crate::events::OrderUpdated>()?;
     m.add_class::<crate::events::OrderPendingUpdate>()?;
     m.add_class::<crate::events::OrderPendingCancel>()?;
+    m.add_class::<crate::events::OrderModifyDenied>()?;
     m.add_class::<crate::events::OrderModifyRejected>()?;
     m.add_class::<crate::events::OrderAccepted>()?;
+    m.add_class::<crate::events::OrderCancelDenied>()?;
     m.add_class::<crate::events::OrderCancelRejected>()?;
     m.add_class::<crate::events::OrderCanceled>()?;
     m.add_class::<crate::events::OrderExpired>()?;
@@ -341,6 +343,7 @@ pub fn model(_: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<crate::accounts::CashAccount>()?;
     m.add_class::<crate::accounts::MarginAccount>()?;
     m.add_class::<crate::accounts::WalletAccount>()?;
+    m.add_class::<account::margin_model::PyMarginModel>()?;
     m.add_class::<crate::accounts::margin_model::StandardMarginModel>()?;
     m.add_class::<crate::accounts::margin_model::LeveragedMarginModel>()?;
     m.add_function(wrap_pyfunction!(

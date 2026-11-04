@@ -96,20 +96,18 @@ pub(super) fn request_data(client: &PolymarketDataClient, request: RequestCustom
                 );
             } else {
                 summary.used_watchlist_fallback = true;
-                let snapshot = watchlist.load();
                 let selection_mode = if resolve_poll_enabled {
                     ResolveWatchSelectionMode::ManualFallback
                 } else {
                     ResolveWatchSelectionMode::ManualAllEligible
                 };
                 let selection = collect_resolve_watch_selection(
-                    &snapshot,
+                    &watchlist.read(),
                     clock.get_time_ns(),
                     grace_secs,
                     max_wait_secs,
                     selection_mode,
                 );
-                drop(snapshot);
 
                 pause_and_reconcile_resolve_watch_entries(
                     &resolve_ctx,
@@ -349,7 +347,7 @@ pub(super) fn request_instrument(
                     |instrument| {
                         // Publish onto the data bus so other clients (e.g. the exec
                         // client's token map) can update from the same fetch.
-                        if let Err(e) = sender.send(DataEvent::Instrument(instrument.clone())) {
+                        if let Err(e) = sender.send(DataEvent::Data(instrument.clone().into())) {
                             log::warn!("Failed to publish instrument {instrument_id}: {e}");
                         }
                     },

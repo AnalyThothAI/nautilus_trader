@@ -31,6 +31,46 @@ cannot check.
 Match nearby code when the tools do not settle a choice. Change generator inputs and regenerate
 outputs instead of editing generated files directly.
 
+## Lint configuration
+
+`Cargo.toml` defines shared lint levels under `[workspace.lints]`. Each package inherits them with
+`[lints] workspace = true`. `clippy.toml` configures lint behavior, including thresholds, test
+allowances, and disallowed APIs; it does not set lint levels. `.cargo/config.toml` and the repository
+Clippy commands deny warnings so enabled checks fail the command.
+
+Crates adopt pedantic checks through `#![warn(clippy::pedantic)]` in each migrated target root.
+A library opt-in does not opt in its binaries, examples, or integration tests. Keep pedantic disabled
+in targets that have not migrated. Use narrow, reasoned source allowances for local exceptions,
+including documented macro exceptions.
+
+[Source attributes](https://doc.rust-lang.org/rustc/lints/levels.html#priority-of-lint-level-sources)
+override Cargo lint flags. Cargo
+[priority](https://doc.rust-lang.org/cargo/reference/manifest.html#the-lints-section) orders those flags
+and cannot preserve a shared allowance against a source group opt-in. Cargo also rejects package lint
+tables alongside workspace inheritance. The repository therefore generates shared allowance attributes after each
+source pedantic opt-in. This keeps direct Cargo commands and staged adoption working without copied
+lint tables or a custom Clippy runner. The generated attributes repeat the shared choices in source,
+with `Cargo.toml` as their authoritative definition.
+
+After changing shared allowances or adding an opt-in, run:
+
+```bash
+python3 -B scripts/update-clippy-allowances.py
+make check-clippy-allowances
+```
+
+The generator also covers module opt-ins: a group attribute in an inner scope overrides inherited
+allowances. Keep generated allowances after the opt-in and regenerate them instead of editing them.
+Pre-commit and repository Clippy commands check for drift. Run
+`python3 -B scripts/ci/test_clippy_allowances.py` for the isolated compiler regression probes.
+
+`make check-code` checks library and test targets; `scripts/clippy-changed.sh` also checks binaries.
+`make check-all-targets` includes examples and benches. These gates retain `-D warnings`.
+`make clippy-pedantic-crate-<package>` enables pedantic for one package's targets and appends shared
+allowance flags from the same generator.
+`make clippy-strict-audit` uses `--force-warn` to report candidate lints even at deliberately allowed
+sites; findings do not fail that audit.
+
 ## Module layout
 
 Arrange each hand-written module so its primary behavior appears before its supporting
@@ -38,18 +78,19 @@ implementation details.
 
 ### Module roots and declarations
 
-Preserve the surrounding module-root style when adding child modules. In each contiguous
-declaration block in a `mod.rs` file, order out-of-line module declarations by these sections:
+Preserve the surrounding module-root style when adding child modules.
+
+In each contiguous declaration block in a hand-written Rust file, order top-level out-of-line module
+declarations by these sections:
 
 1. `#[macro_use]` modules.
-1. Public modules.
-1. Restricted modules such as `pub(crate)`.
-1. Non-test `#[cfg(...)]`-gated modules.
-1. Private modules.
+1. Unconditional modules: public, restricted (such as `pub(crate)`), then private.
+1. Non-test `#[cfg(...)]`-gated modules: public, restricted, then private.
 1. Test-only modules.
 
-Alphabetize declarations within each section and leave one blank line between sections. The
-formatting hook enforces this order in `mod.rs` files.
+Alphabetize declarations in each visibility group, the `#[macro_use]` section, and the test-only section.
+Leave one blank line between groups and sections. The formatting hook enforces this order in all
+hand-written Rust files, including `lib.rs` and `mod.rs`.
 
 Use the narrowest visibility that serves the caller. The workspace denies unreachable `pub` items.
 
@@ -213,9 +254,14 @@ The formatting hook:
 
 - Checks existing control-flow, spawn, and module-ordering rules at changed boundaries.
 - Compares staged and unstaged changes against `HEAD`, or against the merge base with `CHANGED_BASE_SHA` when set.
-- Falls back to checking all tracked Rust files when a CI base is unavailable.
+- Checks all tracked Rust files under `crates`, `examples`, and `docs` when the configured base cannot be resolved.
 - Reads complete changed files for context and includes lines used by exemption checks when selecting diagnostics.
 - Does not modify files.
+
+`make pre-commit` checks committed, staged, and unstaged Rust changes against the merge base with the
+local `origin/develop` ref, then runs prek if formatting passes. Set `CHANGED_BASE_SHA` to select
+another base. The default applies only to this formatting check. Commit-time hooks and direct
+`prek run --all-files` compare against `HEAD` unless `CHANGED_BASE_SHA` is set.
 
 These remain review conventions:
 

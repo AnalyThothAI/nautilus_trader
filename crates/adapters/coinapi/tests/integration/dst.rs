@@ -117,6 +117,7 @@ fn assert_request(request: &str, target: &str, config: &CoinApiHttpConfig) {
     assert_eq!(
         headers,
         vec![
+            "accept-encoding: gzip",
             "accept: application/json",
             &host,
             "x-coinapi-key: test-api-key",
@@ -127,7 +128,7 @@ fn assert_request(request: &str, target: &str, config: &CoinApiHttpConfig) {
     assert_eq!(
         request,
         format!(
-            "GET {target} HTTP/1.1\r\naccept: application/json\r\n{host}\r\nx-coinapi-key: test-api-key\r\nx-referrer: nautilus\r\n\r\n"
+            "GET {target} HTTP/1.1\r\naccept: application/json\r\naccept-encoding: gzip\r\n{host}\r\nx-coinapi-key: test-api-key\r\nx-referrer: nautilus\r\n\r\n"
         )
     );
 }
@@ -459,6 +460,7 @@ async fn data_config_routes_rest_through_explicit_proxy() {
     assert_eq!(
         headers,
         vec![
+            "accept-encoding: gzip",
             "accept: application/json",
             "host: coinapi.invalid",
             "proxy-authorization: Basic dXNlcjpzZWNyZXQ=",
@@ -736,7 +738,7 @@ async fn invalid_parameters_do_not_consume_credits() {
             .get_ohlcv(
                 SYMBOL,
                 &OhlcvQuery {
-                    period_id: String::new(),
+                    period_id: "".into(),
                     range: range(1)
                 }
             )
@@ -809,7 +811,7 @@ async fn range_keys(
             (keys, pages.is_truncated)
         }
         _ => {
-            let pages = client.get_ohlcv_range(SYMBOL, "1MIN", range).await?;
+            let pages = client.get_ohlcv_range(SYMBOL, "1MIN".into(), range).await?;
             let keys = pages.records.iter().map(|o| o.time_period_start).collect();
             (keys, pages.is_truncated)
         }

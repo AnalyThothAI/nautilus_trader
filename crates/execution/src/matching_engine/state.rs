@@ -42,7 +42,7 @@ pub struct MatchingState {
     ids: IdsState,
     market_status: MarketStatus,
     instrument_close: Option<InstrumentClose>,
-    pending_resolution: bool,
+    pending_resolution: Option<MarketStatus>,
     expiration_processed: bool,
     option_settlement_failed: bool,
     bids: Vec<ConsumedLevel>,

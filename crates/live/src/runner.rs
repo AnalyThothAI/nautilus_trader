@@ -385,7 +385,7 @@ impl AsyncRunner {
             // Events drain before commands here even though the runtime select
             // prefers the opposite for everything-else: `LiveNode::start()`
             // calls this after `connect_data_clients()` to push queued
-            // `DataEvent::Instrument` items into the cache. A pending
+            // instrument definitions into the cache. A pending
             // subscription command (e.g. `SubscribeBars`) processed before the
             // matching instrument lands would be rejected by the data engine.
             while let Ok(evt) = self.channels.data_evt_rx.try_recv() {
@@ -547,9 +547,6 @@ impl AsyncRunner {
             DataEvent::Data(data) => {
                 msgbus::send_data(MessagingSwitchboard::data_engine_process_data(), data);
             }
-            DataEvent::Instrument(data) => {
-                msgbus::send_any(MessagingSwitchboard::data_engine_process(), &data);
-            }
             DataEvent::ResponseEnvelope(response) => {
                 msgbus::send_any(MessagingSwitchboard::data_engine_process(), &response);
             }
@@ -558,15 +555,6 @@ impl AsyncRunner {
             }
             DataEvent::Response(resp) => {
                 msgbus::send_data_response(MessagingSwitchboard::data_engine_response(), resp);
-            }
-            DataEvent::FundingRate(funding_rate) => {
-                msgbus::send_any(MessagingSwitchboard::data_engine_process(), &funding_rate);
-            }
-            DataEvent::InstrumentStatus(status) => {
-                msgbus::send_any(MessagingSwitchboard::data_engine_process(), &status);
-            }
-            DataEvent::OptionGreeks(greeks) => {
-                msgbus::send_any(MessagingSwitchboard::data_engine_process(), &greeks);
             }
             #[cfg(feature = "defi")]
             DataEvent::DeFi(data) => {
@@ -803,12 +791,12 @@ mod tests {
             },
         },
         messages::{
-            ExecutionEvent, ExecutionReport,
+            ExecutionEvent,
             data::{SubscribeCommand, SubscribeCustomData},
             execution::{CancelAllOrders, QueryAccount, TradingCommand},
             system::{ReconnectSocket, SocketState, SocketStateChange},
         },
-        msgbus::{TypedIntoHandler, stubs::get_typed_into_message_saving_handler},
+        msgbus::{Endpoint, MStr, TypedIntoHandler, stubs::get_typed_into_message_saving_handler},
         runner::{
             SyncTradingCommandSender, TimeEventMessage, drain_trading_cmd_queue,
             get_data_cmd_sender, get_time_event_sender, get_trading_cmd_sender,
@@ -820,28 +808,77 @@ mod tests {
     use nautilus_core::time::get_atomic_clock_realtime;
     use nautilus_core::{UUID4, UnixNanos};
     use nautilus_execution::engine::ExecutionEngine;
+    #[cfg(feature = "node")]
+    use nautilus_model::types::Money;
     use nautilus_model::{
-        data::{Data, DataType, quote::QuoteTick},
-        enums::{
-            AccountType, LiquiditySide, OrderSide, OrderStatus, OrderType, PositionSide,
-            TimeInForce,
+        data::{
+            Data, DataType, FundingRateUpdate, InstrumentStatus, OptionGreeks, quote::QuoteTick,
+            stubs::stub_instrument_status,
         },
-        events::{
-            OrderAcceptedBatch, OrderCanceledBatch, OrderEvent, OrderEventAny, OrderSubmittedBatch,
-            account::state::AccountState,
-            order::spec::{OrderAcceptedSpec, OrderCanceledSpec, OrderSubmittedSpec},
-        },
+        enums::{AccountType, OrderSide},
+        events::{OrderEventAny, account::state::AccountState, order::spec::OrderSubmittedSpec},
         identifiers::{
-            AccountId, ClientId, ClientOrderId, InstrumentId, PositionId, StrategyId, TradeId,
-            TraderId, Venue, VenueOrderId,
+            AccountId, ClientId, ClientOrderId, InstrumentId, StrategyId, TraderId, Venue,
         },
-        reports::{FillReport, OrderStatusReport, PositionStatusReport},
-        types::{Money, Price, Quantity},
+        instruments::{InstrumentAny, stubs::crypto_perpetual_ethusdt},
+        types::{Price, Quantity},
     };
     use rstest::rstest;
     use ustr::Ustr;
 
     use super::*;
+
+    #[rstest]
+    fn test_runner_dispatches_typed_data_once_in_order() {
+        let mut runner = AsyncRunner::new();
+        let expected = vec![
+            Data::from(InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt())),
+            Data::FundingRate(FundingRateUpdate::new(
+                InstrumentId::from("ETHUSDT.BINANCE"),
+                "0.00012".parse().unwrap(),
+                Some(480),
+                Some(UnixNanos::from(300)),
+                UnixNanos::from(100),
+                UnixNanos::from(200),
+            )),
+            Data::InstrumentStatus(InstrumentStatus {
+                ts_event: UnixNanos::from(400),
+                ts_init: UnixNanos::from(500),
+                ..stub_instrument_status()
+            }),
+            Data::OptionGreeks(OptionGreeks {
+                instrument_id: InstrumentId::from("BTC-20270101-50000-C.DERIBIT"),
+                mark_iv: Some(0.55),
+                bid_iv: Some(0.54),
+                ask_iv: Some(0.56),
+                underlying_price: Some(50001.0),
+                open_interest: Some(123.0),
+                ts_event: UnixNanos::from(600),
+                ts_init: UnixNanos::from(700),
+                ..OptionGreeks::default()
+            }),
+        ];
+        let received = Rc::new(RefCell::new(Vec::<Data>::new()));
+        let observed = received.clone();
+        msgbus::register_data_endpoint(
+            MessagingSwitchboard::data_engine_process_data(),
+            TypedIntoHandler::from(move |data| observed.borrow_mut().push(data)),
+        );
+
+        for data in &expected {
+            runner
+                .data_evt_tx
+                .send(DataEvent::Data(data.clone()).into())
+                .unwrap();
+        }
+
+        runner.flush_pending_data();
+
+        assert_eq!(
+            serde_json::to_value(&*received.borrow()).unwrap(),
+            serde_json::to_value(&expected).unwrap(),
+        );
+    }
 
     #[rstest]
     #[case(false)]
@@ -957,7 +994,7 @@ mod tests {
                 .unwrap();
         }
 
-        stop.send(()).unwrap();
+        runner.stop();
         runner.run().await.unwrap();
 
         assert!(received.borrow().is_empty());
@@ -977,7 +1014,6 @@ mod tests {
         assert!(!runner.time_evt_tx.is_closed());
     }
 
-    // Test fixture for creating test quotes
     fn test_quote() -> QuoteTick {
         QuoteTick {
             instrument_id: InstrumentId::from("EUR/USD.SIM"),
@@ -1008,59 +1044,15 @@ mod tests {
         ))
     }
 
-    // Test fixture to create AsyncRunner with manual channels.
-    // Sender halves are dummies (not connected to the test receivers) since
-    // these tests exercise the event loop, not TLS binding.
-    fn create_test_runner(
-        time_evt_rx: tokio::sync::mpsc::UnboundedReceiver<DispatchMessage<TimeEventMessage>>,
-        data_evt_rx: tokio::sync::mpsc::UnboundedReceiver<DispatchMessage<DataEvent>>,
-        data_cmd_rx: tokio::sync::mpsc::UnboundedReceiver<DispatchMessage<DataCommand>>,
-        exec_evt_rx: tokio::sync::mpsc::UnboundedReceiver<DispatchMessage<ExecutionEvent>>,
-        exec_cmd_rx: tokio::sync::mpsc::UnboundedReceiver<DispatchMessage<TradingCommandMessage>>,
-        signal_rx: tokio::sync::mpsc::UnboundedReceiver<()>,
-        signal_tx: tokio::sync::mpsc::UnboundedSender<()>,
-    ) -> AsyncRunner {
-        let (time_evt_tx, _) = tokio::sync::mpsc::unbounded_channel();
-        let (system_evt_tx, system_evt_rx) = tokio::sync::mpsc::unbounded_channel();
-        let (system_cmd_tx, system_cmd_rx) = tokio::sync::mpsc::unbounded_channel();
-        let (data_evt_tx, _) = tokio::sync::mpsc::unbounded_channel();
-        let (data_cmd_tx, _) = tokio::sync::mpsc::unbounded_channel();
-        let (exec_evt_tx, _) = tokio::sync::mpsc::unbounded_channel();
-        let (exec_cmd_tx, _) = tokio::sync::mpsc::unbounded_channel();
-
-        AsyncRunner {
-            channels: AsyncRunnerChannels {
-                time_evt_rx,
-                system_evt_rx,
-                system_cmd_rx,
-                exec_evt_rx,
-                exec_cmd_rx,
-                data_evt_rx,
-                data_cmd_rx,
-            },
-            skip_time: false,
-            skip_data: false,
-            time_evt_tx,
-            system_evt_tx,
-            system_cmd_tx,
-            exec_evt_tx,
-            exec_cmd_tx,
-            data_evt_tx,
-            data_cmd_tx,
-            signal_rx,
-            signal_tx,
-        }
-    }
-
     #[cfg(feature = "node")]
     #[rstest]
     fn test_poll_pending_processes_entry_snapshot_across_channels() {
-        let (time_evt_tx, time_evt_rx) = tokio::sync::mpsc::unbounded_channel();
-        let (data_evt_tx, data_evt_rx) = tokio::sync::mpsc::unbounded_channel();
-        let (data_cmd_tx, data_cmd_rx) = tokio::sync::mpsc::unbounded_channel();
-        let (exec_evt_tx, exec_evt_rx) = tokio::sync::mpsc::unbounded_channel();
-        let (exec_cmd_tx, exec_cmd_rx) = tokio::sync::mpsc::unbounded_channel();
-        let (signal_tx, signal_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut runner = AsyncRunner::new();
+        let time_evt_tx = runner.time_evt_tx.clone();
+        let data_evt_tx = runner.data_evt_tx.clone();
+        let data_cmd_tx = runner.data_cmd_tx.clone();
+        let exec_evt_tx = runner.exec_evt_tx.clone();
+        let exec_cmd_tx = runner.exec_cmd_tx.clone();
 
         let time_event = TimeEvent::new(
             Ustr::from("test"),
@@ -1121,15 +1113,6 @@ mod tests {
             )
             .unwrap();
 
-        let mut runner = create_test_runner(
-            time_evt_rx,
-            data_evt_rx,
-            data_cmd_rx,
-            exec_evt_rx,
-            exec_cmd_rx,
-            signal_rx,
-            signal_tx,
-        );
         runner.bind_senders();
         get_system_command_sender()
             .send(test_system_command())
@@ -1203,21 +1186,7 @@ mod tests {
     #[cfg(feature = "node")]
     #[tokio::test]
     async fn test_recv_processes_system_event_before_command() {
-        let (_time_evt_tx, time_evt_rx) = tokio::sync::mpsc::unbounded_channel();
-        let (_data_evt_tx, data_evt_rx) = tokio::sync::mpsc::unbounded_channel();
-        let (_data_cmd_tx, data_cmd_rx) = tokio::sync::mpsc::unbounded_channel();
-        let (_exec_evt_tx, exec_evt_rx) = tokio::sync::mpsc::unbounded_channel();
-        let (_exec_cmd_tx, exec_cmd_rx) = tokio::sync::mpsc::unbounded_channel();
-        let (signal_tx, signal_rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut runner = create_test_runner(
-            time_evt_rx,
-            data_evt_rx,
-            data_cmd_rx,
-            exec_evt_rx,
-            exec_cmd_rx,
-            signal_rx,
-            signal_tx,
-        );
+        let mut runner = AsyncRunner::new();
 
         runner
             .system_cmd_tx
@@ -1351,13 +1320,6 @@ mod tests {
         }
     }
 
-    #[rstest]
-    fn test_async_data_command_sender_creation() {
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let sender = AsyncDataCommandSender::new(tx);
-        assert!(format!("{sender:?}").contains("AsyncDataCommandSender"));
-    }
-
     #[cfg(feature = "node")]
     #[rstest]
     fn test_runner_senders_shutdown_logging() {
@@ -1473,13 +1435,6 @@ mod tests {
         AsyncTimeEventSender::new(tx).send(TimeEventMessage::new(event, callback));
         assert_eq!(*ERRORS.0.lock().unwrap(), expected_errors);
         assert_eq!(*received.borrow(), expected_events);
-    }
-
-    #[rstest]
-    fn test_async_time_event_sender_creation() {
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let sender = AsyncTimeEventSender::new(tx);
-        assert!(format!("{sender:?}").contains("AsyncTimeEventSender"));
     }
 
     #[tokio::test]
@@ -1876,178 +1831,6 @@ mod tests {
         assert!(rx.recv().await.is_some());
     }
 
-    #[tokio::test]
-    async fn test_runner_shutdown_signal() {
-        // Create runner with manual channels to avoid global state
-        let (_data_tx, data_evt_rx) =
-            tokio::sync::mpsc::unbounded_channel::<DispatchMessage<DataEvent>>();
-        let (_cmd_tx, data_cmd_rx) =
-            tokio::sync::mpsc::unbounded_channel::<DispatchMessage<DataCommand>>();
-        let (_time_tx, time_evt_rx) =
-            tokio::sync::mpsc::unbounded_channel::<DispatchMessage<TimeEventMessage>>();
-        let (_exec_evt_tx, exec_evt_rx) =
-            tokio::sync::mpsc::unbounded_channel::<DispatchMessage<ExecutionEvent>>();
-        let (_exec_cmd_tx, exec_cmd_rx) =
-            tokio::sync::mpsc::unbounded_channel::<DispatchMessage<TradingCommandMessage>>();
-        let (signal_tx, signal_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
-
-        let mut runner = create_test_runner(
-            time_evt_rx,
-            data_evt_rx,
-            data_cmd_rx,
-            exec_evt_rx,
-            exec_cmd_rx,
-            signal_rx,
-            signal_tx.clone(),
-        );
-
-        // Start runner
-        let runner_handle = tokio::spawn(async move {
-            runner.run().await.unwrap();
-        });
-
-        // Send shutdown signal
-        signal_tx.send(()).unwrap();
-
-        // Runner should stop quickly
-        let result = tokio::time::timeout(Duration::from_millis(100), runner_handle).await;
-        assert!(result.is_ok(), "Runner should stop on signal");
-    }
-
-    #[tokio::test]
-    async fn test_runner_closes_on_channel_drop() {
-        let (data_tx, data_evt_rx) =
-            tokio::sync::mpsc::unbounded_channel::<DispatchMessage<DataEvent>>();
-        let (_cmd_tx, data_cmd_rx) =
-            tokio::sync::mpsc::unbounded_channel::<DispatchMessage<DataCommand>>();
-        let (_time_tx, time_evt_rx) =
-            tokio::sync::mpsc::unbounded_channel::<DispatchMessage<TimeEventMessage>>();
-        let (_exec_evt_tx, exec_evt_rx) =
-            tokio::sync::mpsc::unbounded_channel::<DispatchMessage<ExecutionEvent>>();
-        let (_exec_cmd_tx, exec_cmd_rx) =
-            tokio::sync::mpsc::unbounded_channel::<DispatchMessage<TradingCommandMessage>>();
-        let (signal_tx, signal_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
-
-        let mut runner = create_test_runner(
-            time_evt_rx,
-            data_evt_rx,
-            data_cmd_rx,
-            exec_evt_rx,
-            exec_cmd_rx,
-            signal_rx,
-            signal_tx.clone(),
-        );
-
-        // Start runner
-        let runner_handle = tokio::spawn(async move {
-            runner.run().await.unwrap();
-        });
-
-        drop(data_tx);
-
-        // Yield to let runner enter event loop before stop signal
-        tokio::task::yield_now().await;
-        signal_tx.send(()).ok();
-
-        // Runner should stop when channels close or on signal
-        let result = tokio::time::timeout(Duration::from_millis(200), runner_handle).await;
-        assert!(
-            result.is_ok(),
-            "Runner should stop when channels close or on signal"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_concurrent_event_sending() {
-        let (data_evt_tx, data_evt_rx) =
-            tokio::sync::mpsc::unbounded_channel::<DispatchMessage<DataEvent>>();
-        let (_data_cmd_tx, data_cmd_rx) =
-            tokio::sync::mpsc::unbounded_channel::<DispatchMessage<DataCommand>>();
-        let (_time_evt_tx, time_evt_rx) =
-            tokio::sync::mpsc::unbounded_channel::<DispatchMessage<TimeEventMessage>>();
-        let (_exec_evt_tx, exec_evt_rx) =
-            tokio::sync::mpsc::unbounded_channel::<DispatchMessage<ExecutionEvent>>();
-        let (_exec_cmd_tx, exec_cmd_rx) =
-            tokio::sync::mpsc::unbounded_channel::<DispatchMessage<TradingCommandMessage>>();
-        let (signal_tx, signal_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
-
-        // Setup runner
-        let mut runner = create_test_runner(
-            time_evt_rx,
-            data_evt_rx,
-            data_cmd_rx,
-            exec_evt_rx,
-            exec_cmd_rx,
-            signal_rx,
-            signal_tx.clone(),
-        );
-
-        // Spawn multiple concurrent senders
-        let mut handles = vec![];
-
-        for _ in 0..5 {
-            let tx_clone = data_evt_tx.clone();
-
-            let handle = tokio::spawn(async move {
-                for _ in 0..20 {
-                    let quote = test_quote();
-                    tx_clone
-                        .send(DataEvent::Data(Data::Quote(quote)).into())
-                        .unwrap();
-                    tokio::task::yield_now().await;
-                }
-            });
-
-            handles.push(handle);
-        }
-
-        // Start runner in background
-        let runner_handle = tokio::spawn(async move {
-            runner.run().await.unwrap();
-        });
-
-        // Wait for all senders
-        for handle in handles {
-            handle.await.unwrap();
-        }
-
-        // Yield to let runner enter event loop before stop signal
-        tokio::task::yield_now().await;
-        signal_tx.send(()).unwrap();
-
-        let _ = tokio::time::timeout(Duration::from_millis(200), runner_handle).await;
-    }
-
-    #[rstest]
-    #[case(10)]
-    #[case(100)]
-    #[case(1000)]
-    fn test_channel_send_performance(#[case] count: usize) {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
-        let quote = test_quote();
-
-        // Send events
-        for _ in 0..count {
-            tx.send(DataEvent::Data(Data::Quote(quote))).unwrap();
-        }
-
-        // Verify all received
-        let mut received = 0;
-
-        while rx.try_recv().is_ok() {
-            received += 1;
-        }
-
-        assert_eq!(received, count);
-    }
-
-    #[rstest]
-    fn test_async_trading_command_sender_creation() {
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let sender = AsyncTradingCommandSender::new(tx);
-        assert!(format!("{sender:?}").contains("AsyncTradingCommandSender"));
-    }
-
     #[rstest]
     fn test_async_trading_command_sender_preserves_target_endpoints() {
         std::thread::spawn(|| {
@@ -2243,550 +2026,360 @@ mod tests {
         .unwrap();
     }
 
-    #[tokio::test]
-    async fn test_runner_processes_trading_commands() {
-        let (_data_evt_tx, data_evt_rx) =
-            tokio::sync::mpsc::unbounded_channel::<DispatchMessage<DataEvent>>();
-        let (_data_cmd_tx, data_cmd_rx) =
-            tokio::sync::mpsc::unbounded_channel::<DispatchMessage<DataCommand>>();
-        let (_time_evt_tx, time_evt_rx) =
-            tokio::sync::mpsc::unbounded_channel::<DispatchMessage<TimeEventMessage>>();
-        let (_exec_evt_tx, exec_evt_rx) =
-            tokio::sync::mpsc::unbounded_channel::<DispatchMessage<ExecutionEvent>>();
-        let (exec_cmd_tx, exec_cmd_rx) =
-            tokio::sync::mpsc::unbounded_channel::<DispatchMessage<TradingCommandMessage>>();
-        let (signal_tx, signal_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+    #[cfg(feature = "node")]
+    #[rstest]
+    #[case::cash(AccountType::Cash)]
+    #[case::margin(AccountType::Margin)]
+    fn test_account_event_publishes_after_portfolio_application(#[case] account_type: AccountType) {
+        use nautilus_common::msgbus::{MessageBus, TypedHandler};
+        use nautilus_model::{
+            accounts::Account,
+            types::{AccountBalance, Currency},
+        };
+        use nautilus_portfolio::Portfolio;
 
-        let mut runner = create_test_runner(
-            time_evt_rx,
-            data_evt_rx,
-            data_cmd_rx,
-            exec_evt_rx,
-            exec_cmd_rx,
-            signal_rx,
-            signal_tx.clone(),
-        );
+        // Native logging tests use nextest's per-test process isolation.
+        struct AccountLogCapture(std::sync::Mutex<Vec<String>>);
 
-        let runner_handle = tokio::spawn(async move {
-            runner.run().await.unwrap();
+        impl log::Log for AccountLogCapture {
+            fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+                metadata.level() == log::Level::Info
+                    && metadata.target() == "nautilus_portfolio::portfolio"
+            }
+
+            fn log(&self, record: &log::Record<'_>) {
+                if self.enabled(record.metadata()) {
+                    self.0.lock().unwrap().push(record.args().to_string());
+                }
+            }
+
+            fn flush(&self) {}
+        }
+
+        static LOGS: AccountLogCapture = AccountLogCapture(std::sync::Mutex::new(Vec::new()));
+        log::set_logger(&LOGS).unwrap();
+        log::set_max_level(log::LevelFilter::Info);
+
+        msgbus::set_message_bus(Rc::new(RefCell::new(MessageBus::new(
+            TraderId::from("TESTER-001"),
+            UUID4::new(),
+            None,
+            None,
+        ))));
+        let cache = Rc::new(RefCell::new(Cache::default()));
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
+        let _portfolio = Portfolio::new(clock, cache.clone(), None);
+        let observed = Rc::new(RefCell::new(Vec::new()));
+        let received = observed.clone();
+        let source = cache.clone();
+        let handler = TypedHandler::from(move |event: &AccountState| {
+            let cache = source.borrow();
+            let account = cache.account(&event.account_id).unwrap();
+            assert_eq!(account.last_event().unwrap().event_id, event.event_id);
+            assert_eq!(account.account_type(), event.account_type);
+            assert_eq!(
+                account.balances().into_values().collect::<Vec<_>>(),
+                event.balances
+            );
+            received
+                .borrow_mut()
+                .push((event.event_id, account.events().len()));
         });
 
-        let command = TradingCommand::CancelAllOrders(CancelAllOrders::new(
-            TraderId::from("TRADER-001"),
+        // Subscribers must see applied state regardless of their topic priority
+        msgbus::subscribe_account_state("events.account.*".into(), handler.clone(), Some(20));
+        let scoped = Rc::new(RefCell::new(Vec::new()));
+        let scoped_received = scoped.clone();
+        let scoped_handler = TypedHandler::from(move |event: &AccountState| {
+            scoped_received.borrow_mut().push(event.event_id);
+        });
+        msgbus::subscribe_account_state(
+            "events.account.SIM-001".into(),
+            scoped_handler.clone(),
             None,
-            StrategyId::from("S-001"),
-            InstrumentId::from("EUR/USD.SIM"),
-            Some(OrderSide::Buy),
-            UUID4::new(),
-            UnixNanos::default(),
-            None,
-            None, // correlation_id
-        ));
-        exec_cmd_tx
-            .send(
-                TradingCommandMessage::new(MessagingSwitchboard::exec_engine_execute(), command)
-                    .into(),
-            )
-            .unwrap();
-
-        tokio::task::yield_now().await;
-        signal_tx.send(()).unwrap();
-
-        let result = tokio::time::timeout(Duration::from_millis(100), runner_handle).await;
-        assert!(result.is_ok(), "Runner should process command and stop");
+        );
+        let mut expected = Vec::new();
+        let mut expected_scoped = Vec::new();
+        for (index, (account_id, total, locked, free, history_len)) in [
+            ("SIM-001", "100 USD", "20 USD", "80 USD", 1),
+            ("SIM-002", "200 USD", "50 USD", "150 USD", 1),
+            ("SIM-001", "90 USD", "10 USD", "80 USD", 2),
+            ("SIM-001", "0 USD", "0 USD", "0 USD", 3),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let event = AccountState::new(
+                AccountId::from(account_id),
+                account_type,
+                vec![AccountBalance::new(
+                    Money::from(total),
+                    Money::from(locked),
+                    Money::from(free),
+                )],
+                vec![],
+                true,
+                UUID4::new(),
+                UnixNanos::from(index as u64 + 1),
+                UnixNanos::from(index as u64 + 1),
+                Some(Currency::USD()),
+            );
+            expected.push((event.event_id, history_len));
+            if account_id == "SIM-001" {
+                expected_scoped.push(event.event_id);
+            }
+            let expected_log = format!("Updated {event}");
+            AsyncRunner::handle_exec_event(ExecutionEvent::Account(event));
+            assert_eq!(
+                LOGS.0
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|line| **line == expected_log)
+                    .count(),
+                1
+            );
+        }
+        assert_eq!(*observed.borrow(), expected);
+        assert_eq!(*scoped.borrow(), expected_scoped);
+        let cache = cache.borrow();
+        assert_eq!(
+            cache
+                .account(&AccountId::from("SIM-001"))
+                .unwrap()
+                .events()
+                .len(),
+            3
+        );
+        assert_eq!(
+            cache
+                .account(&AccountId::from("SIM-002"))
+                .unwrap()
+                .events()
+                .len(),
+            1
+        );
+        msgbus::unsubscribe_account_state("events.account.*".into(), &handler);
+        msgbus::unsubscribe_account_state("events.account.SIM-001".into(), &scoped_handler);
     }
 
-    #[tokio::test]
-    async fn test_runner_processes_multiple_trading_commands() {
-        let (_data_evt_tx, data_evt_rx) =
-            tokio::sync::mpsc::unbounded_channel::<DispatchMessage<DataEvent>>();
-        let (_data_cmd_tx, data_cmd_rx) =
-            tokio::sync::mpsc::unbounded_channel::<DispatchMessage<DataCommand>>();
-        let (_time_evt_tx, time_evt_rx) =
-            tokio::sync::mpsc::unbounded_channel::<DispatchMessage<TimeEventMessage>>();
-        let (_exec_evt_tx, exec_evt_rx) =
-            tokio::sync::mpsc::unbounded_channel::<DispatchMessage<ExecutionEvent>>();
-        let (exec_cmd_tx, exec_cmd_rx) =
-            tokio::sync::mpsc::unbounded_channel::<DispatchMessage<TradingCommandMessage>>();
-        let (signal_tx, signal_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+    #[cfg(feature = "node")]
+    #[rstest]
+    #[case::cash_update(AccountType::Cash, true)]
+    #[case::wallet_initial(AccountType::Wallet, false)]
+    #[case::wallet_update(AccountType::Wallet, true)]
+    fn test_rejected_account_event_is_not_published(
+        #[case] account_type: AccountType,
+        #[case] existing_account: bool,
+    ) {
+        use nautilus_common::msgbus::{MessageBus, TypedHandler};
+        use nautilus_model::types::{AccountBalance, Currency};
+        use nautilus_portfolio::Portfolio;
 
-        let mut runner = create_test_runner(
-            time_evt_rx,
-            data_evt_rx,
-            data_cmd_rx,
-            exec_evt_rx,
-            exec_cmd_rx,
-            signal_rx,
-            signal_tx.clone(),
+        msgbus::set_message_bus(Rc::new(RefCell::new(MessageBus::default())));
+        let cache = Rc::new(RefCell::new(Cache::default()));
+        let mut portfolio = Portfolio::new(
+            Rc::new(RefCell::new(VirtualClock::new())),
+            cache.clone(),
+            None,
+        );
+        let state = |amount: &str| {
+            AccountState::new(
+                AccountId::from("SIM-001"),
+                account_type,
+                vec![AccountBalance::new(
+                    Money::from(amount),
+                    Money::zero(Currency::USD()),
+                    Money::from(amount),
+                )],
+                vec![],
+                true,
+                UUID4::new(),
+                UnixNanos::from(1),
+                UnixNanos::from(1),
+                (account_type != AccountType::Wallet).then_some(Currency::USD()),
+            )
+        };
+        let initial = state("100.00 USD");
+
+        if existing_account {
+            portfolio.update_account(&initial);
+        }
+        let received = Rc::new(RefCell::new(Vec::new()));
+        let handler = TypedHandler::from({
+            let received = received.clone();
+            move |event: &AccountState| received.borrow_mut().push(event.clone())
+        });
+        msgbus::subscribe_account_state("events.account.*".into(), handler.clone(), None);
+        AsyncRunner::handle_exec_event(ExecutionEvent::Account(state("-1.00 USD")));
+        assert!(received.borrow().is_empty());
+        let cache = cache.borrow();
+
+        if existing_account {
+            assert_eq!(
+                cache.account(&initial.account_id).unwrap().last_event(),
+                Some(initial)
+            );
+        } else {
+            assert!(cache.account(&initial.account_id).is_none());
+        }
+        msgbus::unsubscribe_account_state("events.account.*".into(), &handler);
+    }
+
+    #[rstest]
+    #[case::risk(MessagingSwitchboard::risk_engine_execute())]
+    #[case::execution(MessagingSwitchboard::exec_engine_execute())]
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_runner_dispatches_commands_and_data_before_handle_stop(
+        #[case] target: MStr<Endpoint>,
+    ) {
+        let count = 10_u64;
+        let mut runner = AsyncRunner::new();
+        let handle = runner.handle();
+        let commands = Rc::new(RefCell::new(Vec::new()));
+        let data = Rc::new(RefCell::new(Vec::new()));
+        let (observed_tx, mut observed_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        for endpoint in [
+            MessagingSwitchboard::risk_engine_execute(),
+            MessagingSwitchboard::exec_engine_execute(),
+        ] {
+            let observed_commands = commands.clone();
+            let commands_tx = observed_tx.clone();
+            msgbus::register_trading_command_endpoint(
+                endpoint,
+                TypedIntoHandler::from(move |command| {
+                    observed_commands.borrow_mut().push((endpoint, command));
+                    commands_tx.send(()).unwrap();
+                }),
+            );
+        }
+
+        let observed_data = data.clone();
+        msgbus::register_data_endpoint(
+            MessagingSwitchboard::data_engine_process_data(),
+            TypedIntoHandler::from(move |event| {
+                observed_data.borrow_mut().push(event);
+                observed_tx.send(()).unwrap();
+            }),
         );
 
-        let runner_handle = tokio::spawn(async move {
-            runner.run().await.unwrap();
-        });
+        let mut expected_commands = Vec::new();
+        let mut expected_data = Vec::new();
 
-        for i in 0..10 {
-            let strategy_id = format!("S-{i:03}");
+        for index in 1..=count {
             let command = TradingCommand::CancelAllOrders(CancelAllOrders::new(
                 TraderId::from("TRADER-001"),
-                None,
-                StrategyId::from(strategy_id.as_str()),
+                Some(ClientId::from("SIM")),
+                StrategyId::from(format!("S-{index:03}")),
                 InstrumentId::from("EUR/USD.SIM"),
-                Some(OrderSide::Buy),
+                Some(OrderSide::Sell),
                 UUID4::new(),
-                UnixNanos::default(),
+                UnixNanos::from(index),
                 None,
-                None, // correlation_id
+                Some(UUID4::new()),
             ));
-            exec_cmd_tx
-                .send(
-                    TradingCommandMessage::new(
-                        MessagingSwitchboard::exec_engine_execute(),
-                        command,
-                    )
-                    .into(),
-                )
+            runner
+                .exec_cmd_tx
+                .send(TradingCommandMessage::new(target, command.clone()).into())
                 .unwrap();
-        }
-
-        tokio::task::yield_now().await;
-        signal_tx.send(()).unwrap();
-
-        let result = tokio::time::timeout(Duration::from_millis(100), runner_handle).await;
-        assert!(
-            result.is_ok(),
-            "Runner should process all commands and stop"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_execution_event_order_channel() {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ExecutionEvent>();
-
-        let event = OrderSubmittedSpec::builder()
-            .client_order_id(ClientOrderId::from("O-001"))
-            .build();
-
-        tx.send(ExecutionEvent::Order(OrderEventAny::Submitted(event)))
-            .unwrap();
-
-        let received = rx.recv().await.unwrap();
-        match received {
-            ExecutionEvent::Order(OrderEventAny::Submitted(e)) => {
-                assert_eq!(e.client_order_id(), ClientOrderId::from("O-001"));
-            }
-            _ => panic!("Expected OrderSubmitted event"),
-        }
-    }
-
-    #[tokio::test]
-    async fn test_execution_report_order_status_channel() {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ExecutionEvent>();
-
-        let report = OrderStatusReport::new(
-            AccountId::from("SIM-001"),
-            InstrumentId::from("EUR/USD.SIM"),
-            Some(ClientOrderId::from("O-001")),
-            VenueOrderId::from("V-001"),
-            OrderSide::Buy.into(),
-            OrderType::Market,
-            TimeInForce::Gtc,
-            OrderStatus::Accepted,
-            Quantity::from(100_000),
-            Quantity::from(100_000),
-            UnixNanos::from(1),
-            UnixNanos::from(2),
-            UnixNanos::from(3),
-            None,
-        );
-
-        tx.send(ExecutionEvent::Report(ExecutionReport::Order(Box::new(
-            report,
-        ))))
-        .unwrap();
-
-        let received = rx.recv().await.unwrap();
-        match received {
-            ExecutionEvent::Report(ExecutionReport::Order(r)) => {
-                assert_eq!(r.venue_order_id.as_str(), "V-001");
-                assert_eq!(r.order_status, OrderStatus::Accepted);
-            }
-            _ => panic!("Expected OrderStatusReport"),
-        }
-    }
-
-    #[tokio::test]
-    async fn test_execution_report_fill() {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ExecutionEvent>();
-
-        let report = FillReport::new(
-            AccountId::from("SIM-001"),
-            InstrumentId::from("EUR/USD.SIM"),
-            VenueOrderId::from("V-001"),
-            TradeId::from("T-001"),
-            OrderSide::Buy,
-            Quantity::from(100_000),
-            Price::from("1.10000"),
-            Money::from("10 USD"),
-            LiquiditySide::Taker,
-            Some(ClientOrderId::from("O-001")),
-            None,
-            UnixNanos::from(1),
-            UnixNanos::from(2),
-            None,
-        );
-
-        tx.send(ExecutionEvent::Report(ExecutionReport::Fill(Box::new(
-            report,
-        ))))
-        .unwrap();
-
-        let received = rx.recv().await.unwrap();
-        match received {
-            ExecutionEvent::Report(ExecutionReport::Fill(r)) => {
-                assert_eq!(r.venue_order_id.as_str(), "V-001");
-                assert_eq!(r.trade_id.to_string(), "T-001");
-            }
-            _ => panic!("Expected FillReport"),
-        }
-    }
-
-    #[tokio::test]
-    async fn test_execution_report_position() {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ExecutionEvent>();
-
-        let report = PositionStatusReport::new(
-            AccountId::from("SIM-001"),
-            InstrumentId::from("EUR/USD.SIM"),
-            PositionSide::Long,
-            Quantity::from(100_000),
-            UnixNanos::from(1),
-            UnixNanos::from(2),
-            None,
-            Some(PositionId::from("P-001")),
-            None,
-        );
-
-        tx.send(ExecutionEvent::Report(ExecutionReport::Position(Box::new(
-            report,
-        ))))
-        .unwrap();
-
-        let received = rx.recv().await.unwrap();
-        match received {
-            ExecutionEvent::Report(ExecutionReport::Position(r)) => {
-                assert_eq!(r.venue_position_id.unwrap().as_str(), "P-001");
-            }
-            _ => panic!("Expected PositionStatusReport"),
-        }
-    }
-
-    #[tokio::test]
-    async fn test_execution_event_account() {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ExecutionEvent>();
-
-        let account_state = AccountState::new(
-            AccountId::from("SIM-001"),
-            AccountType::Cash,
-            vec![],
-            vec![],
-            true,
-            UUID4::new(),
-            UnixNanos::from(1),
-            UnixNanos::from(2),
-            None,
-        );
-
-        tx.send(ExecutionEvent::Account(account_state)).unwrap();
-
-        let received = rx.recv().await.unwrap();
-        match received {
-            ExecutionEvent::Account(r) => {
-                assert_eq!(r.account_id.as_str(), "SIM-001");
-            }
-            _ => panic!("Expected AccountState"),
-        }
-    }
-
-    #[tokio::test]
-    async fn test_runner_stop_method() {
-        let (_data_tx, data_evt_rx) =
-            tokio::sync::mpsc::unbounded_channel::<DispatchMessage<DataEvent>>();
-        let (_cmd_tx, data_cmd_rx) =
-            tokio::sync::mpsc::unbounded_channel::<DispatchMessage<DataCommand>>();
-        let (_time_tx, time_evt_rx) =
-            tokio::sync::mpsc::unbounded_channel::<DispatchMessage<TimeEventMessage>>();
-        let (_exec_evt_tx, exec_evt_rx) =
-            tokio::sync::mpsc::unbounded_channel::<DispatchMessage<ExecutionEvent>>();
-        let (_exec_cmd_tx, exec_cmd_rx) =
-            tokio::sync::mpsc::unbounded_channel::<DispatchMessage<TradingCommandMessage>>();
-        let (signal_tx, signal_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
-
-        let mut runner = create_test_runner(
-            time_evt_rx,
-            data_evt_rx,
-            data_cmd_rx,
-            exec_evt_rx,
-            exec_cmd_rx,
-            signal_rx,
-            signal_tx.clone(),
-        );
-
-        let runner_handle = tokio::spawn(async move {
-            runner.run().await.unwrap();
-        });
-
-        // Use stop via signal_tx directly
-        signal_tx.send(()).unwrap();
-
-        let result = tokio::time::timeout(Duration::from_millis(100), runner_handle).await;
-        assert!(result.is_ok(), "Runner should stop when stop() is called");
-    }
-
-    #[tokio::test]
-    async fn test_all_event_types_integration() {
-        let (data_evt_tx, data_evt_rx) =
-            tokio::sync::mpsc::unbounded_channel::<DispatchMessage<DataEvent>>();
-        let (data_cmd_tx, data_cmd_rx) =
-            tokio::sync::mpsc::unbounded_channel::<DispatchMessage<DataCommand>>();
-        let (time_evt_tx, time_evt_rx) =
-            tokio::sync::mpsc::unbounded_channel::<DispatchMessage<TimeEventMessage>>();
-        let (exec_evt_tx, exec_evt_rx) =
-            tokio::sync::mpsc::unbounded_channel::<DispatchMessage<ExecutionEvent>>();
-        let (_exec_cmd_tx, exec_cmd_rx) =
-            tokio::sync::mpsc::unbounded_channel::<DispatchMessage<TradingCommandMessage>>();
-        let (signal_tx, signal_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
-
-        let mut runner = create_test_runner(
-            time_evt_rx,
-            data_evt_rx,
-            data_cmd_rx,
-            exec_evt_rx,
-            exec_cmd_rx,
-            signal_rx,
-            signal_tx.clone(),
-        );
-
-        let runner_handle = tokio::spawn(async move {
-            runner.run().await.unwrap();
-        });
-
-        // Send data event
-        let quote = test_quote();
-        data_evt_tx
-            .send((DataEvent::Data(Data::Quote(quote))).into())
-            .unwrap();
-
-        // Send data command
-        let command = DataCommand::Subscribe(SubscribeCommand::Data(SubscribeCustomData {
-            client_id: Some(ClientId::from("TEST")),
-            venue: None,
-            data_type: DataType::new("QuoteTick", None, None),
-            command_id: UUID4::new(),
-            ts_init: UnixNanos::default(),
-            correlation_id: None,
-            params: None,
-        }));
-
-        data_cmd_tx.send(command.into()).unwrap();
-
-        // Send time event
-        let event = TimeEvent::new(
-            Ustr::from("test"),
-            UUID4::new(),
-            UnixNanos::from(1),
-            UnixNanos::from(2),
-        );
-        let callback = TimeEventCallback::from(|_: TimeEvent| {});
-        let message = TimeEventMessage::new(event, callback);
-        time_evt_tx.send((message).into()).unwrap();
-
-        // Send execution order event
-        let order_event = OrderSubmittedSpec::builder()
-            .client_order_id(ClientOrderId::from("O-001"))
-            .build();
-        exec_evt_tx
-            .send((ExecutionEvent::Order(OrderEventAny::Submitted(order_event))).into())
-            .unwrap();
-
-        // Send execution report (OrderStatus)
-        let order_status = OrderStatusReport::new(
-            AccountId::from("SIM-001"),
-            InstrumentId::from("EUR/USD.SIM"),
-            Some(ClientOrderId::from("O-001")),
-            VenueOrderId::from("V-001"),
-            OrderSide::Buy.into(),
-            OrderType::Market,
-            TimeInForce::Gtc,
-            OrderStatus::Accepted,
-            Quantity::from(100_000),
-            Quantity::from(100_000),
-            UnixNanos::from(1),
-            UnixNanos::from(2),
-            UnixNanos::from(3),
-            None,
-        );
-        exec_evt_tx
-            .send((ExecutionEvent::Report(ExecutionReport::Order(Box::new(order_status)))).into())
-            .unwrap();
-
-        // Send execution report (Fill)
-        let fill = FillReport::new(
-            AccountId::from("SIM-001"),
-            InstrumentId::from("EUR/USD.SIM"),
-            VenueOrderId::from("V-001"),
-            TradeId::from("T-001"),
-            OrderSide::Buy,
-            Quantity::from(100_000),
-            Price::from("1.10000"),
-            Money::from("10 USD"),
-            LiquiditySide::Taker,
-            Some(ClientOrderId::from("O-001")),
-            None,
-            UnixNanos::from(1),
-            UnixNanos::from(2),
-            None,
-        );
-        exec_evt_tx
-            .send((ExecutionEvent::Report(ExecutionReport::Fill(Box::new(fill)))).into())
-            .unwrap();
-
-        // Send execution report (Position)
-        let position = PositionStatusReport::new(
-            AccountId::from("SIM-001"),
-            InstrumentId::from("EUR/USD.SIM"),
-            PositionSide::Long,
-            Quantity::from(100_000),
-            UnixNanos::from(1),
-            UnixNanos::from(2),
-            None,
-            Some(PositionId::from("P-001")),
-            None,
-        );
-        exec_evt_tx
-            .send((ExecutionEvent::Report(ExecutionReport::Position(Box::new(position)))).into())
-            .unwrap();
-
-        // Send account event
-        let account_state = AccountState::new(
-            AccountId::from("SIM-001"),
-            AccountType::Cash,
-            vec![],
-            vec![],
-            true,
-            UUID4::new(),
-            UnixNanos::from(1),
-            UnixNanos::from(2),
-            None,
-        );
-        exec_evt_tx
-            .send((ExecutionEvent::Account(account_state)).into())
-            .unwrap();
-
-        // Yield to let runner enter event loop before stop signal
-        tokio::task::yield_now().await;
-        signal_tx.send(()).unwrap();
-
-        let result = tokio::time::timeout(Duration::from_millis(200), runner_handle).await;
-        assert!(
-            result.is_ok(),
-            "Runner should process all event types and stop cleanly"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_runner_handle_stops_runner() {
-        let (_data_tx, data_evt_rx) =
-            tokio::sync::mpsc::unbounded_channel::<DispatchMessage<DataEvent>>();
-        let (_cmd_tx, data_cmd_rx) =
-            tokio::sync::mpsc::unbounded_channel::<DispatchMessage<DataCommand>>();
-        let (_time_tx, time_evt_rx) =
-            tokio::sync::mpsc::unbounded_channel::<DispatchMessage<TimeEventMessage>>();
-        let (_exec_evt_tx, exec_evt_rx) =
-            tokio::sync::mpsc::unbounded_channel::<DispatchMessage<ExecutionEvent>>();
-        let (_exec_cmd_tx, exec_cmd_rx) =
-            tokio::sync::mpsc::unbounded_channel::<DispatchMessage<TradingCommandMessage>>();
-        let (signal_tx, signal_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
-
-        let mut runner = create_test_runner(
-            time_evt_rx,
-            data_evt_rx,
-            data_cmd_rx,
-            exec_evt_rx,
-            exec_cmd_rx,
-            signal_rx,
-            signal_tx.clone(),
-        );
-
-        // Get handle before moving runner
-        let handle = runner.handle();
-
-        let runner_handle = tokio::spawn(async move {
-            runner.run().await.unwrap();
-        });
-
-        // Use handle to stop
-        handle.stop();
-
-        let result = tokio::time::timeout(Duration::from_millis(100), runner_handle).await;
-        assert!(result.is_ok(), "Runner should stop via handle");
-    }
-
-    #[tokio::test]
-    async fn test_runner_handle_is_cloneable() {
-        let (signal_tx, _signal_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
-        let handle = AsyncRunnerHandle { signal_tx };
-
-        let handle2 = handle.clone();
-
-        // Both handles should be able to send stop signals
-        assert!(handle.signal_tx.send(()).is_ok());
-        assert!(handle2.signal_tx.send(()).is_ok());
-    }
-
-    #[tokio::test]
-    async fn test_runner_processes_events_before_stop() {
-        let (data_evt_tx, data_evt_rx) =
-            tokio::sync::mpsc::unbounded_channel::<DispatchMessage<DataEvent>>();
-        let (_cmd_tx, data_cmd_rx) =
-            tokio::sync::mpsc::unbounded_channel::<DispatchMessage<DataCommand>>();
-        let (_time_tx, time_evt_rx) =
-            tokio::sync::mpsc::unbounded_channel::<DispatchMessage<TimeEventMessage>>();
-        let (_exec_evt_tx, exec_evt_rx) =
-            tokio::sync::mpsc::unbounded_channel::<DispatchMessage<ExecutionEvent>>();
-        let (_exec_cmd_tx, exec_cmd_rx) =
-            tokio::sync::mpsc::unbounded_channel::<DispatchMessage<TradingCommandMessage>>();
-        let (signal_tx, signal_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
-
-        let mut runner = create_test_runner(
-            time_evt_rx,
-            data_evt_rx,
-            data_cmd_rx,
-            exec_evt_rx,
-            exec_cmd_rx,
-            signal_rx,
-            signal_tx.clone(),
-        );
-
-        let handle = runner.handle();
-
-        // Send events before starting runner
-        for _ in 0..10 {
-            let quote = test_quote();
-            data_evt_tx
-                .send((DataEvent::Data(Data::Quote(quote))).into())
+            expected_commands.push((target, command));
+            let mut quote = test_quote();
+            quote.ts_init = UnixNanos::from(index);
+            let event = Data::Quote(quote);
+            runner
+                .data_evt_tx
+                .send(DataEvent::Data(event.clone()).into())
                 .unwrap();
+            expected_data.push(event);
         }
 
-        let runner_handle = tokio::spawn(async move {
-            runner.run().await.unwrap();
-        });
+        let driver = async {
+            for _ in 0..count * 2 {
+                observed_rx.recv().await.unwrap();
+            }
 
-        // Yield to let runner enter event loop before stop signal
-        tokio::task::yield_now().await;
-        handle.stop();
+            handle.stop();
+        };
 
-        let result = tokio::time::timeout(Duration::from_millis(200), runner_handle).await;
-        assert!(result.is_ok(), "Runner should process events and stop");
+        let (result, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(runner.run(), driver)
+        })
+        .await
+        .expect("runner dispatches every message and stops");
+
+        result.unwrap();
+
+        assert_eq!(&*commands.borrow(), &expected_commands);
+        assert_eq!(
+            serde_json::to_value(&*data.borrow()).unwrap(),
+            serde_json::to_value(expected_data).unwrap()
+        );
+        assert!(runner.channels.exec_cmd_rx.is_empty());
+        assert!(runner.channels.data_evt_rx.is_empty());
+        assert!(observed_rx.try_recv().is_err());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_runner_dispatches_every_concurrent_producer_in_order() {
+        let mut runner = AsyncRunner::new();
+        let handle = runner.handle();
+        let (observed_tx, mut observed_rx) = tokio::sync::mpsc::unbounded_channel();
+        msgbus::register_data_endpoint(
+            MessagingSwitchboard::data_engine_process_data(),
+            TypedIntoHandler::from(move |event| observed_tx.send(event).unwrap()),
+        );
+        let mut producers = Vec::new();
+
+        for producer in 0..5_u64 {
+            let sender = runner.data_evt_tx.clone();
+
+            producers.push(tokio::spawn(async move {
+                for index in 0..20 {
+                    let mut quote = test_quote();
+                    quote.ts_init = UnixNanos::from(producer * 20 + index);
+                    sender
+                        .send(DataEvent::Data(Data::Quote(quote)).into())
+                        .unwrap();
+                    tokio::task::yield_now().await;
+                }
+            }));
+        }
+
+        let driver = async {
+            for producer in producers {
+                producer.await.unwrap();
+            }
+
+            let mut observed = vec![Vec::new(); 5];
+
+            for _ in 0..100 {
+                let Data::Quote(quote) = observed_rx.recv().await.unwrap() else {
+                    panic!("expected a quote");
+                };
+
+                let timestamp = quote.ts_init.as_u64();
+                let mut expected = test_quote();
+                expected.ts_init = quote.ts_init;
+                assert_eq!(quote, expected);
+                observed[usize::try_from(timestamp / 20).unwrap()].push(timestamp % 20);
+            }
+
+            handle.stop();
+            observed
+        };
+
+        let (result, observed) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(runner.run(), driver)
+        })
+        .await
+        .expect("runner receives every producer's messages and stops");
+
+        result.unwrap();
+
+        assert_eq!(observed, vec![(0..20_u64).collect::<Vec<_>>(); 5]);
+        assert!(runner.channels.data_evt_rx.is_empty());
+        assert!(observed_rx.try_recv().is_err());
     }
 
     #[rstest]
@@ -2975,87 +2568,6 @@ mod tests {
         })
         .join()
         .unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_execution_event_order_submitted_batch_channel() {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ExecutionEvent>();
-
-        let events = vec![
-            OrderSubmittedSpec::builder()
-                .client_order_id(ClientOrderId::from("O-001"))
-                .build(),
-            OrderSubmittedSpec::builder()
-                .client_order_id(ClientOrderId::from("O-002"))
-                .build(),
-        ];
-
-        let batch = OrderSubmittedBatch::new(events);
-        tx.send(ExecutionEvent::OrderSubmittedBatch(batch)).unwrap();
-
-        let received = rx.recv().await.unwrap();
-        match received {
-            ExecutionEvent::OrderSubmittedBatch(b) => {
-                assert_eq!(b.len(), 2);
-                assert_eq!(b.events[0].client_order_id, ClientOrderId::from("O-001"));
-                assert_eq!(b.events[1].client_order_id, ClientOrderId::from("O-002"));
-            }
-            _ => panic!("Expected OrderSubmittedBatch event"),
-        }
-    }
-
-    #[tokio::test]
-    async fn test_execution_event_order_accepted_batch_channel() {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ExecutionEvent>();
-
-        let events = vec![
-            OrderAcceptedSpec::builder()
-                .client_order_id(ClientOrderId::from("O-001"))
-                .build(),
-            OrderAcceptedSpec::builder()
-                .client_order_id(ClientOrderId::from("O-002"))
-                .build(),
-        ];
-
-        let batch = OrderAcceptedBatch::new(events);
-        tx.send(ExecutionEvent::OrderAcceptedBatch(batch)).unwrap();
-
-        let received = rx.recv().await.unwrap();
-        match received {
-            ExecutionEvent::OrderAcceptedBatch(b) => {
-                assert_eq!(b.len(), 2);
-                assert_eq!(b.events[0].client_order_id, ClientOrderId::from("O-001"));
-                assert_eq!(b.events[1].client_order_id, ClientOrderId::from("O-002"));
-            }
-            _ => panic!("Expected OrderAcceptedBatch event"),
-        }
-    }
-
-    #[tokio::test]
-    async fn test_execution_event_order_canceled_batch_channel() {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ExecutionEvent>();
-
-        let events = vec![
-            OrderCanceledSpec::builder()
-                .client_order_id(ClientOrderId::from("O-001"))
-                .build(),
-            OrderCanceledSpec::builder()
-                .client_order_id(ClientOrderId::from("O-002"))
-                .build(),
-        ];
-
-        let batch = OrderCanceledBatch::new(events);
-        tx.send(ExecutionEvent::OrderCanceledBatch(batch)).unwrap();
-
-        let received = rx.recv().await.unwrap();
-        match received {
-            ExecutionEvent::OrderCanceledBatch(b) => {
-                assert_eq!(b.len(), 2);
-                assert_eq!(b.events[0].client_order_id, ClientOrderId::from("O-001"));
-                assert_eq!(b.events[1].client_order_id, ClientOrderId::from("O-002"));
-            }
-            _ => panic!("Expected OrderCanceledBatch event"),
-        }
     }
 
     #[cfg(feature = "defi")]

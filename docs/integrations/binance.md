@@ -318,7 +318,7 @@ matching engine. Thus, they do not blindly retry after a timeout, network failur
 response. Retrying could create a duplicate order or apply a second amendment.
 
 - Local submit validation emits `OrderDenied` before submission. Local modify validation emits
-  `OrderModifyRejected`. A definitive venue rejection emits the matching rejection event.
+  `OrderModifyDenied`. A definitive venue rejection emits the matching rejection event.
 - An ambiguous transport result remains inflight and is resolved by the private stream or REST
   reconciliation. The adapter does not emit a false rejection while the venue outcome is unknown.
 - A Futures algo cancel may fall back from the pre-trigger algo endpoint to the regular-order endpoint. This
@@ -330,8 +330,10 @@ response. Retrying could create a duplicate order or apply a second amendment.
 `retry_delay_initial_ms`, and `retry_delay_max_ms` for HTTP GET requests. Transient read failures
 retry with bounded exponential backoff and fresh authentication fields. A venue `Retry-After`
 header sets the minimum delay, which can exceed `retry_delay_max_ms`. The fixed total retry budget
-is 180 seconds. When a required delay exceeds the remaining budget, the request returns the venue
-error without waiting.
+is 180 seconds. When a retry's advertised delay exceeds the remaining budget, the request returns
+the venue error without waiting. Shared cooldown waits also count against the fixed 30-second read
+attempt timeout and the total budget. A read can time out before transmission instead of
+returning a venue error.
 
 These settings do not retry order commands because resending an ambiguous command could duplicate
 an order or amendment.
@@ -351,6 +353,19 @@ positions are removed, unresolved instruments and other conversion failures also
 position fails, `generate_position_status_reports` returns an error with the failure count instead
 of an incomplete report set. See
 [instrument availability](../concepts/execution/reconciliation.md#instrument-availability).
+
+#### Futures margin calculations
+
+USD-M and COIN-M Futures instruments use an initial margin factor of `1`. With the default
+`LeveragedMarginModel`, local initial margin equals notional divided by the cached account leverage.
+
+Margin accounts start at 1x leverage and require the full notional until their cached leverage changes.
+Setting `futures_leverages` requests venue leverage but does not update the cached account leverage.
+
+Local maintenance margin equals notional divided by cached account leverage, multiplied by the
+`margin_maint` factor of `0.1`. This calculation does not model Binance's bracket-specific maintenance ratios
+for [USD-M](https://developers.binance.com/docs/derivatives/usds-margined-futures/account/rest-api/Notional-and-Leverage-Brackets)
+or [COIN-M](https://developers.binance.com/docs/derivatives/coin-margined-futures/account/rest-api/Notional-Bracket-for-Pair).
 
 ### Risk events
 
@@ -418,7 +433,36 @@ formula does not account for contract size. Configure `default_taker_fee` on
 | Order status updates | ✓    | ✓            | ✓            | Real-time order state changes. |
 | Trade history        | ✓    | ✓            | ✓            | Execution and fill reports.    |
 
-#### Futures trade-history retention
+#### Startup recovery
+
+Mass status combines open orders with available closed-order history for orders created within the
+reconciliation lookback window. Orders created before that window can be missed even if they fill within it.
+Historical USD-M conditional orders retain their original client order IDs and order types when their parent
+orders appear in the queried history.
+
+For instruments without open orders or saved state, select them through `load_ids` with `load_all=False`,
+the provider's `symbols` filter, or `external_order_instrument_ids`. Broad `bases`, `quotes`, and
+`contract_types` filters do not initiate catalog-wide history scans.
+
+History requests run sequentially per instrument. Long lookbacks, many instruments, or heavy order activity
+can exceed the node's default 30-second `timeout_reconciliation`. Use a bounded `reconciliation_lookback_mins`
+and increase that timeout when needed. With no lookback, Spot scans all available order history; Futures
+applies the 88-day window described below.
+
+An order-history failure drops that instrument's historical orders and marks the snapshot incomplete.
+Open orders, positions, fills, and other instruments' historical orders remain available. A failed
+fill-history request fails mass status.
+
+Spot startup history updates order facts only, including when `reconciliation_lookback_mins` is unset.
+Position recovery requires saved owned orders and positions in the configured cache backing store.
+Wallet balances do not establish ownership of individual positions. Startup history does not create missing
+Spot positions or advance stale saved positions.
+
+#### Futures history retention
+
+Binance omits canceled or expired Futures orders with no fills once their creation time is more than three
+days old. It also omits orders created more than 90 days ago. Recovery depends on the history Binance retains;
+`reports_complete` does not detect orders removed by these venue limits.
 
 Binance retains USD-M and COIN-M account trades for the past three months. Binance does not define whether
 this means calendar months or a fixed duration. Thus, the adapter uses the most recent 88 days as its complete
@@ -706,11 +750,11 @@ web UI, or raw venue payloads.
 Order books can be maintained at full or partial depths. The diff-depth stream and its update
 rate differ by product and Spot transport:
 
-| Product / transport | Diff-depth stream    | Update rate      |
-| ------------------- | -------------------- | ---------------- |
-| Spot SBE            | `<symbol>@depth`     | 25ms             |
-| Spot JSON           | `<symbol>@depth`     | 1000ms (default) |
-| Futures             | `<symbol>@depth@0ms` | Unthrottled      |
+| Product / transport | Diff-depth stream                          | Update rate               |
+| ------------------- | ------------------------------------------ | ------------------------- |
+| Spot SBE            | `<symbol>@depth`                           | 20ms                      |
+| Spot JSON           | `<symbol>@depth` or `<symbol>@depth@100ms` | 100ms (default) or 1000ms |
+| Futures             | `<symbol>@depth@0ms`                       | 0ms (default)             |
 
 Book subscriptions emit snapshots, whether seeded from REST or received as partial-depth frames,
 with these flags:
@@ -751,10 +795,13 @@ depend on the [Spot market data mode](#spot-market-data-mode):
 | None (diff depth)                       | `<symbol>@depth`         | `<symbol>@depth`   |
 | Any other, including 50, 100, 500, 1000 | Rejected                 | Rejected           |
 
+JSON streams add `@100ms` to these stream names by default. Use `params={"update_speed": 1000}`
+to select 1000ms updates without the suffix (see [Spot market data mode](#spot-market-data-mode)).
+
 - Rejected depths fail before subscription. In JSON mode the error lists the valid depths.
 - Diff-depth subscriptions are seeded by a 5000-level REST snapshot.
-- Unsubscribe before changing an instrument's subscription depth. A new partial-depth subscription does not
-  remove the previous stream.
+- Unsubscribe before changing an instrument's subscription depth or update speed. Conflicting subscriptions
+  are rejected until you unsubscribe.
 
 ### L1 top-of-book subscriptions
 
@@ -821,12 +868,17 @@ resyncs, such as after a reconnect, waits for budget instead of exceeding it:
 
 | Product | Snapshot budget  | Burst (half the budget) | Full snapshot cost |
 | ------- | ---------------- | ----------------------- | ------------------ |
-| Spot    | 3,000 per minute | 1,500                   | 250 (5000 levels)  |
+| Spot    | 1,200 per minute | 600                     | 250 (5000 levels)  |
 | Futures | 1,200 per minute | 600                     | 20 (1000 levels)   |
 
-- Queueing for the first snapshot does not consume the recovery's attempts or 180-second budget.
+- Waiting for the first snapshot-pacer reservation does not consume recovery attempts or the 180-second budget.
+  After that reservation, REST quota and cooldown waits count against the snapshot timeout.
 - Explicit snapshot requests draw on the same budget.
-- The HTTP client's retries of a failed snapshot request are not paced.
+- Each HTTP attempt, including retries, spends snapshot weight immediately before transmission.
+  Queued reservations do not accumulate send credit during a cooldown. An unsent attempt releases its
+  reservation on cancellation, timeout, or failure.
+- HTTP retries wait for weight inside the read attempt timeout and, during book recovery, the snapshot
+  timeout. A retry can time out while waiting for weight.
 
 ### Live recovery validation
 
@@ -901,8 +953,8 @@ Spot.
 
 Historical trade requests without bounds use the recent-trades endpoint. A request with time bounds uses
 aggregate trades and accepts at most 1000 records, so the source follows the request rather than a config
-option. Spot passes the supplied bounds to `/api/v3/aggTrades`. Futures accepts either bound within the last
-24 hours. When both are supplied, the range must be shorter than one hour.
+option. Spot passes the supplied bounds to `/api/v3/aggTrades`. Futures requires each supplied bound to be
+within the last 48 hours. When both are supplied, the range must be shorter than one hour.
 
 Historical core bar requests accept externally aggregated time bars and use the corresponding venue kline
 endpoint. Internally aggregated bars are built by the `DataEngine` from raw trade, quote, or source-bar
@@ -1217,22 +1269,24 @@ Binance's own per-IP weight allowance, which the endpoint costs below draw from:
 
 Binance charges these weights per request:
 
-| Endpoint                  | Weight | Notes                                  |
-| ------------------------- | ------ | -------------------------------------- |
-| `/api/v3/order`           | 1      | Spot order placement.                  |
-| `/api/v3/allOrders`       | 20     | Spot historical orders (expensive).    |
-| `/api/v3/klines`          | 2+     | Scales with `limit` parameter.         |
-| `/api/v3/depth`           | 5+     | Scales with `limit`; 250 at 5000.      |
-| `/fapi/v1/order`          | 1      | Futures order placement.               |
-| `/fapi/v1/algoOrder`      | 0      | Uses order-count limits.               |
-| `/fapi/v1/allOrders`      | 20     | Futures historical orders (expensive). |
-| `/fapi/v1/commissionRate` | 20     | Futures commission rate query.         |
-| `/fapi/v1/klines`         | 5+     | Scales with `limit` parameter.         |
-| `/fapi/v1/depth`          | 2+     | Scales with `limit`; 20 at 1000.       |
+| Endpoint                  | Weight         | Notes                                 |
+| ------------------------- | -------------- | ------------------------------------- |
+| `/api/v3/order`           | 1              | Spot order placement.                 |
+| `/api/v3/allOrders`       | 20             | Spot historical orders (expensive).   |
+| `/api/v3/klines`          | 2              | Fixed cost for supported limits.      |
+| `/api/v3/depth`           | 5, 25, 50, 250 | Scales with `limit`; 250 at 5000.     |
+| `/fapi/v1/order`          | 0              | Futures order placement.              |
+| `/fapi/v1/algoOrder`      | 0              | Uses order-count limits.              |
+| `/fapi/v1/allOrders`      | 5              | Futures historical orders.            |
+| `/fapi/v1/commissionRate` | 20             | Futures commission rate query.        |
+| `/fapi/v1/klines`         | 1, 2, 5, 10    | Scales with `limit`; default costs 5. |
+| `/fapi/v1/depth`          | 2, 5, 10, 20   | Scales with `limit`; 20 at 1000.      |
 
-USD-M Futures `POST /fapi/v1/algoOrder` consumes `1` from both `X-MBX-ORDER-COUNT-10S` and
-`X-MBX-ORDER-COUNT-1M`. Binance charges no IP request weight for this endpoint. The adapter still queues it
-through the global bucket as part of its local pacing model.
+USD-M Futures `POST /fapi/v1/order`, `POST /fapi/v1/algoOrder`, and `PUT /fapi/v1/order`
+consume 1 from both `X-MBX-ORDER-COUNT-10S` and `X-MBX-ORDER-COUNT-1M`, without IP request weight.
+COIN-M `POST /dapi/v1/order` and `POST /dapi/v1/algoOrder` also consume no IP request weight.
+These requests can proceed when the local request-weight bucket is empty, subject to order-count
+quota and shared REST cooldowns.
 
 ### WebSocket API limits
 
@@ -1247,26 +1301,62 @@ REST API:
 
 ### Adapter pacing
 
-The adapter runs its own token bucket limiters ahead of the venue's accounting. Every HTTP request
-draws one token from a per-product request bucket, and every order operation draws an additional
-token from the order-count buckets:
+The adapter runs token bucket limiters ahead of the venue's fixed-window accounting. Each supported
+HTTP endpoint consumes its published request weight before transmission. Retries and history pages
+acquire their full weight for every attempt. Placements and applicable modifications draw from
+the order-count buckets:
 
-| Product                    | Requests     | Order operations             |
-| -------------------------- | ------------ | ---------------------------- |
-| Spot                       | 1,200/minute | 10/second, 100,000/day       |
-| Futures (USD-M and COIN-M) | 2,400/minute | 300/10 seconds, 1,200/minute |
+| Product                    | Request weight | Order operations             |
+| -------------------------- | -------------- | ---------------------------- |
+| Spot                       | 1,200/minute   | 10/second, 100,000/day       |
+| Futures (USD-M and COIN-M) | 2,400/minute   | 300/10 seconds, 1,200/minute |
 
-The order-count buckets cover every order operation the product supports, not just placement:
-submit, OCO submit, batch submit, algo submit, modify (Spot modifies through cancel-replace), batch
-modify, cancel, cancel-all, batch cancel, and algo cancel. Cancel-heavy and modify-heavy strategies
-are throttled by these buckets as well. Non-order authenticated requests, such as leverage and
-margin-type changes and listen-key keepalives, draw from the request bucket alone.
+The order-count buckets cover submit, OCO submit, batch submit, algo submit, Spot cancel-replace, and
+USD-M modify and batch modify. Cancellations and COIN-M modifications use the request bucket alone.
+Non-order authenticated requests, such as leverage and margin-type changes and listen-key keepalives,
+also use the request bucket alone. Mutations are rejected as `NotSent` when an applicable bucket is empty.
+Futures data and execution clients share the request bucket for matching configurations.
 
-The request bucket counts calls rather than weight, so it does not mirror the venue's weight accounting. A run
-of high-weight or dynamic-weight endpoints (`/api/v3/allOrders` at weight 20, or `/klines` scaling with
-`limit`) spends venue weight faster than the local bucket accounts for. Large history requests may need manual
-pacing. Monitor the `X-MBX-USED-WEIGHT-*` response headers to track actual venue usage. Order book snapshot
-requests also wait on a weight-aware budget. See [Snapshot pacing](#snapshot-pacing).
+The `/fapi/v1/fundingRate` and `/fapi/v1/fundingInfo` endpoints share a USD-M bucket of 500 requests
+per 5 minutes. `/futures/data/openInterestHist` has its own USD-M bucket of 1,000 requests per 5 minutes.
+These endpoints consume no global IP request weight.
+
+Local buckets refill continuously and do not track the venue's exact fixed-window counters or
+traffic from other processes. Monitor `X-MBX-USED-WEIGHT-*` headers and coordinate shared IP usage
+externally; large history requests may still need manual pacing. Order book snapshot requests also
+wait on a separate weight-aware budget. See [Snapshot pacing](#snapshot-pacing).
+
+### Shared REST backoff
+
+HTTP 429 and 418 responses with a usable `Retry-After` header extend a shared REST cooldown for the
+failed quota. Reads, including book recovery snapshots, wait before signing and sending. REST mutations
+fail locally as `RateLimitBlocked` before transmission when an applicable cooldown or local quota blocks them.
+Later responses cannot shorten the cooldown. Requests already in flight can still complete.
+
+- IP cooldowns apply across clients in the same process with the same environment, endpoint scope, and
+  configured proxy. Spot and Futures remain separate; USD-M and COIN-M share one Futures scope.
+- An order-count 429 identified by error `-1015`, with a usable `Retry-After` header, blocks placements
+  and modifications that use order-count quota with the same API key, product family, environment, and
+  endpoint scope, including through different proxies. Market-data and cancellation requests continue,
+  subject to IP cooldowns and the request bucket.
+
+Separate processes, different custom URLs, and different proxy settings need external coordination
+when they reach the same IP quota. Multiple API keys for one account also need external coordination.
+WebSocket requests do not use this REST cooldown.
+
+Submit, modify, and cancel commands blocked by a shared cooldown or local quota are classified as `NotSent`.
+The execution client emits the corresponding rejection event for single orders and tracked batch children.
+Cancel-all failures are logged without per-order rejection events. Check order status after a failed
+cancel-all. Blocked commands are not queued for later transmission or retried automatically.
+Preparatory order-identity reads also fail fast and do not retry.
+Strategy code decides whether to issue a new command when quota is available.
+
+A 418 without a parseable `Retry-After`, or a delay beyond the supported clock range on either status,
+blocks the affected scope until process restart and logs an error. All requests in the affected scope,
+including reads, fail locally before transmission. Verify that the venue no longer blocks those requests
+before restarting.
+A 429 with a missing or unparsable header keeps the normal read retry backoff; the adapter does not
+infer a shared expiry.
 
 :::warning
 Binance returns HTTP 429 when you exceed the allowed weight. Repeated
@@ -1372,6 +1462,25 @@ credentials.
 Full Spot `BookDeltas` subscriptions use the `<symbol>@depth` diff-depth stream on the selected
 transport, with REST snapshot synchronization. Explicit depth subscriptions use partial-book snapshots
 (see [Order books](#order-books)).
+
+For Spot JSON partial and diff depth streams, the `update_speed` subscription parameter accepts
+`100` (default) or `1000` milliseconds. SBE and Futures ignore this parameter.
+
+With the data client configured for JSON market data, subscribe to top-20 snapshots at 100ms:
+
+```python
+from nautilus_trader.model import BookType
+
+self.subscribe_book_deltas(
+    instrument_id,
+    book_type=BookType.L2_MBP,
+    depth=20,
+    params={"update_speed": 100},
+)
+```
+
+Unsubscribe before changing the depth or update speed for an instrument. Unsubscribe uses the
+active stream, so it does not require the original params.
 
 :::note
 Exposed to Python as `BinanceSpotMarketDataMode` on

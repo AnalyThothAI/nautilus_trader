@@ -121,15 +121,15 @@ use crate::{
         consts::{
             OKX_FIELD_SCODE, OKX_FIELD_SMSG, OKX_HTTP_URL, OKX_NAUTILUS_BROKER_ID,
             OKX_POST_ONLY_CANCEL_REASON, OKX_POST_ONLY_CANCEL_SOURCE, OKX_SUPPORTED_ORDER_TYPES,
-            OKX_SUPPORTED_TIME_IN_FORCE, okx_algo_target_currency, okx_reduce_only_wire_value,
-            spot_trade_quote_ccy_wire_value, validate_algo_trigger_type,
+            OKX_SUPPORTED_TIME_IN_FORCE, okx_algo_target_currency, okx_market_target_currency,
+            okx_reduce_only_wire_value, spot_trade_quote_ccy_wire_value,
+            validate_algo_trigger_type,
         },
         credential::Credential,
         enums::{
             OKXAlgoOrderStatus, OKXAlgoOrderType, OKXEnvironment, OKXInstrumentStatus,
             OKXInstrumentType, OKXMarginMode, OKXOrderStatus, OKXOrderType, OKXPositionMode,
-            OKXPositionSide, OKXSide, OKXTargetCurrency, OKXTradeMode, OKXTriggerType,
-            conditional_order_to_algo_type,
+            OKXPositionSide, OKXSide, OKXTradeMode, OKXTriggerType, conditional_order_to_algo_type,
         },
         models::OKXInstrument,
         parse::{
@@ -167,6 +167,10 @@ impl OKXInstrumentDefinitionError {
         }
     }
 }
+
+#[derive(Debug, Error)]
+#[error("Failed to parse active order report: {0}")]
+pub(crate) struct OKXActiveOrderReportError(#[source] anyhow::Error);
 
 #[derive(Debug, Error)]
 #[error("Failed to fetch pending algo order reports: {source}")]
@@ -301,10 +305,12 @@ fn retry_after(headers: &HashMap<String, String>, now: Timestamp) -> Option<Dura
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::{collections::HashMap, time::Duration};
 
     use anyhow::Context;
+    use nautilus_core::UnixNanos;
     use nautilus_model::{
+        data::BarType,
         identifiers::{InstrumentId, Symbol},
         instruments::{
             CryptoFuture, CryptoFuturesSpread, InstrumentAny,
@@ -317,11 +323,26 @@ mod tests {
     use serde::{Serialize, Serializer, ser::Error as _};
 
     use super::{
-        Method, OKX_GLOBAL_RATE_KEY, OKXEnvironment, OKXHttpClient, OKXHttpError,
-        OKXInstrumentDefinitionError, OKXRawHttpClient, Timestamp, deserialize_okx_response,
-        parse_retry_after, resolve_okx_error_code, resolve_okx_error_message,
+        Method, OKX_GLOBAL_RATE_KEY, OKXEnvironment, OKXHistoryCoverage, OKXHttpClient,
+        OKXHttpError, OKXInstrumentDefinitionError, OKXRawHttpClient, Timestamp,
+        deserialize_okx_response, parse_retry_after, reconciliation_history_page_limit,
+        resolve_okx_error_code, resolve_okx_error_message,
     };
     use crate::http::models::OKXFeeRate;
+
+    #[rstest]
+    #[case::default(None, 50)]
+    #[case::disabled(Some(0), 0)]
+    #[case::below_cap(Some(49), 49)]
+    #[case::at_cap(Some(50), 50)]
+    #[case::above_cap(Some(51), 50)]
+    #[case::maximum(Some(u32::MAX), 50)]
+    fn test_reconciliation_history_page_limit(
+        #[case] max_pages: Option<u32>,
+        #[case] expected: usize,
+    ) {
+        assert_eq!(reconciliation_history_page_limit(max_pages), expected);
+    }
 
     #[rstest]
     fn test_is_spread_prefers_cached_future(mut crypto_future_btcusdt: CryptoFuture) {
@@ -578,6 +599,172 @@ mod tests {
             super::OKXHttpClient::option_summary_exp_time("BTC-USD-241217-92000-C").unwrap();
         assert_eq!(result, Some("241217".to_string()));
     }
+
+    fn spot_instruments() -> Vec<InstrumentAny> {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("test_data")
+            .join("http_get_instruments_spot.json");
+        let response: super::OKXResponse<crate::common::models::OKXInstrument> =
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        response
+            .data
+            .iter()
+            .filter_map(|raw| {
+                crate::common::parse::parse_instrument_any(raw, None, None, UnixNanos::default())
+                    .ok()
+                    .flatten()
+            })
+            .collect()
+    }
+
+    #[rstest]
+    #[case::no_limit(None, OKXHistoryCoverage::Truncated)]
+    #[case::limit_met_on_the_last_page(Some(300), OKXHistoryCoverage::Unverified)]
+    #[tokio::test]
+    async fn test_request_trades_paged_at_the_page_cap(
+        #[case] limit: Option<u32>,
+        #[case] expected: OKXHistoryCoverage,
+    ) {
+        // One trade a millisecond: three pages reach 300 ms back, the start is a day back
+        let now_ms = Timestamp::now().as_millisecond();
+        let router = axum::Router::new().route(
+            "/api/v5/market/history-trades",
+            axum::routing::get(
+                move |axum::extract::Query(params): axum::extract::Query<
+                    HashMap<String, String>,
+                >| async move {
+                    let below = params
+                        .get("after")
+                        .and_then(|s| s.parse::<i64>().ok())
+                        .unwrap_or(1_000_001);
+                    let data: Vec<serde_json::Value> = (1..=100)
+                        .map(|i| below - i)
+                        .map(|id| {
+                            serde_json::json!({
+                                "instId": "BTC-USD",
+                                "side": "buy",
+                                "sz": "0.01",
+                                "px": "100000.0",
+                                "tradeId": id.to_string(),
+                                "ts": (now_ms - (1_000_001 - id)).to_string(),
+                            })
+                        })
+                        .collect();
+                    axum::Json(serde_json::json!({"code": "0", "msg": "", "data": data}))
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = OKXHttpClient::new(
+            Some(format!("http://{addr}")),
+            60,
+            3,
+            1000,
+            10_000,
+            OKXEnvironment::Live,
+            None,
+        )
+        .unwrap();
+
+        for instrument in spot_instruments() {
+            client.cache_instrument(instrument);
+        }
+
+        let (trades, coverage) = client
+            .request_trades_paged(
+                InstrumentId::from("BTC-USD.OKX"),
+                Some(Timestamp::now() - jiff::SignedDuration::from_hours(24)),
+                None,
+                limit,
+                3,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(coverage, expected);
+        assert_eq!(trades.len(), 300);
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_request_bars_paged_is_truncated_at_the_page_cap() {
+        // A day of minute candles, a window ten days long: two history pages of 100 cannot reach the start
+        let first: Timestamp = "2026-09-01T00:00:00Z".parse().unwrap();
+        let candles: Vec<serde_json::Value> = (0..1_440i64)
+            .rev()
+            .map(|index| {
+                let ts = first.as_millisecond() + index * 60_000;
+                serde_json::json!([
+                    ts.to_string(),
+                    "33528.6",
+                    "33870.0",
+                    "33500.1",
+                    "33783.9",
+                    "778.838",
+                    "26291398.9",
+                    "26291398.9",
+                    "1"
+                ])
+            })
+            .collect();
+        let route = axum::routing::get(
+            move |axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>| {
+                let candles = candles.clone();
+                async move {
+                    let after = params.get("after").map(|v| v.parse::<i64>().unwrap());
+                    let before = params.get("before").map(|v| v.parse::<i64>().unwrap());
+                    let limit = params
+                        .get("limit")
+                        .map_or(100, |v| v.parse::<usize>().unwrap());
+                    let data: Vec<serde_json::Value> = candles
+                        .into_iter()
+                        .filter(|c| {
+                            let ts = c[0].as_str().unwrap().parse::<i64>().unwrap();
+                            after.is_none_or(|a| ts < a) && before.is_none_or(|b| ts > b)
+                        })
+                        .take(limit)
+                        .collect();
+                    axum::Json(serde_json::json!({"code": "0", "msg": "", "data": data}))
+                }
+            },
+        );
+        let router = axum::Router::new()
+            .route("/api/v5/market/candles", route.clone())
+            .route("/api/v5/market/history-candles", route);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = OKXHttpClient::new(
+            Some(format!("http://{addr}")),
+            60,
+            3,
+            1000,
+            10_000,
+            OKXEnvironment::Live,
+            None,
+        )
+        .unwrap();
+
+        for instrument in spot_instruments() {
+            client.cache_instrument(instrument);
+        }
+
+        let (bars, coverage) = client
+            .request_bars_paged(
+                BarType::from("BTC-USD.OKX-1-MINUTE-LAST-EXTERNAL"),
+                Some(first - jiff::SignedDuration::from_hours(216)),
+                Some(first + jiff::SignedDuration::from_hours(24)),
+                None,
+                2,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(coverage, OKXHistoryCoverage::Truncated);
+        assert_eq!(bars.len(), 200);
+    }
 }
 
 /// Default OKX REST API rate limit: 500 requests per 2 seconds.
@@ -659,7 +846,7 @@ struct PageSweep<T> {
 impl<T> PageSweep<T> {
     fn from_pages(items: Vec<T>, exhausted: bool) -> Self {
         Self {
-            complete: !exhausted || items.is_empty(),
+            complete: !exhausted,
             items,
         }
     }
@@ -2255,6 +2442,21 @@ impl OKXRawHttpClient {
     }
 }
 
+/// Whether a paginated history request covered its whole window.
+///
+/// The data client reports a [`Complete`](Self::Complete) request as a completed response
+/// envelope, which lets the data engine write the window back to a catalog.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OKXHistoryCoverage {
+    /// The pagination reached the start of the requested window.
+    Complete,
+    /// The page cap stopped the pagination before the start of the window.
+    Truncated,
+    /// The window cannot be confirmed: no start was given, a limit ended the request,
+    /// or OKX returned nothing older before the start.
+    Unverified,
+}
+
 /// Provides a higher-level HTTP client for the [OKX](https://okx.com) REST API.
 ///
 /// This client wraps the underlying `OKXHttpInnerClient` to handle conversions
@@ -3398,18 +3600,42 @@ impl OKXHttpClient {
         end: Option<Timestamp>,
         limit: Option<u32>,
     ) -> anyhow::Result<Vec<FundingRateUpdate>> {
+        self.request_funding_rates_with_coverage(instrument_id, start, end, limit)
+            .await
+            .map(|(rates, _)| rates)
+    }
+
+    /// Requests funding rates like [`Self::request_funding_rates`] and reports whether the
+    /// single page covered the window down to `start`: the page is not full and its oldest
+    /// record is within one funding interval of `start`. A full page that ends after `start`
+    /// is truncated.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HTTP request fails or parsing fails.
+    pub async fn request_funding_rates_with_coverage(
+        &self,
+        instrument_id: InstrumentId,
+        start: Option<Timestamp>,
+        end: Option<Timestamp>,
+        limit: Option<u32>,
+    ) -> anyhow::Result<(Vec<FundingRateUpdate>, OKXHistoryCoverage)> {
+        // OKX returns at most 400 records a page, which is also its default when no limit is set
+        const OKX_FUNDING_PAGE_SIZE: usize = 400;
+
         let mut params = GetFundingRateHistoryParams {
             inst_id: instrument_id.symbol.to_string(),
             ..Default::default()
         };
 
-        // OKX uses "before" for newer-than and "after" for older-than
+        // OKX uses "before" for newer-than and "after" for older-than, both exclusive, so widen
+        // each bound by 1 ms to keep records that fall exactly on the window bounds
         if let Some(start) = start {
-            params.before = Some(start.as_millisecond().to_string());
+            params.before = Some(start.as_millisecond().saturating_sub(1).max(0).to_string());
         }
 
         if let Some(end) = end {
-            params.after = Some(end.as_millisecond().to_string());
+            params.after = Some(end.as_millisecond().saturating_add(1).to_string());
         }
 
         params.limit = limit;
@@ -3448,10 +3674,39 @@ impl OKXHttpClient {
             instrument_id,
         );
 
-        Ok(rates)
+        let coverage = match (start, rates.first()) {
+            (Some(start), Some(oldest)) if limit.is_none() => {
+                let start_ns = start.as_nanosecond();
+                let oldest_ns = i128::from(oldest.ts_event.as_u64());
+
+                if resp.len() >= OKX_FUNDING_PAGE_SIZE && oldest_ns > start_ns {
+                    OKXHistoryCoverage::Truncated
+                } else if let Some(interval_mins) = rates.get(1).and_then(|rate| rate.interval)
+                    && oldest_ns < start_ns + i128::from(interval_mins) * 60_000_000_000
+                {
+                    OKXHistoryCoverage::Complete
+                } else {
+                    OKXHistoryCoverage::Unverified
+                }
+            }
+            _ => OKXHistoryCoverage::Unverified,
+        };
+
+        // A start with sub-millisecond precision lets the settlement just before it through the
+        // widened lower bound. That record shows the page reached the start, so it is dropped
+        // only after the coverage check above
+        if let Some(start) = start {
+            let start_ns = start.as_nanosecond();
+            rates.retain(|rate| i128::from(rate.ts_event.as_u64()) >= start_ns);
+        }
+
+        Ok((rates, coverage))
     }
 
     /// Requests trades for the `instrument_id` and `start` -> `end` time range.
+    ///
+    /// Each trade uses its own time as `ts_init`, since the data engine trims responses to the
+    /// requested window on `ts_init`.
     ///
     /// # Errors
     ///
@@ -3463,8 +3718,39 @@ impl OKXHttpClient {
         end: Option<Timestamp>,
         limit: Option<u32>,
     ) -> anyhow::Result<Vec<TradeTick>> {
-        const OKX_TRADES_MAX_LIMIT: u32 = 100;
+        self.request_trades_with_coverage(instrument_id, start, end, limit)
+            .await
+            .map(|(trades, _)| trades)
+    }
+
+    /// Requests trades like [`Self::request_trades`] and reports whether the backward
+    /// pagination covered the window down to `start`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HTTP request fails or trade parsing fails.
+    pub async fn request_trades_with_coverage(
+        &self,
+        instrument_id: InstrumentId,
+        start: Option<Timestamp>,
+        end: Option<Timestamp>,
+        limit: Option<u32>,
+    ) -> anyhow::Result<(Vec<TradeTick>, OKXHistoryCoverage)> {
         const MAX_PAGES: usize = 500;
+
+        self.request_trades_paged(instrument_id, start, end, limit, MAX_PAGES)
+            .await
+    }
+
+    async fn request_trades_paged(
+        &self,
+        instrument_id: InstrumentId,
+        start: Option<Timestamp>,
+        end: Option<Timestamp>,
+        limit: Option<u32>,
+        max_pages: usize,
+    ) -> anyhow::Result<(Vec<TradeTick>, OKXHistoryCoverage)> {
+        const OKX_TRADES_MAX_LIMIT: u32 = 100;
         const MAX_CONSECUTIVE_EMPTY: usize = 3;
 
         #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3485,7 +3771,7 @@ impl OKXHttpClient {
         if let Some(s) = start
             && s > now
         {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), OKXHistoryCoverage::Unverified));
         }
 
         let end = if let Some(e) = end
@@ -3506,7 +3792,6 @@ impl OKXHttpClient {
         let start_ms = start.map(jiff::Timestamp::as_millisecond);
         let end_ms = end.map(jiff::Timestamp::as_millisecond);
 
-        let ts_init = self.generate_ts_init();
         let inst = self.instrument_from_cache_by_id(instrument_id)?;
 
         // Historical pagination walks backwards using trade IDs, OKX does not honor timestamps for
@@ -3518,6 +3803,8 @@ impl OKXHttpClient {
             let mut seen_trades: AHashSet<(String, i64)> = AHashSet::new();
             let mut unique_count = 0usize;
             let mut consecutive_empty_pages = 0usize;
+            let mut coverage = OKXHistoryCoverage::Unverified;
+            let mut parse_failures = 0usize;
 
             // Only apply default limit when there's no start boundary
             // (start provides a natural stopping point, end alone allows infinite backward pagination)
@@ -3532,13 +3819,15 @@ impl OKXHttpClient {
             );
 
             loop {
-                if pages >= MAX_PAGES {
-                    log::warn!("Hit MAX_PAGES limit of {MAX_PAGES}");
+                // A limit met on the last allowed page is a complete answer, not a cut one
+                if effective_limit < u32::MAX && unique_count >= effective_limit as usize {
+                    log::debug!("Reached effective limit: unique_count={unique_count}");
                     break;
                 }
 
-                if effective_limit < u32::MAX && unique_count >= effective_limit as usize {
-                    log::debug!("Reached effective limit: unique_count={unique_count}");
+                if pages >= max_pages {
+                    log::warn!("Hit page limit of {max_pages}");
+                    coverage = OKXHistoryCoverage::Truncated;
                     break;
                 }
 
@@ -3594,12 +3883,14 @@ impl OKXHttpClient {
                 let mut duplicates = 0usize;
 
                 for r in &raw {
+                    // Historical trades use their own time as ts_init: the data engine trims
+                    // responses to the requested window on ts_init
                     match parse_trade_tick(
                         r,
                         instrument_id,
                         inst.price_precision(),
                         inst.size_precision(),
-                        ts_init,
+                        parse_millisecond_timestamp(r.ts),
                     ) {
                         Ok(trade) => {
                             let ts_ms = trade.ts_event.as_i64() / 1_000_000;
@@ -3627,7 +3918,10 @@ impl OKXHttpClient {
                                 duplicates += 1;
                             }
                         }
-                        Err(e) => log::error!("{e}"),
+                        Err(e) => {
+                            parse_failures += 1;
+                            log::error!("{e}");
+                        }
                     }
                 }
 
@@ -3639,6 +3933,10 @@ impl OKXHttpClient {
                     duplicates,
                     hit_start_boundary
                 );
+
+                if hit_start_boundary {
+                    coverage = OKXHistoryCoverage::Complete;
+                }
 
                 // Extract oldest unique trade ID for next page cursor
                 let oldest_trade_id = if page_trades.is_empty() {
@@ -3730,8 +4028,13 @@ impl OKXHttpClient {
                 out.drain(0..excess);
             }
 
-            log::debug!("Returning {} trades", out.len());
-            return Ok(out);
+            // A trade dropped on a parse error leaves a gap the window cannot vouch for
+            if parse_failures > 0 && coverage == OKXHistoryCoverage::Complete {
+                coverage = OKXHistoryCoverage::Unverified;
+            }
+
+            log::debug!("Returning {} trades, coverage={coverage:?}", out.len());
+            return Ok((out, coverage));
         }
 
         let req_limit = limit
@@ -3757,7 +4060,7 @@ impl OKXHttpClient {
                 instrument_id,
                 inst.price_precision(),
                 inst.size_precision(),
-                ts_init,
+                parse_millisecond_timestamp(r.ts),
             ) {
                 Ok(trade) => trades.push(trade),
                 Err(e) => log::error!("{e}"),
@@ -3774,7 +4077,7 @@ impl OKXHttpClient {
             trades.drain(0..trades.len() - lim as usize);
         }
 
-        Ok(trades)
+        Ok((trades, OKXHistoryCoverage::Unverified))
     }
 
     /// Requests historical bars for the given bar type and time range.
@@ -3783,7 +4086,8 @@ impl OKXHttpClient {
     /// Returns bars sorted oldest to newest.
     /// Each bar uses the candle open time as `ts_event` and its close time as `ts_init`.
     /// Requests without an end may include an unconfirmed candle with a future `ts_init`.
-    /// With bounds, candle open times are at or after `start` and close times are at or before `end`.
+    /// With bounds, candle close times (`ts_init`) are within `[start, end]`, the window the data
+    /// engine trims responses to, so the first candle may open before `start`.
     ///
     /// # Errors
     ///
@@ -3812,8 +4116,9 @@ impl OKXHttpClient {
     ///
     /// # Pagination
     ///
-    /// - Range requests use exclusive `after` and `before` cursors, adjusting `before` to include
-    ///   the floored start boundary
+    /// - Range requests use exclusive `after` and `before` cursors, setting `before` one bar before
+    ///   the floored start (two for months) so the first candle that closes at or after the start
+    ///   is included
     /// - Pages backwards from end time (or now) to start time
     /// - Stops when: limit reached, time window covered, or API returns empty
     /// - Rate limit safety: ≥ 50ms between requests
@@ -3826,11 +4131,45 @@ impl OKXHttpClient {
         &self,
         bar_type: BarType,
         start: Option<Timestamp>,
-        mut end: Option<Timestamp>,
+        end: Option<Timestamp>,
         limit: Option<u32>,
     ) -> anyhow::Result<Vec<Bar>> {
-        const HISTORY_SPLIT_DAYS: i64 = 100;
+        self.request_bars_with_coverage(bar_type, start, end, limit)
+            .await
+            .map(|(bars, _)| bars)
+    }
+
+    /// Requests bars like [`Self::request_bars`] and reports whether the pagination
+    /// covered the window down to `start`: the oldest bar returned closes in the first
+    /// bar slot at or after `start`. A window is never reported as covered when a limit ended
+    /// the request, when it holds a candle OKX has not confirmed, or for months, since month
+    /// lengths vary.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails.
+    pub async fn request_bars_with_coverage(
+        &self,
+        bar_type: BarType,
+        start: Option<Timestamp>,
+        end: Option<Timestamp>,
+        limit: Option<u32>,
+    ) -> anyhow::Result<(Vec<Bar>, OKXHistoryCoverage)> {
         const MAX_PAGES_SOFT: usize = 500;
+
+        self.request_bars_paged(bar_type, start, end, limit, MAX_PAGES_SOFT)
+            .await
+    }
+
+    async fn request_bars_paged(
+        &self,
+        bar_type: BarType,
+        start: Option<Timestamp>,
+        mut end: Option<Timestamp>,
+        limit: Option<u32>,
+        max_pages: usize,
+    ) -> anyhow::Result<(Vec<Bar>, OKXHistoryCoverage)> {
+        const HISTORY_SPLIT_DAYS: i64 = 100;
 
         #[derive(Clone, Copy, Debug, PartialEq, Eq)]
         enum Mode {
@@ -3855,7 +4194,7 @@ impl OKXHttpClient {
         if let Some(s) = start
             && s > now
         {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), OKXHistoryCoverage::Unverified));
         }
 
         if let Some(e) = end
@@ -3897,12 +4236,25 @@ impl OKXHttpClient {
         let start_ns = start.and_then(|s| i64::try_from(s.as_nanosecond()).ok());
         let end_ns = end.and_then(|e| i64::try_from(e.as_nanosecond()).ok());
 
-        // Floor start to bar boundaries for cleaner API requests
+        // Floor start to bar boundaries for cleaner API requests, then step back one bar: OKX
+        // filters candles by open time, while the window is defined on the close (`ts_init`),
+        // so the bar that closes at or just after the start opens before it. The month slot is
+        // an approximate 30 days, so months step back two slots to cover 31-day months
+        let is_month = spec.aggregation == BarAggregation::Month;
+        let lookback_ms = if is_month { 2 * slot_ms } else { slot_ms };
+        // The shortest bar length: the earliest bar in the window closes within it of the start
+        let min_slot_ns = if is_month {
+            (step as i64) * 28 * 86_400_000 * 1_000_000
+        } else {
+            slot_ns
+        };
         let start_ms = start.map(|s| {
             let ms = s.as_millisecond();
 
             if slot_ms > 0 {
-                (ms / slot_ms) * slot_ms // Floor to nearest bar boundary
+                ((ms / slot_ms) * slot_ms)
+                    .saturating_sub(lookback_ms)
+                    .max(0)
             } else {
                 ms
             }
@@ -3953,6 +4305,9 @@ impl OKXHttpClient {
 
         let mut have_latest_first_page = false;
         let mut progressless_loops = 0u8;
+        let mut truncated = false;
+        // Open times of candles OKX has not confirmed yet; they rule out a covered window
+        let mut unconfirmed: Vec<UnixNanos> = Vec::new();
 
         loop {
             if let Some(lim) = limit
@@ -3962,7 +4317,9 @@ impl OKXHttpClient {
                 break;
             }
 
-            if pages >= MAX_PAGES_SOFT {
+            if pages >= max_pages {
+                log::warn!("Hit page limit of {max_pages}");
+                truncated = true;
                 break;
             }
 
@@ -4095,12 +4452,17 @@ impl OKXHttpClient {
             // Parse, oldest → newest
             let mut page: Vec<Bar> = Vec::with_capacity(raw.len());
             for r in &raw {
-                page.push(parse_historical_candlestick(
+                let bar = parse_historical_candlestick(
                     r,
                     bar_type,
                     inst.price_precision(),
                     inst.size_precision(),
-                )?);
+                )?;
+
+                if r.8 != "1" {
+                    unconfirmed.push(bar.ts_event);
+                }
+                page.push(bar);
             }
             page.reverse();
 
@@ -4111,9 +4473,9 @@ impl OKXHttpClient {
                 .clone()
                 .into_iter()
                 .filter(|b| {
-                    let ts = b.ts_event.as_i64();
+                    let ts = b.ts_init.as_i64();
                     let ok_after = start_ns.is_none_or(|sns| ts >= sns);
-                    let ok_before = end_ns.is_none_or(|ens| b.ts_init.as_i64() <= ens);
+                    let ok_before = end_ns.is_none_or(|ens| ts <= ens);
                     ok_after && ok_before
                 })
                 .collect();
@@ -4237,10 +4599,11 @@ impl OKXHttpClient {
                 break;
             }
 
+            // The earliest bar in the window closes within one bar of the start
             if let Some(sns) = start_ns
                 && let Some(first) = out.first()
                 && (matches!(mode, Mode::Backward) || forward_prepend_mode)
-                && first.ts_event.as_i64() <= sns
+                && first.ts_init.as_i64() < sns.saturating_add(min_slot_ns)
             {
                 break;
             }
@@ -4268,20 +4631,25 @@ impl OKXHttpClient {
             if !raw.is_empty() {
                 let mut page: Vec<Bar> = Vec::with_capacity(raw.len());
                 for r in &raw {
-                    page.push(parse_historical_candlestick(
+                    let bar = parse_historical_candlestick(
                         r,
                         bar_type,
                         inst.price_precision(),
                         inst.size_precision(),
-                    )?);
+                    )?;
+
+                    if r.8 != "1" {
+                        unconfirmed.push(bar.ts_event);
+                    }
+                    page.push(bar);
                 }
                 page.reverse();
                 out = page
                     .into_iter()
                     .filter(|b| {
-                        let ts = b.ts_event.as_i64();
+                        let ts = b.ts_init.as_i64();
                         let ok_after = start_ns.is_none_or(|sns| ts >= sns);
-                        let ok_before = end_ns.is_none_or(|ens| b.ts_init.as_i64() <= ens);
+                        let ok_before = end_ns.is_none_or(|ens| ts <= ens);
                         ok_after && ok_before
                     })
                     .collect();
@@ -4315,7 +4683,21 @@ impl OKXHttpClient {
             out.drain(..start);
         }
 
-        Ok(out)
+        let limited = limit.is_some_and(|lim| lim > 0 && out.len() >= lim as usize);
+        let coverage = if truncated {
+            OKXHistoryCoverage::Truncated
+        } else if !limited
+            && !is_month
+            && !out.iter().any(|bar| unconfirmed.contains(&bar.ts_event))
+            && let (Some(sns), Some(first)) = (start_ns, out.first())
+            && first.ts_init.as_i64() < sns.saturating_add(slot_ns)
+        {
+            OKXHistoryCoverage::Complete
+        } else {
+            OKXHistoryCoverage::Unverified
+        };
+
+        Ok((out, coverage))
     }
 
     /// Requests historical order status reports for the given parameters.
@@ -4348,6 +4730,8 @@ impl OKXHttpClient {
                 end,
                 open_only,
                 limit,
+                false,
+                None,
                 None,
             )
             .await?
@@ -4364,7 +4748,9 @@ impl OKXHttpClient {
         end: Option<Timestamp>,
         open_only: bool,
         limit: Option<u32>,
+        allow_history_failure: bool,
         scope: Option<ReportInstrumentScope<'_>>,
+        max_history_pages: Option<u32>,
     ) -> anyhow::Result<ReportSweep<OrderStatusReport>> {
         if instrument_id.as_ref().is_some_and(|id| self.is_spread(*id))
             || (instrument_id.is_none() && instrument_type.is_none())
@@ -4377,7 +4763,9 @@ impl OKXHttpClient {
                     end,
                     open_only,
                     limit,
+                    allow_history_failure,
                     scope,
+                    max_history_pages,
                 )
                 .await;
         }
@@ -4408,50 +4796,72 @@ impl OKXHttpClient {
         }
         let pending_base = pending_base.build().map_err(|e| anyhow::anyhow!(e))?;
 
-        let (combined_resp, mut complete) = if open_only {
-            let pending = self.paginate_orders_pending(&pending_base, limit).await?;
-            (pending.items, pending.complete)
+        let (pending, history) = if open_only {
+            (
+                self.paginate_orders_pending(&pending_base, limit).await?,
+                None,
+            )
         } else {
             let (history, pending) = Box::pin(async {
-                tokio::try_join!(
-                    self.paginate_orders_history(&history_base, limit),
+                tokio::join!(
+                    self.paginate_orders_history(
+                        &history_base,
+                        limit,
+                        reconciliation_history_page_limit(max_history_pages),
+                    ),
                     self.paginate_orders_pending(&pending_base, limit),
                 )
             })
-            .await?;
-            let mut combined_resp = history.items;
-            combined_resp.extend(pending.items);
-            (combined_resp, history.complete && pending.complete)
+            .await;
+
+            (pending?, Some(history))
         };
+
+        anyhow::ensure!(
+            pending.complete,
+            "Pending orders did not establish complete coverage"
+        );
+
+        let (history, mut complete) = match history {
+            Some(Ok(history)) => (history.items, history.complete),
+            Some(Err(e)) if !allow_history_failure => return Err(e),
+            Some(Err(e)) => {
+                log::warn!("Failed to fetch order history: {e}");
+                (Vec::new(), false)
+            }
+            None => (Vec::new(), true),
+        };
+
+        let capacity = pending.items.len() + history.len();
+        let orders = pending
+            .items
+            .into_iter()
+            .map(|order| (order, true))
+            .chain(history.into_iter().map(|order| (order, false)));
 
         // Prepare time range filter
         let start_ns = start.map(UnixNanos::from);
         let end_ns = end.map(UnixNanos::from);
 
         let ts_init = self.generate_ts_init();
-        let mut reports = Vec::with_capacity(combined_resp.len());
+        let mut reports = Vec::with_capacity(capacity);
 
         // Use a seen filter in case pending orders are within the histories "2hr reserve window"
         let mut seen: AHashSet<String> = AHashSet::new();
 
-        for order in combined_resp {
-            let seen_key = if !order.cl_ord_id.is_empty() {
-                order.cl_ord_id.as_str().to_string()
-            } else if let Some(algo_cl_ord_id) = order
-                .algo_cl_ord_id
-                .as_ref()
-                .filter(|value| !value.as_str().is_empty())
-            {
-                algo_cl_ord_id.as_str().to_string()
-            } else if let Some(algo_id) = order
-                .algo_id
-                .as_ref()
-                .filter(|value| !value.as_str().is_empty())
-            {
-                algo_id.as_str().to_string()
-            } else {
-                order.ord_id.as_str().to_string()
-            };
+        for (order, from_pending_source) in orders {
+            let active = is_open_okx_order(order.state, from_pending_source);
+            let seen_key = [
+                Some(order.cl_ord_id.as_str()),
+                order.algo_cl_ord_id.as_ref().map(Ustr::as_str),
+                order.algo_id.as_ref().map(Ustr::as_str),
+                Some(order.ord_id.as_str()),
+            ]
+            .into_iter()
+            .flatten()
+            .find(|value| !value.is_empty())
+            .unwrap_or_default()
+            .to_string();
 
             if !seen.insert(seen_key) {
                 continue; // Reserved pending already reported
@@ -4459,9 +4869,7 @@ impl OKXHttpClient {
 
             // Open orders are authoritative regardless of age; only closed
             // history respects the report window.
-            if report_ts_outside_window(order.u_time, start_ns, end_ns)
-                && !is_open_okx_order(order.state)
-            {
+            if report_ts_outside_window(order.u_time, start_ns, end_ns) && !active {
                 continue;
             }
 
@@ -4469,7 +4877,7 @@ impl OKXHttpClient {
                 order.inst_id,
                 order.inst_type,
                 false,
-                is_open_okx_order(order.state),
+                active,
                 scope,
             )? {
                 InstrumentResolution::Found(inst) => inst,
@@ -4489,26 +4897,13 @@ impl OKXHttpClient {
                 ts_init,
             ) {
                 Ok(report) => report,
+                Err(e) if active => return Err(e),
                 Err(e) => {
                     log::warn!("Failed to parse order status report: {e}");
                     complete = false;
                     continue;
                 }
             };
-
-            if let Some(start_ns) = start_ns
-                && report.ts_last < start_ns
-                && report.order_status.is_closed()
-            {
-                continue;
-            }
-
-            if let Some(end_ns) = end_ns
-                && report.ts_last > end_ns
-                && report.order_status.is_closed()
-            {
-                continue;
-            }
 
             reports.push(report);
         }
@@ -4608,6 +5003,7 @@ impl OKXHttpClient {
         }
 
         let ts_init = self.generate_ts_init();
+
         let mut report = parse_order_status_report(
             order,
             account_id,
@@ -4615,7 +5011,15 @@ impl OKXHttpClient {
             instrument.price_precision(),
             instrument.size_precision(),
             ts_init,
-        )?;
+        )
+        .map_err(|e| {
+            if is_open_okx_order(order.state, false) {
+                OKXActiveOrderReportError(e).into()
+            } else {
+                e
+            }
+        })?;
+
         let post_only_rejected = order.state == OKXOrderStatus::Canceled
             && report.filled_qty.is_zero()
             && (order.cancel_source == OKX_POST_ONLY_CANCEL_SOURCE
@@ -4656,6 +5060,8 @@ impl OKXHttpClient {
                 end,
                 open_only,
                 limit,
+                false,
+                None,
                 None,
             )
             .await?
@@ -4671,7 +5077,9 @@ impl OKXHttpClient {
         end: Option<Timestamp>,
         open_only: bool,
         limit: Option<u32>,
+        allow_history_failure: bool,
         scope: Option<ReportInstrumentScope<'_>>,
+        max_history_pages: Option<u32>,
     ) -> anyhow::Result<ReportSweep<OrderStatusReport>> {
         let mut pending_builder = GetSpreadOrdersParamsBuilder::default();
         let mut history_builder = GetSpreadOrdersParamsBuilder::default();
@@ -4698,31 +5106,58 @@ impl OKXHttpClient {
         let pending_base = pending_builder.build().map_err(|e| anyhow::anyhow!(e))?;
         let history_base = history_builder.build().map_err(|e| anyhow::anyhow!(e))?;
 
-        let (combined_resp, mut complete) = if open_only {
-            let pending = self
-                .paginate_spread_orders_pending(&pending_base, limit)
-                .await?;
-            (pending.items, pending.complete)
+        let (pending, history) = if open_only {
+            (
+                self.paginate_spread_orders_pending(&pending_base, limit)
+                    .await?,
+                None,
+            )
         } else {
             let (history, pending) = Box::pin(async {
-                tokio::try_join!(
-                    self.paginate_spread_orders_history(&history_base, limit),
+                tokio::join!(
+                    self.paginate_spread_orders_history(
+                        &history_base,
+                        limit,
+                        reconciliation_history_page_limit(max_history_pages),
+                    ),
                     self.paginate_spread_orders_pending(&pending_base, limit),
                 )
             })
-            .await?;
-            let mut combined_resp = history.items;
-            combined_resp.extend(pending.items);
-            (combined_resp, history.complete && pending.complete)
+            .await;
+
+            (pending?, Some(history))
         };
+
+        anyhow::ensure!(
+            pending.complete,
+            "Pending spread orders did not establish complete coverage"
+        );
+
+        let (history, mut complete) = match history {
+            Some(Ok(history)) => (history.items, history.complete),
+            Some(Err(e)) if !allow_history_failure => return Err(e),
+            Some(Err(e)) => {
+                log::warn!("Failed to fetch spread order history: {e}");
+                (Vec::new(), false)
+            }
+            None => (Vec::new(), true),
+        };
+
+        let capacity = pending.items.len() + history.len();
+        let orders = pending
+            .items
+            .into_iter()
+            .map(|order| (order, true))
+            .chain(history.into_iter().map(|order| (order, false)));
 
         let start_ns = start.map(UnixNanos::from);
         let end_ns = end.map(UnixNanos::from);
         let ts_init = self.generate_ts_init();
-        let mut reports = Vec::with_capacity(combined_resp.len());
+        let mut reports = Vec::with_capacity(capacity);
         let mut seen: AHashSet<String> = AHashSet::new();
 
-        for order in combined_resp {
+        for (order, from_pending_source) in orders {
+            let active = is_open_okx_order(order.state, from_pending_source);
             let seen_key = if order.cl_ord_id.is_empty() {
                 order.ord_id.as_str().to_string()
             } else {
@@ -4735,9 +5170,14 @@ impl OKXHttpClient {
 
             // Open spread orders are authoritative regardless of age; only
             // closed history respects the report window.
-            if let Some(ts) = order.u_time.or(order.c_time)
-                && report_ts_outside_window(ts, start_ns, end_ns)
-                && !is_open_okx_order(order.state)
+            let ts_last = order
+                .u_time
+                .or(order.c_time)
+                .map_or(ts_init, parse_millisecond_timestamp);
+
+            if !active
+                && (start_ns.is_some_and(|start| ts_last < start)
+                    || end_ns.is_some_and(|end| ts_last > end))
             {
                 continue;
             }
@@ -4746,7 +5186,7 @@ impl OKXHttpClient {
                 order.sprd_id,
                 OKXInstrumentType::Any,
                 true,
-                is_open_okx_order(order.state),
+                active,
                 scope,
             )? {
                 InstrumentResolution::Found(inst) => inst,
@@ -4766,26 +5206,13 @@ impl OKXHttpClient {
                 ts_init,
             ) {
                 Ok(report) => report,
+                Err(e) if active => return Err(e),
                 Err(e) => {
                     log::warn!("Failed to parse spread order status report: {e}");
                     complete = false;
                     continue;
                 }
             };
-
-            if let Some(start_ns) = start_ns
-                && report.ts_last < start_ns
-                && report.order_status.is_closed()
-            {
-                continue;
-            }
-
-            if let Some(end_ns) = end_ns
-                && report.ts_last > end_ns
-                && report.order_status.is_closed()
-            {
-                continue;
-            }
 
             reports.push(report);
         }
@@ -4797,12 +5224,13 @@ impl OKXHttpClient {
         &self,
         base: &GetSpreadOrdersParams,
         limit: Option<u32>,
+        max_pages: usize,
     ) -> anyhow::Result<PageSweep<OKXSpreadOrder>> {
         let mut all = Vec::new();
         let mut cursor: Option<String> = None;
         let mut exhausted = true;
 
-        for _ in 0..MAX_RECONCILIATION_PAGES {
+        for _ in 0..max_pages {
             let mut params = base.clone();
             params.end_id = cursor.take();
 
@@ -4831,7 +5259,7 @@ impl OKXHttpClient {
 
         if exhausted && !all.is_empty() {
             log::warn!(
-                "Spread order history pagination hit {MAX_RECONCILIATION_PAGES} page cap, \
+                "Spread order history pagination hit {max_pages} page cap, \
                  results may be truncated ({} records)",
                 all.len()
             );
@@ -4900,12 +5328,13 @@ impl OKXHttpClient {
         &self,
         base: &GetOrderHistoryParams,
         limit: Option<u32>,
+        max_pages: usize,
     ) -> anyhow::Result<PageSweep<OKXOrderHistory>> {
         let mut all = Vec::new();
         let mut cursor: Option<String> = None;
         let mut exhausted = true;
 
-        for _ in 0..MAX_RECONCILIATION_PAGES {
+        for _ in 0..max_pages {
             let mut params = base.clone();
             params.after = cursor.take();
 
@@ -4934,7 +5363,7 @@ impl OKXHttpClient {
 
         if exhausted && !all.is_empty() {
             log::warn!(
-                "Order history pagination hit {MAX_RECONCILIATION_PAGES} page cap, \
+                "Order history pagination hit {max_pages} page cap, \
                  results may be truncated ({} records)",
                 all.len()
             );
@@ -5005,12 +5434,13 @@ impl OKXHttpClient {
         base: &GetTransactionDetailsParams,
         limit: Option<u32>,
         history: FillHistory,
+        max_pages: usize,
     ) -> anyhow::Result<PageSweep<OKXTransactionDetail>> {
         let mut all = Vec::new();
         let mut cursor: Option<String> = None;
         let mut exhausted = true;
 
-        for _ in 0..MAX_RECONCILIATION_PAGES {
+        for _ in 0..max_pages {
             let mut params = base.clone();
             params.after = cursor.take();
 
@@ -5039,7 +5469,7 @@ impl OKXHttpClient {
 
         if exhausted && !all.is_empty() {
             log::warn!(
-                "Fill pagination hit {MAX_RECONCILIATION_PAGES} page cap, \
+                "Fill pagination hit {max_pages} page cap, \
                  results may be truncated ({} records)",
                 all.len()
             );
@@ -5112,12 +5542,13 @@ impl OKXHttpClient {
         base: &GetAlgoOrdersParams,
         limit: Option<usize>,
         require_complete_active_coverage: bool,
+        max_pages: usize,
     ) -> anyhow::Result<PageSweep<OKXOrderAlgo>> {
         let mut all = Vec::new();
         let mut cursor: Option<String> = None;
         let mut exhausted = true;
 
-        for _ in 0..MAX_RECONCILIATION_PAGES {
+        for _ in 0..max_pages {
             let mut params = base.clone();
             params.after = cursor.take();
 
@@ -5151,7 +5582,7 @@ impl OKXHttpClient {
 
         if exhausted && !all.is_empty() {
             log::warn!(
-                "Algo history pagination hit {MAX_RECONCILIATION_PAGES} page cap, \
+                "Algo history pagination hit {max_pages} page cap, \
                  results may be truncated ({} records)",
                 all.len()
             );
@@ -5188,6 +5619,7 @@ impl OKXHttpClient {
                 limit,
                 FillHistory::Recent,
                 None,
+                None,
             )
             .await?
             .reports)
@@ -5204,6 +5636,7 @@ impl OKXHttpClient {
         limit: Option<u32>,
         history: FillHistory,
         scope: Option<ReportInstrumentScope<'_>>,
+        max_history_pages: Option<u32>,
     ) -> anyhow::Result<ReportSweep<FillReport>> {
         if instrument_id.as_ref().is_some_and(|id| self.is_spread(*id))
             || (instrument_id.is_none() && instrument_type.is_none())
@@ -5216,6 +5649,7 @@ impl OKXHttpClient {
                     end,
                     limit,
                     scope,
+                    max_history_pages,
                 )
                 .await;
         }
@@ -5251,7 +5685,14 @@ impl OKXHttpClient {
 
         let params = params.build().map_err(|e| anyhow::anyhow!(e))?;
 
-        let sweep = self.paginate_fills(&params, limit, history).await?;
+        let sweep = self
+            .paginate_fills(
+                &params,
+                limit,
+                history,
+                reconciliation_history_page_limit(max_history_pages),
+            )
+            .await?;
         let mut complete = sweep.complete;
 
         // Prepare time range filter
@@ -5342,11 +5783,20 @@ impl OKXHttpClient {
         limit: Option<u32>,
     ) -> anyhow::Result<Vec<FillReport>> {
         Ok(self
-            .request_spread_fill_reports_scoped(account_id, instrument_id, start, end, limit, None)
+            .request_spread_fill_reports_scoped(
+                account_id,
+                instrument_id,
+                start,
+                end,
+                limit,
+                None,
+                None,
+            )
             .await?
             .reports)
     }
 
+    #[expect(clippy::too_many_arguments)]
     pub(crate) async fn request_spread_fill_reports_scoped(
         &self,
         account_id: AccountId,
@@ -5355,6 +5805,7 @@ impl OKXHttpClient {
         end: Option<Timestamp>,
         limit: Option<u32>,
         scope: Option<ReportInstrumentScope<'_>>,
+        max_history_pages: Option<u32>,
     ) -> anyhow::Result<ReportSweep<FillReport>> {
         let mut builder = GetSpreadTradesParamsBuilder::default();
 
@@ -5375,7 +5826,13 @@ impl OKXHttpClient {
         }
 
         let params = builder.build().map_err(|e| anyhow::anyhow!(e))?;
-        let sweep = self.paginate_spread_fills(&params, limit).await?;
+        let sweep = self
+            .paginate_spread_fills(
+                &params,
+                limit,
+                reconciliation_history_page_limit(max_history_pages),
+            )
+            .await?;
         let mut complete = sweep.complete;
 
         let start_ns = start.map(UnixNanos::from);
@@ -5453,12 +5910,13 @@ impl OKXHttpClient {
         &self,
         base: &GetSpreadTradesParams,
         limit: Option<u32>,
+        max_pages: usize,
     ) -> anyhow::Result<PageSweep<OKXSpreadTrade>> {
         let mut all = Vec::new();
         let mut cursor: Option<String> = None;
         let mut exhausted = true;
 
-        for _ in 0..MAX_RECONCILIATION_PAGES {
+        for _ in 0..max_pages {
             let mut params = base.clone();
             params.end_id = cursor.take();
 
@@ -5487,7 +5945,7 @@ impl OKXHttpClient {
 
         if exhausted && !all.is_empty() {
             log::warn!(
-                "Spread fill pagination hit {MAX_RECONCILIATION_PAGES} page cap, \
+                "Spread fill pagination hit {max_pages} page cap, \
                  results may be truncated ({} records)",
                 all.len()
             );
@@ -6427,18 +6885,9 @@ impl OKXHttpClient {
             }
         });
 
-        let tgt_ccy = if instrument_type == OKXInstrumentType::Spot
-            && order_type == OrderType::Market
-            && td_mode == OKXTradeMode::Cash
-        {
-            match quote_quantity {
-                Some(true) => Some(OKXTargetCurrency::QuoteCcy),
-                Some(false) if order_side == OrderSide::Buy => Some(OKXTargetCurrency::BaseCcy),
-                _ => None,
-            }
-        } else {
-            None
-        };
+        let tgt_ccy =
+            okx_market_target_currency(instrument_type, order_side, order_type, quote_quantity)
+                .map_err(|e| OKXHttpError::ValidationError(e.to_string()))?;
 
         if rpi && order_type != OrderType::Limit {
             return Err(OKXHttpError::ValidationError(
@@ -6647,6 +7096,7 @@ impl OKXHttpClient {
         let okx_side = OKXSide::from(order_side);
 
         let instrument_type = okx_instrument_type_from_symbol(instrument_id.symbol.as_str());
+
         let tgt_ccy = okx_algo_target_currency(
             instrument_type,
             td_mode,
@@ -6654,7 +7104,7 @@ impl OKXHttpClient {
             order_type,
             quote_quantity,
         )
-        .map_err(OKXHttpError::ValidationError)?;
+        .map_err(OKXHttpError::from_order_denial)?;
 
         validate_algo_trigger_type(instrument_type, td_mode, order_type, trigger_type)
             .map_err(OKXHttpError::ValidationError)?;
@@ -6889,6 +7339,7 @@ impl OKXHttpClient {
                 None,
                 None,
                 false,
+                None,
             )
             .await?
             .reports)
@@ -6907,6 +7358,7 @@ impl OKXHttpClient {
         start: Option<Timestamp>,
         end: Option<Timestamp>,
         require_complete_active_coverage: bool,
+        max_history_pages: Option<u32>,
     ) -> anyhow::Result<AlgoOrderReportSweep> {
         let mut instruments_cache: AHashMap<Ustr, InstrumentAny> = AHashMap::new();
         let mut ambiguous_triggered_child_ids = AHashSet::new();
@@ -7102,8 +7554,14 @@ impl OKXHttpClient {
             for history_state in history_states {
                 params.state = Some(*history_state);
                 let remaining = limit.map(|l| (l as usize).saturating_sub(reports.len()));
+
                 let history_sweep = match self
-                    .paginate_algo_history(&params, remaining, require_complete_active_coverage)
+                    .paginate_algo_history(
+                        &params,
+                        remaining,
+                        require_complete_active_coverage,
+                        reconciliation_history_page_limit(max_history_pages),
+                    )
                     .await
                 {
                     Ok(sweep) => sweep,
@@ -7263,9 +7721,8 @@ impl OKXHttpClient {
                         if !order.ord_id.is_empty() && child_order_id != &order.ord_id
                 );
 
-            // Pending-source records are authoritative regardless of age or
-            // mapped state; only terminal history respects the report window.
-            if !from_pending_source
+            // An unknown pending state cannot establish that the order is terminal
+            if !(from_pending_source && order.state == OKXAlgoOrderStatus::Unknown)
                 && report_ts_outside_window(order.u_time, start_ns, end_ns)
                 && !is_open_okx_algo(order.state)
             {
@@ -7294,28 +7751,32 @@ impl OKXHttpClient {
                 }
             };
 
-            match parse_http_algo_order(order, account_id, &instrument, ts_init) {
-                Ok(report) => {
-                    if has_ambiguous_children && report.order_status == OrderStatus::Triggered {
-                        log::warn!(
-                            "Algo order {} has ambiguous child order identifiers",
-                            order.algo_id,
-                        );
-                        ambiguous_triggered_child_ids.insert(report.venue_order_id);
-                    }
-
-                    if let Some(index) = seen.get(&key).copied() {
-                        if is_order_status_report_more_advanced(&report, &reports[index]) {
-                            reports[index] = report;
-                        }
-                    } else {
-                        seen.insert(key, reports.len());
-                        reports.push(report);
-                    }
-                }
+            let report = match parse_http_algo_order(order, account_id, &instrument, ts_init) {
+                Ok(report) => report,
+                Err(e) if !from_pending_source && is_open_okx_algo(order.state) => return Err(e),
                 Err(e) => {
                     log::warn!("Failed to parse algo order report: {e}");
                     complete = false;
+                    continue;
+                }
+            };
+
+            if has_ambiguous_children && report.order_status == OrderStatus::Triggered {
+                log::warn!(
+                    "Algo order {} has ambiguous child order identifiers",
+                    order.algo_id,
+                );
+                ambiguous_triggered_child_ids.insert(report.venue_order_id);
+            }
+
+            match seen.get(&key).copied() {
+                Some(index) if is_order_status_report_more_advanced(&report, &reports[index]) => {
+                    reports[index] = report;
+                }
+                Some(_) => {}
+                None => {
+                    seen.insert(key, reports.len());
+                    reports.push(report);
                 }
             }
         }
@@ -7435,11 +7896,11 @@ fn parse_historical_candlestick(
     Ok(bar)
 }
 
-fn is_open_okx_order(state: OKXOrderStatus) -> bool {
+fn is_open_okx_order(state: OKXOrderStatus, from_pending_source: bool) -> bool {
     matches!(
         state,
         OKXOrderStatus::Live | OKXOrderStatus::PartiallyFilled
-    )
+    ) || (from_pending_source && state == OKXOrderStatus::Unknown)
 }
 
 fn fill_quantity_is_positive(value: &str) -> Result<bool, rust_decimal::Error> {
@@ -7544,4 +8005,10 @@ fn parse_http_algo_order(
     };
 
     parse_algo_order_status_report(&msg, instrument, account_id, ts_init)
+}
+
+fn reconciliation_history_page_limit(max_pages: Option<u32>) -> usize {
+    max_pages.map_or(MAX_RECONCILIATION_PAGES, |pages| {
+        (pages as usize).min(MAX_RECONCILIATION_PAGES)
+    })
 }

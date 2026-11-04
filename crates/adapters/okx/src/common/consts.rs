@@ -20,6 +20,7 @@ use std::sync::LazyLock;
 use ahash::AHashSet;
 use nautilus_model::{
     enums::{OrderSide, OrderType, PositionSide, TimeInForce, TriggerType},
+    events::OrderDeniedReason,
     identifiers::{ClientId, Venue},
 };
 use ustr::Ustr;
@@ -160,6 +161,44 @@ pub(crate) fn okx_reduce_only_wire_value(
     }
 }
 
+/// Resolves quantity units for ordinary market orders.
+///
+/// # Errors
+///
+/// Returns an error if a margin order requests units other than its native side-dependent units.
+pub(crate) fn okx_market_target_currency(
+    instrument_type: OKXInstrumentType,
+    order_side: OrderSide,
+    order_type: OrderType,
+    quote_quantity: Option<bool>,
+) -> Result<Option<OKXTargetCurrency>, OrderDeniedReason> {
+    if order_type != OrderType::Market {
+        return Ok(None);
+    }
+
+    match instrument_type {
+        OKXInstrumentType::Spot => Ok(match quote_quantity {
+            Some(true) => Some(OKXTargetCurrency::QuoteCcy),
+            Some(false) if order_side == OrderSide::Buy => Some(OKXTargetCurrency::BaseCcy),
+            _ => None,
+        }),
+        OKXInstrumentType::Margin => {
+            let native_quote = order_side == OrderSide::Buy;
+            if quote_quantity.is_some_and(|quote| quote != native_quote) {
+                let unit = if native_quote { "quote" } else { "base" };
+                return Err(OrderDeniedReason::ValidationFailed {
+                    detail: format!(
+                        "OKXInstrumentType::Margin market {order_side} orders require {unit} quantity"
+                    ),
+                });
+            }
+
+            Ok(None)
+        }
+        _ => Ok(None),
+    }
+}
+
 /// Resolves explicit sizing for algo orders.
 ///
 /// # Errors
@@ -171,7 +210,7 @@ pub(crate) fn okx_algo_target_currency(
     order_side: OrderSide,
     order_type: OrderType,
     quote_quantity: bool,
-) -> Result<Option<OKXTargetCurrency>, String> {
+) -> Result<Option<OKXTargetCurrency>, OrderDeniedReason> {
     if !OKX_CONDITIONAL_ORDER_TYPES.contains(&order_type) {
         return Ok(None);
     }
@@ -192,17 +231,17 @@ pub(crate) fn okx_algo_target_currency(
             return if quote_quantity {
                 Ok(None)
             } else {
-                Err(format!(
-                    "OKX {instrument_type} {order_type} algo buys require quote quantity in {td_mode} mode"
-                ))
+                Err(OrderDeniedReason::ValidationFailed {
+                    detail: format!(
+                        "OKX {instrument_type} {order_type} algo buys require quote quantity in {td_mode} mode"
+                    ),
+                })
             };
         }
     }
 
     if quote_quantity {
-        return Err(format!(
-            "OKX {instrument_type} {order_type} algo orders do not support quote quantity in {td_mode} mode"
-        ));
+        return Err(OrderDeniedReason::unsupported_quote_quantity());
     }
 
     Ok(None)
@@ -464,6 +503,41 @@ mod tests {
     use super::*;
 
     #[rstest]
+    #[case::buy_quote(OrderSide::Buy, Some(true))]
+    #[case::sell_base(OrderSide::Sell, Some(false))]
+    #[case::buy_default(OrderSide::Buy, None)]
+    #[case::sell_default(OrderSide::Sell, None)]
+    fn test_market_target_currency_preserves_native_margin_units(
+        #[case] side: OrderSide,
+        #[case] quote_quantity: Option<bool>,
+    ) {
+        assert_eq!(
+            okx_market_target_currency(
+                OKXInstrumentType::Margin,
+                side,
+                OrderType::Market,
+                quote_quantity,
+            ),
+            Ok(None),
+        );
+    }
+
+    #[rstest]
+    #[case::spot_limit(OKXInstrumentType::Spot, OrderType::Limit)]
+    #[case::spot_market_to_limit(OKXInstrumentType::Spot, OrderType::MarketToLimit)]
+    #[case::swap_market(OKXInstrumentType::Swap, OrderType::Market)]
+    #[case::event_market(OKXInstrumentType::Events, OrderType::Market)]
+    fn test_market_target_currency_omits_unrelated_units(
+        #[case] instrument_type: OKXInstrumentType,
+        #[case] order_type: OrderType,
+    ) {
+        assert_eq!(
+            okx_market_target_currency(instrument_type, OrderSide::Buy, order_type, Some(true)),
+            Ok(None),
+        );
+    }
+
+    #[rstest]
     #[case::auto_default(0, OKXVipLevel::Vip0, OKXBookChannel::Book)]
     #[case::auto_vip3(0, OKXVipLevel::Vip3, OKXBookChannel::Book)]
     #[case::auto_vip4(0, OKXVipLevel::Vip4, OKXBookChannel::BookL2Tbt)]
@@ -566,9 +640,7 @@ mod tests {
                 order_type,
                 true,
             ),
-            Err(format!(
-                "OKX Spot {order_type} algo orders do not support quote quantity in {trade_mode} mode"
-            )),
+            Err(OrderDeniedReason::unsupported_quote_quantity()),
         );
     }
 
@@ -663,9 +735,7 @@ mod tests {
     ) {
         assert_eq!(
             okx_algo_target_currency(instrument_type, trade_mode, side, order_type, true),
-            Err(format!(
-                "OKX {instrument_type} {order_type} algo orders do not support quote quantity in {trade_mode} mode"
-            )),
+            Err(OrderDeniedReason::unsupported_quote_quantity()),
         );
     }
 
@@ -679,10 +749,11 @@ mod tests {
                 OrderType::TrailingStopMarket,
                 false,
             ),
-            Err(
-                "OKX Spot TRAILING_STOP_MARKET algo buys require quote quantity in Cash mode"
-                    .to_string()
-            ),
+            Err(OrderDeniedReason::ValidationFailed {
+                detail:
+                    "OKX Spot TRAILING_STOP_MARKET algo buys require quote quantity in Cash mode"
+                        .to_string(),
+            }),
         );
     }
 

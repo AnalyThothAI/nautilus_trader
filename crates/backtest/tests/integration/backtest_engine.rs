@@ -4187,6 +4187,52 @@ fn test_streaming_mode_processes_data_in_batches(crypto_perpetual_ethusdt: Crypt
 }
 
 #[rstest]
+fn test_streaming_resumes_after_batch_before_start(crypto_perpetual_ethusdt: CryptoPerpetual) {
+    let mut engine = create_engine();
+    let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt);
+    let instrument_id = instrument.id();
+    engine.add_instrument(&instrument).unwrap();
+    engine.add_strategy(EmptyStrategy::new()).unwrap();
+    engine
+        .add_data(
+            vec![quote(instrument_id, "1000.00", "1000.10", 1)],
+            None,
+            true,
+            true,
+        )
+        .unwrap();
+
+    let start = Some(UnixNanos::from(10));
+    let end = Some(UnixNanos::from(40));
+    engine.run(start, end, None, true).unwrap();
+    let run_id = engine.run_id().unwrap();
+    assert_eq!(engine.get_result().iterations, 0);
+    assert!(engine.kernel().trader.borrow().is_running());
+
+    engine.clear_data();
+    engine
+        .add_data(
+            vec![
+                quote(instrument_id, "1001.00", "1001.10", 20),
+                quote(instrument_id, "1002.00", "1002.10", 30),
+            ],
+            None,
+            true,
+            true,
+        )
+        .unwrap();
+    engine.run(start, end, None, true).unwrap();
+
+    assert_eq!(engine.get_result().iterations, 2);
+    assert_eq!(engine.run_id(), Some(run_id));
+    assert!(engine.kernel().trader.borrow().is_running());
+
+    engine.end().unwrap();
+    assert_eq!(engine.run_id(), Some(run_id));
+    assert!(!engine.kernel().trader.borrow().is_running());
+}
+
+#[rstest]
 fn test_streaming_windows_retain_first_item_past_end() {
     let mut engine = BacktestEngine::new(BacktestEngineConfig::default()).unwrap();
     let first = stub_custom_data(1, 1, None, None);
@@ -4377,9 +4423,12 @@ fn test_reset_run_produces_same_results(crypto_perpetual_ethusdt: CryptoPerpetua
     engine.run(None, None, None, false).unwrap();
     let result1_iterations = engine.get_result().iterations;
     let result1_orders = engine.get_result().total_orders;
+    let run_id = engine.run_id().unwrap();
 
     // Reset and run again with same data
     engine.reset().unwrap();
+    assert_eq!(engine.run_id(), None);
+
     engine.run(None, None, None, false).unwrap();
     let result2_iterations = engine.get_result().iterations;
     let result2_orders = engine.get_result().total_orders;
@@ -4387,6 +4436,7 @@ fn test_reset_run_produces_same_results(crypto_perpetual_ethusdt: CryptoPerpetua
     assert_eq!(result1_iterations, result2_iterations);
     assert_eq!(result1_orders, result2_orders);
     assert_eq!(result1_iterations, 3);
+    assert_ne!(engine.run_id().unwrap(), run_id);
 }
 
 #[rstest]
@@ -5291,6 +5341,198 @@ fn test_reset_between_emulated_runs_clears_order_emulator_state(
     assert_eq!(emulator.subscribed_strategy_count(), 1);
     assert_eq!(emulator.monitored_position_count(), 1);
     assert_eq!(emulator.get_submit_order_commands().len(), 1);
+}
+
+#[rstest]
+#[case::timer_only(&[], 1)]
+#[case::replay_gap(&[1, 40], 1)]
+#[case::tail_flush(&[1, 100], 1)]
+#[case::overdue(&[40], 40)]
+fn test_timer_cancellation_before_later_events(
+    crypto_perpetual_ethusdt: CryptoPerpetual,
+    #[case] quote_times: &[u64],
+    #[case] start_ns: u64,
+    #[values(false, true)] cancel_all: bool,
+) {
+    let mut engine = create_engine();
+    let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt);
+    let instrument_id = instrument.id();
+    engine.add_instrument(&instrument).unwrap();
+
+    let clock = Rc::clone(&engine.kernel().clock);
+    let callback_clock = Rc::clone(&clock);
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let observed = Rc::clone(&events);
+    let timer_name = "self_cancel";
+
+    let callback = TimeEventCallback::RustLocal(Rc::new(move |event: TimeEvent| {
+        let ts_now = callback_clock.borrow().timestamp_ns();
+        if cancel_all {
+            callback_clock.borrow_mut().cancel_timers();
+        } else {
+            callback_clock.borrow_mut().cancel_timer(timer_name);
+        }
+
+        observed
+            .borrow_mut()
+            .push((event.ts_event, event.ts_init, ts_now));
+    }));
+
+    clock
+        .borrow_mut()
+        .set_timer_ns(
+            timer_name,
+            DurationNanos::new(10),
+            Some(UnixNanos::from(1)),
+            None,
+            Some(callback),
+            None,
+            None,
+        )
+        .unwrap();
+
+    if !quote_times.is_empty() {
+        let data = quote_times
+            .iter()
+            .map(|&ts| quote(instrument_id, "1000.00", "1001.00", ts))
+            .collect();
+        engine.add_data(data, None, true, true).unwrap();
+    }
+
+    engine
+        .run(
+            Some(UnixNanos::from(start_ns)),
+            Some(UnixNanos::from(40)),
+            None,
+            false,
+        )
+        .unwrap();
+    engine.dispose();
+
+    assert_eq!(
+        *events.borrow(),
+        vec![(
+            UnixNanos::from(11),
+            UnixNanos::from(11),
+            UnixNanos::from(11)
+        )],
+    );
+}
+
+#[rstest]
+fn test_timer_cancellation_across_component_clocks(crypto_perpetual_ethusdt: CryptoPerpetual) {
+    let mut engine = create_engine();
+    let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt);
+    let instrument_id = instrument.id();
+    engine.add_instrument(&instrument).unwrap();
+    engine.add_strategy(EmptyStrategy::new()).unwrap();
+
+    let target_clock = engine.kernel().trader.borrow().get_component_clocks()[0].clone();
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let target_events = Rc::clone(&events);
+    let target = "target";
+    target_clock
+        .borrow_mut()
+        .set_time_alert_ns(
+            target,
+            UnixNanos::from(31),
+            Some(TimeEventCallback::RustLocal(Rc::new(move |event| {
+                target_events.borrow_mut().push(event.ts_event);
+            }))),
+            None,
+        )
+        .unwrap();
+
+    let observed = Rc::clone(&events);
+    engine
+        .kernel()
+        .clock
+        .borrow_mut()
+        .set_time_alert_ns(
+            "cancel_target",
+            UnixNanos::from(11),
+            Some(TimeEventCallback::RustLocal(Rc::new(move |event| {
+                target_clock.borrow_mut().cancel_timer(target);
+                observed.borrow_mut().push(event.ts_event);
+            }))),
+            None,
+        )
+        .unwrap();
+
+    let data = [1, 40]
+        .into_iter()
+        .map(|ts| quote(instrument_id, "1000.00", "1001.00", ts))
+        .collect();
+    engine.add_data(data, None, true, true).unwrap();
+
+    engine.run(None, None, None, false).unwrap();
+    engine.dispose();
+
+    assert_eq!(*events.borrow(), vec![UnixNanos::from(11)]);
+}
+
+#[rstest]
+#[case::replay_gap(40, true, 40)]
+#[case::tail_flush(100, false, 11)]
+fn test_timer_expired_deadline_preserves_event_order(
+    crypto_perpetual_ethusdt: CryptoPerpetual,
+    #[case] last_quote: u64,
+    #[case] later_alert: bool,
+    #[case] expected_end: u64,
+) {
+    let mut engine = create_engine();
+    let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt);
+    let instrument_id = instrument.id();
+    engine.add_instrument(&instrument).unwrap();
+
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let observed = Rc::clone(&events);
+    let cache = Rc::clone(&engine.kernel().cache);
+    let callback = TimeEventCallback::RustLocal(Rc::new(move |event| {
+        let quote_ts = cache.borrow().quote(&instrument_id).unwrap().ts_init;
+        observed.borrow_mut().push((event.ts_event, quote_ts));
+    }));
+
+    let clock = Rc::clone(&engine.kernel().clock);
+    clock
+        .borrow_mut()
+        .set_timer_ns(
+            "stopped",
+            DurationNanos::new(10),
+            Some(UnixNanos::from(1)),
+            Some(UnixNanos::from(15)),
+            Some(callback.clone()),
+            None,
+            None,
+        )
+        .unwrap();
+
+    if later_alert {
+        clock
+            .borrow_mut()
+            .set_time_alert_ns("later", UnixNanos::from(31), Some(callback), None)
+            .unwrap();
+    }
+
+    let data = [1, last_quote]
+        .into_iter()
+        .map(|ts| quote(instrument_id, "1000.00", "1001.00", ts))
+        .collect();
+    engine.add_data(data, None, true, true).unwrap();
+
+    engine
+        .run(None, Some(UnixNanos::from(40)), None, false)
+        .unwrap();
+    let result = engine.get_result();
+    engine.dispose();
+
+    let mut expected = vec![(UnixNanos::from(11), UnixNanos::from(1))];
+    if later_alert {
+        expected.push((UnixNanos::from(31), UnixNanos::from(1)));
+    }
+
+    assert_eq!(*events.borrow(), expected);
+    assert_eq!(result.backtest_end, Some(UnixNanos::from(expected_end)));
 }
 
 // Strategy that sets two timers at the same timestamp, each submitting
@@ -8234,4 +8476,254 @@ impl DataActor for TradeFillChain {
         }
         Ok(())
     }
+}
+
+#[derive(Debug)]
+struct NativeMarkStop {
+    core: StrategyCore,
+    instrument_id: InstrumentId,
+    side: OrderSide,
+    trigger_type: TriggerType,
+    submitted: bool,
+}
+
+nautilus_strategy!(NativeMarkStop);
+
+impl DataActor for NativeMarkStop {
+    fn on_start(&mut self) -> anyhow::Result<()> {
+        self.subscribe_quotes(self.instrument_id, None, None);
+        Ok(())
+    }
+
+    fn on_quote(&mut self, _quote: &QuoteTick) -> anyhow::Result<()> {
+        if self.submitted {
+            return Ok(());
+        }
+
+        self.submitted = true;
+
+        let trigger = Price::from(if self.side == OrderSide::Buy {
+            "1010.00"
+        } else {
+            "990.00"
+        });
+
+        let order = self.order().stop_market(
+            self.instrument_id,
+            self.side,
+            Quantity::from("1.000"),
+            trigger,
+            Some(self.trigger_type),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        self.submit_order(order, None, None, None)
+    }
+}
+
+#[rstest]
+#[case::mark_only(true, false, false, true)]
+#[case::quote_only(false, true, false, true)]
+#[case::last_only(false, false, true, true)]
+#[case::neither(false, false, false, true)]
+#[case::missing_mark(false, true, false, false)]
+fn test_native_mark_price_stop_election(
+    #[case] mark_crosses: bool,
+    #[case] quote_crosses: bool,
+    #[case] last_crosses: bool,
+    #[case] has_mark: bool,
+    #[values(
+        (OrderSide::Buy, "1020.00", "1001.00"),
+        (OrderSide::Sell, "980.00", "999.00")
+    )]
+    direction: (OrderSide, &str, &str),
+    #[values(false, true)] trade_execution: bool,
+    #[values(TriggerType::MarkPrice, TriggerType::LastPrice)] trigger_type: TriggerType,
+) {
+    let (side, crossed, fill_price) = direction;
+    let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt());
+    let instrument_id = instrument.id();
+    let mut engine = native_mark_stop_engine(&instrument, side, trigger_type, trade_execution, 0);
+
+    let (bid, ask) = if quote_crosses {
+        (crossed, crossed)
+    } else {
+        ("999.00", "1001.00")
+    };
+
+    let mut data = vec![quote(instrument_id, "999.00", "1001.00", 1_000_000_000)];
+    if has_mark {
+        data.push(Data::MarkPrice(MarkPriceUpdate::new(
+            instrument_id,
+            Price::from("1000.00"),
+            2_000_000_000.into(),
+            2_000_000_000.into(),
+        )));
+    }
+
+    data.push(quote(instrument_id, bid, ask, 3_000_000_000));
+    data.push(Data::Trade(TradeTick::new(
+        instrument_id,
+        Price::from(if last_crosses { crossed } else { "1000.00" }),
+        Quantity::from("10.000"),
+        AggressorSide::NoAggressor,
+        TradeId::from("LAST-CONTROL"),
+        4_000_000_000.into(),
+        4_000_000_000.into(),
+    )));
+    data.push(quote(instrument_id, bid, ask, 5_000_000_000));
+    if mark_crosses {
+        data.push(Data::MarkPrice(MarkPriceUpdate::new(
+            instrument_id,
+            Price::from(crossed),
+            6_000_000_000.into(),
+            6_000_000_000.into(),
+        )));
+    }
+
+    engine.add_data(data, None, true, true).unwrap();
+    engine.run(None, None, None, false).unwrap();
+    let cache = engine.kernel().cache.borrow();
+    let orders = cache.orders(None, Some(&instrument_id), None, None, None);
+
+    let [order] = orders.as_slice() else {
+        panic!("expected one native stop");
+    };
+
+    let should_fill = match trigger_type {
+        TriggerType::MarkPrice => mark_crosses,
+        _ => last_crosses,
+    };
+
+    assert_eq!(order.trigger_type(), Some(trigger_type));
+    assert_eq!(order.order_side(), side);
+    assert_eq!(order.quantity(), Quantity::from("1.000"));
+
+    let (status, filled_qty) = if should_fill {
+        (OrderStatus::Filled, Quantity::from("1.000"))
+    } else {
+        (OrderStatus::Accepted, Quantity::from("0.000"))
+    };
+
+    assert_eq!(order.status(), status);
+    assert_eq!(order.filled_qty(), filled_qty);
+
+    if should_fill && trigger_type == TriggerType::MarkPrice {
+        assert_eq!(order.avg_px(), Some(Price::from(fill_price).as_decimal()));
+
+        let fill = order
+            .events()
+            .iter()
+            .find_map(|event| match event {
+                OrderEventAny::Filled(fill) => Some(fill),
+                _ => None,
+            })
+            .unwrap();
+
+        assert_eq!(fill.ts_event, UnixNanos::from(6_000_000_000));
+    }
+}
+
+#[rstest]
+fn test_native_mark_price_tick_settles_delayed_submission(
+    crypto_perpetual_ethusdt: CryptoPerpetual,
+) {
+    let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt);
+    let instrument_id = instrument.id();
+    let mut engine = native_mark_stop_engine(
+        &instrument,
+        OrderSide::Buy,
+        TriggerType::MarkPrice,
+        false,
+        500_000_000,
+    );
+    let data = vec![
+        quote(instrument_id, "999.00", "1001.00", 1_000_000_000),
+        Data::MarkPrice(MarkPriceUpdate::new(
+            instrument_id,
+            Price::from("1000.00"),
+            2_000_000_000.into(),
+            2_000_000_000.into(),
+        )),
+        Data::MarkPrice(MarkPriceUpdate::new(
+            instrument_id,
+            Price::from("1020.00"),
+            3_000_000_000.into(),
+            3_000_000_000.into(),
+        )),
+    ];
+    engine.add_data(data, None, true, true).unwrap();
+    engine.run(None, None, None, false).unwrap();
+    let cache = engine.kernel().cache.borrow();
+    let orders = cache.orders(None, Some(&instrument_id), None, None, None);
+
+    let [order] = orders.as_slice() else {
+        panic!("expected one mark stop");
+    };
+
+    let accepted = order
+        .events()
+        .iter()
+        .find_map(|event| match event {
+            OrderEventAny::Accepted(event) => Some(event),
+            _ => None,
+        })
+        .unwrap();
+
+    assert_eq!(accepted.ts_event, UnixNanos::from(2_000_000_000));
+    assert_eq!(order.status(), OrderStatus::Filled);
+    assert_eq!(order.filled_qty(), Quantity::from("1.000"));
+    assert_eq!(order.avg_px(), Some(dec!(1001)));
+}
+
+fn native_mark_stop_engine(
+    instrument: &InstrumentAny,
+    side: OrderSide,
+    trigger_type: TriggerType,
+    trade_execution: bool,
+    insert_latency: u64,
+) -> BacktestEngine {
+    let instrument_id = instrument.id();
+    let mut engine = BacktestEngine::new(BacktestEngineConfig::default()).unwrap();
+    engine
+        .add_venue(
+            SimulatedVenueConfig::builder()
+                .venue(instrument_id.venue)
+                .oms_type(OmsType::Netting)
+                .account_type(AccountType::Margin)
+                .book_type(BookType::L1_MBP)
+                .starting_balances(vec![Money::from("100_000 USDT")])
+                .trade_execution(trade_execution)
+                .latency_model(LatencyModelHandle::new(StaticLatencyModel::new(
+                    DurationNanos::default(),
+                    DurationNanos::new(insert_latency),
+                    DurationNanos::default(),
+                    DurationNanos::default(),
+                )))
+                .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into())
+                .build()
+                .unwrap(),
+        )
+        .unwrap();
+    engine.add_instrument(instrument).unwrap();
+    engine
+        .add_strategy(NativeMarkStop {
+            core: StrategyCore::new(StrategyConfig::default()),
+            instrument_id,
+            side,
+            trigger_type,
+            submitted: false,
+        })
+        .unwrap();
+
+    engine
 }

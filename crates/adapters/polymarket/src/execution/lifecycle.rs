@@ -377,6 +377,7 @@ impl PolymarketExecutionClient {
                 Some(venue_order_id),
                 "Polymarket modification was interrupted during shutdown",
                 ts_event,
+                None,
             );
 
             if let Some(cancel_ts) = cancel_ts
@@ -404,6 +405,7 @@ impl PolymarketExecutionClient {
             self.clock,
             self.config.signature_type,
             &self.collateral_locks,
+            &self.settlement,
         )
         .await
     }
@@ -519,11 +521,12 @@ impl PolymarketExecutionClient {
                             let http = http_client.clone();
                             let emit = emitter.clone();
                             let reservations = collateral_locks.clone();
+                            let settlement = settlement.clone();
                             let session_spawner = session_spawner.clone();
 
                             let future = async move {
                                 match fetch_and_emit_account_state(
-                                    &http, &emit, clock, signature_type, &reservations,
+                                    &http, &emit, clock, signature_type, &reservations, &settlement,
                                 )
                                 .await
                                 {
@@ -557,8 +560,9 @@ impl PolymarketExecutionClient {
                         let http = http_client.clone();
                         let emit = emitter.clone();
                         let reservations = collateral_locks.clone();
+                        let settlement = settlement.clone();
                         let future = async move {
-                            match fetch_and_emit_account_state(&http, &emit, clock, signature_type, &reservations)
+                            match fetch_and_emit_account_state(&http, &emit, clock, signature_type, &reservations, &settlement)
                                 .await
                             {
                                 Ok(()) => {
@@ -628,9 +632,7 @@ impl PolymarketExecutionClient {
     }
 
     pub(super) fn get_neg_risk(&self, instrument_id: &InstrumentId) -> bool {
-        self.neg_risk_index
-            .get_cloned(instrument_id)
-            .unwrap_or(false)
+        Self::get_neg_risk_from_snapshot(&self.neg_risk_index.load(), instrument_id)
     }
 
     /// Spawns the task that performs targeted terminal REST reads for quarantined and
@@ -711,6 +713,7 @@ impl PolymarketExecutionClient {
                         clock,
                         signature_type,
                         &collateral_locks,
+                        &settlement,
                     )
                     .await
                 {
@@ -954,12 +957,12 @@ impl PolymarketExecutionClient {
             .http_client
             .get_version()
             .await
-            .context("failed to query Polymarket CLOB protocol version")?
+            .context("failed to query Polymarket CLOB service version")?
             .version;
 
         if version != SUPPORTED_CLOB_VERSION {
             anyhow::bail!(
-                "Polymarket CLOB protocol version {version} is unsupported; adapter supports V2 only"
+                "Polymarket CLOB service version {version} is unsupported; expected service version {SUPPORTED_CLOB_VERSION}"
             );
         }
 
@@ -1843,7 +1846,10 @@ mod tests {
         live::runner::set_exec_event_sender,
         messages::{
             ExecutionEvent,
-            execution::{CancelAllOrders, GenerateFillReportsBuilder},
+            execution::{
+                CancelAllOrders, GenerateFillReportsBuilder, GenerateOrderStatusReportBuilder,
+                GenerateOrderStatusReportsBuilder, ModifyOrder, SubmitOrder, SubmitOrderList,
+            },
         },
         msgbus::{publish_order_event, publish_position_event, switchboard},
     };
@@ -1855,18 +1861,20 @@ mod tests {
             TimeInForce,
         },
         events::{
-            OrderEventAny, PositionClosed, PositionEvent,
+            OrderEventAny, OrderInitialized, PositionClosed, PositionEvent,
             order::spec::{
                 OrderFillVoidedSpec, OrderFilledSpec, OrderPendingCancelSpec,
                 OrderPendingUpdateSpec, OrderUpdatedSpec,
             },
         },
         identifiers::{
-            AccountId, ClientId, ClientOrderId, InstrumentId, StrategyId, Symbol, TradeId,
-            TraderId, VenueOrderId,
+            AccountId, ClientId, ClientOrderId, InstrumentId, OrderListId, StrategyId, Symbol,
+            TradeId, TraderId, VenueOrderId,
         },
         instruments::stubs::binary_option,
-        orders::{LimitOrder, Order, OrderAny, OrderTestBuilder, stubs::TestOrderEventStubs},
+        orders::{
+            LimitOrder, Order, OrderAny, OrderList, OrderTestBuilder, stubs::TestOrderEventStubs,
+        },
         position::Position,
         types::{Currency, Money, Price, Price as ModelPrice, Quantity, Quantity as ModelQuantity},
     };
@@ -1879,7 +1887,9 @@ mod tests {
         execution::settlement::{
             AdmittedLeg,
             admission::AdmittedTrade,
-            registry::tests::{force_client_fault, leg_application, trade_hard_fault},
+            registry::tests::{
+                force_client_fault, force_trade_fault, leg_application, trade_hard_fault,
+            },
             state::LegApplication,
         },
         factories::spawn_rejecting_proxy,
@@ -3120,7 +3130,10 @@ mod tests {
         let topic = msgbus::switchboard::get_event_order_topic(order.strategy_id());
 
         let apply = |client: &PolymarketExecutionClient, total: &str, now: u64| {
-            let ticket = client.collateral_locks.lock().begin_refresh();
+            let ticket = client
+                .collateral_locks
+                .lock()
+                .begin_refresh(&client.settlement);
             match client
                 .collateral_locks
                 .lock()
@@ -3198,7 +3211,10 @@ mod tests {
         let topic = msgbus::switchboard::get_event_order_topic(order.strategy_id());
 
         let apply = |client: &PolymarketExecutionClient, total: &str, now: u64| {
-            let ticket = client.collateral_locks.lock().begin_refresh();
+            let ticket = client
+                .collateral_locks
+                .lock()
+                .begin_refresh(&client.settlement);
             match client
                 .collateral_locks
                 .lock()
@@ -3229,7 +3245,10 @@ mod tests {
         );
         cache.borrow_mut().update_order(&filled).unwrap();
         publish_order_event(topic, &filled);
-        let stale = client.collateral_locks.lock().begin_refresh();
+        let stale = client
+            .collateral_locks
+            .lock()
+            .begin_refresh(&client.settlement);
 
         client.load_orders_from_cache();
         let discarded = client
@@ -3282,7 +3301,10 @@ mod tests {
             }],
         });
 
-        let ticket = client.collateral_locks.lock().begin_refresh();
+        let ticket = client
+            .collateral_locks
+            .lock()
+            .begin_refresh(&client.settlement);
         client
             .collateral_locks
             .lock()
@@ -3307,7 +3329,10 @@ mod tests {
             msgbus::switchboard::get_event_order_topic(StrategyId::from("S-001")),
             &filled,
         );
-        let ticket = client.collateral_locks.lock().begin_refresh();
+        let ticket = client
+            .collateral_locks
+            .lock()
+            .begin_refresh(&client.settlement);
 
         let after_fill = match client
             .collateral_locks
@@ -3362,7 +3387,10 @@ mod tests {
             .settlement
             .build_fill_report("REPORT-BUY", &leg, UnixNanos::from(1))
             .unwrap();
-        let ticket = client.collateral_locks.lock().begin_refresh();
+        let ticket = client
+            .collateral_locks
+            .lock()
+            .begin_refresh(&client.settlement);
         client
             .collateral_locks
             .lock()
@@ -3392,7 +3420,10 @@ mod tests {
             msgbus::switchboard::get_event_order_topic(StrategyId::from("S-001")),
             &filled,
         );
-        let ticket = client.collateral_locks.lock().begin_refresh();
+        let ticket = client
+            .collateral_locks
+            .lock()
+            .begin_refresh(&client.settlement);
 
         let after_fill = match client
             .collateral_locks
@@ -3432,7 +3463,10 @@ mod tests {
             .add_instrument(instrument.clone())
             .unwrap();
         client.ensure_order_event_subscription();
-        let ticket = client.collateral_locks.lock().begin_refresh();
+        let ticket = client
+            .collateral_locks
+            .lock()
+            .begin_refresh(&client.settlement);
 
         let baseline = match client
             .collateral_locks
@@ -3462,7 +3496,10 @@ mod tests {
             msgbus::switchboard::get_event_order_topic(StrategyId::from("S-001")),
             &fill,
         );
-        let ticket = client.collateral_locks.lock().begin_refresh();
+        let ticket = client
+            .collateral_locks
+            .lock()
+            .begin_refresh(&client.settlement);
 
         let after_sell = match client
             .collateral_locks
@@ -3687,7 +3724,10 @@ mod tests {
 
         client.reset_client();
 
-        let ticket = client.collateral_locks.lock().begin_refresh();
+        let ticket = client
+            .collateral_locks
+            .lock()
+            .begin_refresh(&client.settlement);
 
         let balance = match client
             .collateral_locks
@@ -3834,6 +3874,115 @@ mod tests {
     }
 
     #[rstest]
+    #[tokio::test]
+    async fn trade_fault_blocks_submissions_and_modifies_but_keeps_cancellation_available() {
+        let (mut client, cache) = test_client();
+        let instrument = test_binary_option("FAULT", false, false);
+        let instrument_id = instrument.id();
+
+        let order = {
+            let mut cache = cache.borrow_mut();
+            cache.add_instrument(instrument).unwrap();
+            cache_accepted_open_order(&mut cache, instrument_id)
+        };
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        client.emitter.set_sender(tx);
+        client.core.set_connected();
+        force_trade_fault(&client.settlement, "fault-trade", "correction declined");
+        let expected = "Polymarket submissions for account POLYMARKET-001 are blocked until restart: settlement trade fault-trade is hard-faulted: correction declined";
+        let submit = SubmitOrder::from_order(
+            &order,
+            order.trader_id(),
+            None,
+            None,
+            UUID4::new(),
+            UnixNanos::default(),
+        );
+        let submit_error = client.submit_order(submit).unwrap_err().to_string();
+
+        let list = OrderList::new(
+            OrderListId::from("LIST-001"),
+            instrument_id,
+            order.strategy_id(),
+            vec![order.client_order_id()],
+            UnixNanos::default(),
+        );
+
+        let submit_list = SubmitOrderList::new(
+            order.trader_id(),
+            None,
+            order.strategy_id(),
+            list,
+            vec![OrderInitialized::from(&order)],
+            None,
+            None,
+            None,
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+        );
+        let batch_error = client
+            .submit_order_list(submit_list)
+            .unwrap_err()
+            .to_string();
+
+        let modify = ModifyOrder::new(
+            order.trader_id(),
+            None,
+            order.strategy_id(),
+            instrument_id,
+            order.client_order_id(),
+            order.venue_order_id(),
+            None,
+            Some(Price::from("0.60")),
+            None,
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+        );
+        let cause = modify.command_id;
+        client.modify_order(modify).unwrap();
+        let rejected = rx.try_recv().unwrap();
+
+        let ExecutionEvent::Order(OrderEventAny::ModifyDenied(rejected)) = rejected else {
+            panic!("Expected ModifyDenied, was {rejected:?}");
+        };
+
+        assert_eq!(rejected.causation_id, Some(cause));
+
+        let cancel = CancelAllOrders::new(
+            order.trader_id(),
+            None,
+            order.strategy_id(),
+            InstrumentId::from("MISSING.POLYMARKET"),
+            None,
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+        );
+        let cancel_error = client.cancel_all_orders(cancel).unwrap_err().to_string();
+
+        assert_eq!(submit_error, expected);
+        assert_eq!(batch_error, expected);
+        assert_eq!(rejected.trader_id, order.trader_id());
+        assert_eq!(rejected.strategy_id, order.strategy_id());
+        assert_eq!(rejected.instrument_id, instrument_id);
+        assert_eq!(rejected.client_order_id, order.client_order_id());
+        assert_eq!(rejected.venue_order_id, order.venue_order_id());
+        assert_eq!(rejected.account_id, Some(client.core.account_id));
+        assert_eq!(rejected.reason, expected);
+        assert_eq!(
+            cancel_error,
+            "Cannot cancel all orders: instrument not found in cache for MISSING.POLYMARKET"
+        );
+        assert!(client.is_connected());
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[rstest]
     fn client_fault_refuses_commands_and_reports_disconnected() {
         let (client, _cache) = test_client();
         client.core.set_connected();
@@ -3883,9 +4032,22 @@ mod tests {
             .ts_init(UnixNanos::default())
             .build()
             .unwrap();
+        let order_reports_cmd = GenerateOrderStatusReportsBuilder::default()
+            .ts_init(UnixNanos::default())
+            .open_only(false)
+            .build()
+            .unwrap();
+        let order_report_cmd = GenerateOrderStatusReportBuilder::default()
+            .ts_init(UnixNanos::default())
+            .build()
+            .unwrap();
 
         let mass_status = client.generate_mass_status(None).await;
         let fill_reports = client.generate_fill_reports(fill_reports_cmd).await;
+        let order_reports = client
+            .generate_order_status_reports(&order_reports_cmd)
+            .await;
+        let order_report = client.generate_order_status_report(&order_report_cmd).await;
 
         assert_eq!(
             mass_status.unwrap_err().to_string(),
@@ -3896,6 +4058,16 @@ mod tests {
             fill_reports.unwrap_err().to_string(),
             "cannot generate fill reports: Polymarket settlement registry holds 1 record(s) \
              with unresolved evidence"
+        );
+        assert_eq!(
+            order_reports.unwrap_err().to_string(),
+            "cannot generate order status reports: Polymarket settlement registry holds 1 \
+             record(s) with unresolved evidence"
+        );
+        assert_eq!(
+            order_report.unwrap_err().to_string(),
+            "cannot generate order status report: Polymarket settlement registry holds 1 \
+             record(s) with unresolved evidence"
         );
     }
 

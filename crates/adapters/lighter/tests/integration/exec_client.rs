@@ -58,6 +58,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
+use base64::{Engine, engine::general_purpose::STANDARD};
 use futures_util::{SinkExt, StreamExt};
 use nautilus_common::{
     cache::Cache,
@@ -79,21 +80,10 @@ use nautilus_common::{
 };
 use nautilus_core::{DurationNanos, UUID4, UnixNanos};
 use nautilus_execution::engine::ExecutionEngine;
-use nautilus_lighter::{
-    common::{
-        consts::{
-            LIGHTER_NAUTILUS_INTEGRATOR_ACCOUNT_INDEX, LIGHTER_TESTNET_CHAIN_ID, LIGHTER_VENUE,
-        },
-        enums::{LighterDeployment, LighterEnvironment},
-    },
-    config::LighterExecutionClientConfig,
-    execution::LighterExecutionClient,
-    signing::tx::{
-        CancelOrderTxInfo, CreateGroupedOrdersTxInfo, CreateOrderTxInfo, L2TxAttributes,
-        ModifyOrderTxInfo, OrderInfo, TxContext, compute_tx_hash,
-    },
+use nautilus_live::{
+    ExecutionClientCore, SocketReconnectRegistry, SocketReconnectRequestOutcome,
+    manager::{ExecutionManager, ExecutionManagerConfig},
 };
-use nautilus_live::{ExecutionClientCore, SocketReconnectRegistry, SocketReconnectRequestOutcome};
 use nautilus_model::{
     accounts::{AccountAny, MarginAccount},
     enums::{
@@ -110,10 +100,34 @@ use nautilus_model::{
     reports::{FillReport, OrderStatusReport, PositionStatusReport},
     types::{AccountBalance, Currency, Money, Price, Quantity},
 };
+use nautilus_network::ratelimiter::{RateLimiter, quota::Quota};
 use rstest::rstest;
 use rust_decimal::Decimal;
 use serde_json::{Value, json};
 use ustr::Ustr;
+
+use crate::{
+    common::{
+        consts::{
+            LIGHTER_NAUTILUS_INTEGRATOR_ACCOUNT_INDEX,
+            LIGHTER_ROBINHOOD_NAUTILUS_INTEGRATOR_ACCOUNT_INDEX, LIGHTER_TESTNET_CHAIN_ID,
+            LIGHTER_VENUE, SCHEDULED_CANCEL_REQUEST_TIMEOUT,
+        },
+        credential::Credential,
+        enums::{LighterDeployment, LighterEnvironment},
+    },
+    config::LighterExecutionClientConfig,
+    execution::LighterExecutionClient,
+    signing::{
+        field::Fp5,
+        schnorr::Signature,
+        tx::{
+            CancelAllOrdersTxInfo, CancelOrderTxInfo, CreateGroupedOrdersTxInfo, CreateOrderTxInfo,
+            L2TxAttributes, ModifyOrderTxInfo, OrderInfo, TxContext, compute_tx_hash,
+        },
+    },
+    websocket::dispatch::PendingOrderAction,
+};
 
 const PRIVATE_KEY_HEX: &str =
     "0b8e0f63c24d8baacd9d29ad4e9a4b73c4a8d2bb8b16dc4fa9d7c2e1d3a8b1f0e8d3a4c5b6e7f001";
@@ -499,7 +513,7 @@ async fn tx(
         };
 
         transactions.into_iter().find(|(kind, info)| {
-            matches!(kind, 14 | 15 | 17)
+            matches!(kind, 14..=17)
                 && order_tx_hash(*kind, info, state.chain_id.load(Ordering::Relaxed)) == *tx_hash
         })
     });
@@ -525,7 +539,12 @@ async fn tx(
     let Some(mut body) = (if keyed.is_some() {
         keyed
     } else {
-        state.tx_responses.lock().await.pop_front()
+        state
+            .tx_responses
+            .lock()
+            .await
+            .pop_front()
+            .or_else(|| (tx_type == 16).then(|| json!({"status": 2,"event_info":""})))
     }) else {
         return (
             StatusCode::BAD_REQUEST,
@@ -533,6 +552,10 @@ async fn tx(
         )
             .into_response();
     };
+
+    if body["code"].as_i64().is_some_and(|code| code != 200) {
+        return (StatusCode::OK, body.to_string()).into_response();
+    }
 
     let object = body
         .as_object_mut()
@@ -625,7 +648,9 @@ async fn handle_ws_upgrade(
 /// Build the typed `subscribed/account_all_*` payload the venue emits after
 /// each account subscribe ack. Returns `None` for non-account channels.
 fn account_subscribed_frame(channel: &str) -> Option<Value> {
-    if channel.starts_with("account_all_orders:") {
+    if channel.starts_with("account_tx:") {
+        Some(json!({"type": "subscribed/account_tx", "channel": channel}))
+    } else if channel.starts_with("account_all_orders:") {
         Some(json!({
             "type": "subscribed/account_all_orders",
             "channel": channel,
@@ -984,6 +1009,7 @@ fn build_config(addr: SocketAddr) -> LighterExecutionClientConfig {
         sendtx_quota_per_min: None,
         transport_backend: Default::default(),
         use_gtd: true,
+        scheduled_cancel_timeout_secs: None,
     }
 }
 
@@ -1083,6 +1109,7 @@ fn build_client(
 
 fn build_client_mainnet(
     addr: SocketAddr,
+    deployment: LighterDeployment,
 ) -> (
     LighterExecutionClient,
     tokio::sync::mpsc::UnboundedReceiver<ExecutionEvent>,
@@ -1090,19 +1117,7 @@ fn build_client_mainnet(
 ) {
     let mut config = build_config(addr);
     config.environment = LighterEnvironment::Mainnet;
-    build_client_with(config)
-}
-
-fn build_client_robinhood_mainnet(
-    addr: SocketAddr,
-) -> (
-    LighterExecutionClient,
-    tokio::sync::mpsc::UnboundedReceiver<ExecutionEvent>,
-    Rc<RefCell<Cache>>,
-) {
-    let mut config = build_config(addr);
-    config.environment = LighterEnvironment::Mainnet;
-    config.deployment = LighterDeployment::Robinhood;
+    config.deployment = deployment;
     config.venue = Some(*LIGHTER_VENUE);
     build_client_with(config)
 }
@@ -1259,6 +1274,7 @@ async fn assert_local_order_denied_once(
                     "UNSUPPORTED_ORDER_LIST:",
                     "UNSUPPORTED_ORDER_TYPE:",
                     "UNSUPPORTED_TIME_IN_FORCE:",
+                    "UNSUPPORTED_QUOTE_QUANTITY",
                     "VALIDATION_FAILED:",
                 ]
                 .iter()
@@ -1573,6 +1589,16 @@ fn order_tx_hash(kind: u8, info: &Value, chain_id: u32) -> String {
     };
 
     let hash = match kind {
+        16 => compute_tx_hash(
+            &CancelAllOrdersTxInfo {
+                context,
+                time_in_force: info["TimeInForce"].as_u64().unwrap() as u8,
+                scheduled_time_ms: info["Time"].as_i64().unwrap(),
+                skip_nonce: 0,
+            },
+            chain_id,
+        )
+        .unwrap(),
         14 => compute_tx_hash(
             &CreateOrderTxInfo {
                 context,
@@ -1753,6 +1779,7 @@ async fn test_connect_disconnect_lifecycle() {
     assert!(channels.iter().any(|c| c == &"account_all_positions/12345"));
     assert!(channels.iter().any(|c| c == &"account_all_assets/12345"));
     assert!(channels.iter().any(|c| c == &"user_stats/12345"));
+    assert!(channels.iter().any(|c| c == &"account_tx/12345"));
 
     // Subscribe frames must carry the L2 auth token; the data-client tests
     // pin the token shape via the REST `auth=` parameter, here the same
@@ -1985,10 +2012,15 @@ async fn connect_reports_socket_state_on_the_user_streams_endpoint() {
 #[tokio::test(flavor = "multi_thread")]
 async fn connect_submits_l2_only_integrator_auto_approval_for_all_account_tiers(
     #[case] account_type: Option<u8>,
+    #[values(
+        (LighterDeployment::Lighter, 723_813),
+        (LighterDeployment::Robinhood, 17_725)
+    )]
+    attribution: (LighterDeployment, u64),
 ) {
     let (addr, state) = start_server().await;
     *state.account_type.lock().await = account_type;
-    let (mut client, _rx, _cache) = build_client_mainnet(addr);
+    let (mut client, _rx, _cache) = build_client_mainnet(addr, attribution.0);
 
     client.connect().await.expect("connect");
 
@@ -2000,10 +2032,7 @@ async fn connect_submits_l2_only_integrator_auto_approval_for_all_account_tiers(
     let tx_info = &approvals[0]["tx_info"];
     assert_eq!(tx_info["AccountIndex"], TEST_ACCOUNT_INDEX);
     assert_eq!(tx_info["ApiKeyIndex"], TEST_API_KEY_INDEX);
-    assert_eq!(
-        tx_info["IntegratorAccountIndex"],
-        LIGHTER_NAUTILUS_INTEGRATOR_ACCOUNT_INDEX,
-    );
+    assert_eq!(tx_info["IntegratorAccountIndex"], attribution.1);
     assert_eq!(tx_info["MaxPerpsTakerFee"], 0);
     assert_eq!(tx_info["MaxPerpsMakerFee"], 0);
     assert_eq!(tx_info["MaxSpotTakerFee"], 0);
@@ -2022,22 +2051,30 @@ async fn connect_submits_l2_only_integrator_auto_approval_for_all_account_tiers(
             .contains(&approval_expiry),
         "ApprovalExpiry must use the maximum five-year TTL",
     );
-    assert_eq!(state.referral_use_calls.load(Ordering::Relaxed), 0);
+    assert_eq!(
+        state.referral_use_calls.load(Ordering::Relaxed),
+        usize::from(account_type.is_some()),
+    );
 
     client.disconnect().await.expect("disconnect");
 }
 
 #[rstest]
+#[case::lighter(LighterDeployment::Lighter, "NAUTILUS")]
+#[case::robinhood(LighterDeployment::Robinhood, "NAUTILUS")]
 #[tokio::test(flavor = "multi_thread")]
-async fn connect_applies_robinhood_referral_on_each_process_start() {
+async fn connect_applies_referral_on_each_process_start(
+    #[case] deployment: LighterDeployment,
+    #[case] referral_code: &str,
+) {
     let (addr, state) = start_server().await;
-    let (mut first_client, _rx, _cache) = build_client_robinhood_mainnet(addr);
+    let (mut first_client, _rx, _cache) = build_client_mainnet(addr, deployment);
     let expected_request = std::collections::HashMap::from([
         (
             "l1_address".to_string(),
             "0x0000000000000000000000000000000000000000".to_string(),
         ),
-        ("referral_code".to_string(), "NAUTILUS".to_string()),
+        ("referral_code".to_string(), referral_code.to_string()),
     ]);
 
     first_client.connect().await.expect("first connect");
@@ -2048,13 +2085,13 @@ async fn connect_applies_robinhood_referral_on_each_process_start() {
         state.referral_use_requests().await,
         vec![expected_request.clone()],
     );
-    assert_eq!(state.maker_only_calls.load(Ordering::Relaxed), 0);
-    assert!(state.rest_send_txs().await.is_empty());
+    assert_eq!(state.maker_only_calls.load(Ordering::Relaxed), 1);
+    assert_eq!(state.rest_send_txs().await.len(), 1);
 
     first_client.disconnect().await.expect("first disconnect");
     drop(first_client);
 
-    let (mut second_client, _rx, _cache) = build_client_robinhood_mainnet(addr);
+    let (mut second_client, _rx, _cache) = build_client_mainnet(addr, deployment);
     second_client.connect().await.expect("second connect");
 
     assert_eq!(state.referral_use_calls.load(Ordering::Relaxed), 2);
@@ -2063,22 +2100,27 @@ async fn connect_applies_robinhood_referral_on_each_process_start() {
         state.referral_use_requests().await,
         vec![expected_request.clone(), expected_request],
     );
-    assert_eq!(state.maker_only_calls.load(Ordering::Relaxed), 0);
-    assert!(state.rest_send_txs().await.is_empty());
+    assert_eq!(state.maker_only_calls.load(Ordering::Relaxed), 2);
+    assert_eq!(state.rest_send_txs().await.len(), 2);
 
     second_client.disconnect().await.expect("second disconnect");
 }
 
 #[rstest]
+#[case::lighter(LighterDeployment::Lighter)]
+#[case::robinhood(LighterDeployment::Robinhood)]
 #[tokio::test(flavor = "multi_thread")]
-async fn connect_continues_when_robinhood_referral_fails() {
+async fn connect_continues_when_referral_fails(
+    #[case] deployment: LighterDeployment,
+    #[values(20001, 41013)] code: u64,
+) {
     let (addr, state) = start_server().await;
     *state.next_referral_use_response.lock().await = Some(json!({
-        "code": 20001,
+        "code": code,
         "message": "referral unavailable",
     }));
 
-    let (mut client, _rx, _cache) = build_client_robinhood_mainnet(addr);
+    let (mut client, _rx, _cache) = build_client_mainnet(addr, deployment);
 
     client.connect().await.expect("connect");
 
@@ -2122,7 +2164,7 @@ async fn connect_skips_integrator_auto_approval_for_maker_only_api_key() {
         .lock()
         .await
         .push(i64::from(TEST_API_KEY_INDEX));
-    let (mut client, _rx, _cache) = build_client_mainnet(addr);
+    let (mut client, _rx, _cache) = build_client_mainnet(addr, LighterDeployment::Lighter);
 
     client.connect().await.expect("connect");
 
@@ -2142,7 +2184,7 @@ async fn connect_bails_when_integrator_auto_approval_reports_unapproved() {
         "code": 21149,
         "message": "integrator is not approved",
     }));
-    let (mut client, _rx, _cache) = build_client_mainnet(addr);
+    let (mut client, _rx, _cache) = build_client_mainnet(addr, LighterDeployment::Lighter);
 
     let err = client.connect().await.unwrap_err();
     let msg = format!("{err:#}");
@@ -2258,9 +2300,8 @@ async fn connect_clears_prior_position_cache_across_reconnect() {
     state.push_frame(&load_json("ws_account_all_positions_update.json"));
     wait_until_async(
         || {
-            let client_ptr = std::ptr::addr_of!(client);
+            let client = &client;
             async move {
-                let client = unsafe { &*client_ptr };
                 !client
                     .generate_position_status_reports(&GeneratePositionStatusReports::new(
                         UUID4::new(),
@@ -2314,12 +2355,14 @@ mod serial_tests {
     #[rstest]
     fn test_credentialless_paths_in_isolated_environment() {
         for test_name in [
-            "serial_tests::test_connect_without_credentials_fails_fast",
-            "serial_tests::test_submit_order_without_credentials_errors_synchronously",
+            "test_connect_without_credentials_fails_fast",
+            "test_submit_order_without_credentials_errors_synchronously",
         ] {
+            let module = module_path!().split_once("::").unwrap().1;
+            let test_name = format!("{module}::{test_name}");
             let mut command =
                 Command::new(std::env::current_exe().expect("test executable must exist"));
-            command.arg(test_name).arg("--exact").arg("--ignored");
+            command.arg(&test_name).arg("--exact").arg("--ignored");
             for name in LIGHTER_ENV_VARS {
                 command.env_remove(name);
             }
@@ -2327,6 +2370,10 @@ mod serial_tests {
             assert!(
                 output.status.success(),
                 "isolated credentialless case {test_name} failed",
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains("1 passed;"),
+                "isolated credentialless case {test_name} must execute one test",
             );
         }
     }
@@ -2379,39 +2426,63 @@ mod serial_tests {
 }
 
 #[rstest]
-#[case::testnet(LighterEnvironment::Testnet, Some(0), Value::Null)]
+#[case::testnet(
+    LighterDeployment::Lighter,
+    LighterEnvironment::Testnet,
+    Some(0),
+    Value::Null
+)]
 #[case::mainnet_unavailable(
+    LighterDeployment::Lighter,
     LighterEnvironment::Mainnet,
     None,
     json!({"1": LIGHTER_NAUTILUS_INTEGRATOR_ACCOUNT_INDEX}),
 )]
 #[case::mainnet_standard(
+    LighterDeployment::Lighter,
     LighterEnvironment::Mainnet,
     Some(0),
     json!({"1": LIGHTER_NAUTILUS_INTEGRATOR_ACCOUNT_INDEX}),
 )]
 #[case::mainnet_premium(
+    LighterDeployment::Lighter,
     LighterEnvironment::Mainnet,
     Some(1),
     json!({"1": LIGHTER_NAUTILUS_INTEGRATOR_ACCOUNT_INDEX}),
 )]
 #[case::mainnet_plus(
+    LighterDeployment::Lighter,
     LighterEnvironment::Mainnet,
     Some(2),
     json!({"1": LIGHTER_NAUTILUS_INTEGRATOR_ACCOUNT_INDEX}),
 )]
 #[case::mainnet_builder(
+    LighterDeployment::Lighter,
     LighterEnvironment::Mainnet,
     Some(3),
     json!({"1": LIGHTER_NAUTILUS_INTEGRATOR_ACCOUNT_INDEX}),
 )]
 #[case::mainnet_unknown(
+    LighterDeployment::Lighter,
     LighterEnvironment::Mainnet,
     Some(7),
     json!({"1": LIGHTER_NAUTILUS_INTEGRATOR_ACCOUNT_INDEX}),
 )]
+#[case::robinhood_mainnet(
+    LighterDeployment::Robinhood,
+    LighterEnvironment::Mainnet,
+    Some(0),
+    json!({"1": LIGHTER_ROBINHOOD_NAUTILUS_INTEGRATOR_ACCOUNT_INDEX}),
+)]
+#[case::robinhood_testnet(
+    LighterDeployment::Robinhood,
+    LighterEnvironment::Testnet,
+    Some(0),
+    Value::Null
+)]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_submit_limit_order_emits_submitted_and_signs_sendtx(
+    #[case] deployment: LighterDeployment,
     #[case] environment: LighterEnvironment,
     #[case] account_type: Option<u8>,
     #[case] mut expected_attributes: Value,
@@ -2436,6 +2507,9 @@ async fn test_submit_limit_order_emits_submitted_and_signs_sendtx(
     *state.account_type.lock().await = account_type;
     let mut config = build_config(addr);
     config.environment = environment;
+    config.deployment = deployment;
+    config.venue = Some(*LIGHTER_VENUE);
+    state.chain_id.store(config.chain_id(), Ordering::Relaxed);
     let (mut client, mut rx, cache) = build_client_with(config);
     client.connect().await.expect("connect");
 
@@ -2485,13 +2559,21 @@ async fn test_submit_limit_order_emits_submitted_and_signs_sendtx(
 }
 
 #[rstest]
-#[case::testnet(LighterEnvironment::Testnet, Value::Null)]
+#[case::testnet(LighterDeployment::Lighter, LighterEnvironment::Testnet, Value::Null)]
 #[case::mainnet_standard(
+    LighterDeployment::Lighter,
     LighterEnvironment::Mainnet,
     json!({"1": LIGHTER_NAUTILUS_INTEGRATOR_ACCOUNT_INDEX}),
 )]
+#[case::robinhood_mainnet(
+    LighterDeployment::Robinhood,
+    LighterEnvironment::Mainnet,
+    json!({"1": LIGHTER_ROBINHOOD_NAUTILUS_INTEGRATOR_ACCOUNT_INDEX}),
+)]
+#[case::robinhood_testnet(LighterDeployment::Robinhood, LighterEnvironment::Testnet, Value::Null)]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_submit_order_list_shares_correlated_transport_batch(
+    #[case] deployment: LighterDeployment,
     #[case] environment: LighterEnvironment,
     #[case] mut expected_attributes: Value,
     #[values(false, true)] override_modes: bool,
@@ -2514,6 +2596,8 @@ async fn test_submit_order_list_shares_correlated_transport_batch(
     let (addr, state) = start_server().await;
     let mut config = build_config(addr);
     config.environment = environment;
+    config.deployment = deployment;
+    config.venue = Some(*LIGHTER_VENUE);
     state.chain_id.store(config.chain_id(), Ordering::Relaxed);
     let (mut client, mut rx, cache) = build_client_with(config);
     client.connect().await.expect("connect");
@@ -2959,7 +3043,7 @@ async fn test_submit_fok_limit_order_denies_once_without_error() {
 #[rstest]
 #[case::quote_quantity(
     make_limit_order_with_quantity_options("O-LIMIT-QUOTE-QTY", true, None),
-    "quote_quantity"
+    "UNSUPPORTED_QUOTE_QUANTITY"
 )]
 #[case::display_qty(
     make_limit_order_with_quantity_options(
@@ -2967,12 +3051,12 @@ async fn test_submit_fok_limit_order_denies_once_without_error() {
         false,
         Some(Quantity::from("0.0010")),
     ),
-    "display_qty"
+    "VALIDATION_FAILED: Lighter orders do not support display_qty iceberg instructions"
 )]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_submit_unsupported_quantity_options_deny_locally(
     #[case] order: OrderAny,
-    #[case] reason_part: &str,
+    #[case] expected_reason: &str,
 ) {
     let (addr, state) = start_server().await;
     let (client, mut rx, cache) = build_client(addr);
@@ -2981,7 +3065,8 @@ async fn test_submit_unsupported_quantity_options_deny_locally(
     client
         .submit_order(submit_command(&order))
         .expect("local denial should not return Err to the engine");
-    assert_local_order_denied_once(&mut rx, &state, reason_part).await;
+    let reason = assert_local_order_denied_once(&mut rx, &state, expected_reason).await;
+    assert_eq!(reason, expected_reason);
 }
 
 #[rstest]
@@ -3532,6 +3617,208 @@ async fn test_cancel_order_signs_cancel_sendtx() {
 }
 
 #[rstest]
+#[case::acknowledged(false)]
+#[case::venue_rejected(true)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_cancel_already_canceled_preserves_terminal_state(#[case] rejected: bool) {
+    let (addr, state) = start_server().await;
+    let (mut client, mut rx, cache) = build_client(addr);
+    client.connect().await.expect("connect");
+
+    let id = ClientOrderId::from("O-CANCEL-TERMINAL");
+    let (index, venue_id) = seed_open_order(
+        &client,
+        &cache,
+        &state,
+        &mut rx,
+        id.as_str(),
+        "281476929510113",
+    )
+    .await;
+    let pending = OrderEventAny::PendingCancel(OrderPendingCancel::new(
+        trader_id(),
+        strategy_id(),
+        eth_perp_id(),
+        id,
+        Some(account_id()),
+        UUID4::new(),
+        UnixNanos::default(),
+        UnixNanos::default(),
+        false,
+        Some(venue_id),
+    ));
+    cache.borrow_mut().update_order(&pending).unwrap();
+    client
+        .cancel_order(CancelOrder::new(
+            trader_id(),
+            Some(client_id()),
+            strategy_id(),
+            eth_perp_id(),
+            id,
+            Some(venue_id),
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+        ))
+        .expect("initial cancel");
+    await_send_tx_count(&state, 2).await;
+    let frames = state.send_txs().await;
+    let create_nonce = send_tx_info(&frames[0])["Nonce"].as_i64().unwrap();
+    let cancel_nonce = send_tx_info(&frames[1])["Nonce"].as_i64().unwrap();
+    wait_until_async(
+        || async {
+            client
+                .dispatch
+                .nonce_manager
+                .baseline(TEST_ACCOUNT_INDEX as i64, TEST_API_KEY_INDEX)
+                == Some(cancel_nonce)
+        },
+        Duration::from_secs(2),
+    )
+    .await;
+
+    let mut entry = account_all_orders_open_entry(
+        index,
+        venue_id.as_str(),
+        &index.to_string(),
+        TEST_ORDER_NONCE,
+    );
+    entry["status"] = json!("canceled");
+    entry["remaining_base_amount"] = json!("0.0000");
+    state.push_frame(&json!({
+        "type": "update/account_all_orders",
+        "channel": format!("account_all_orders:{TEST_ACCOUNT_INDEX}"),
+        "orders": {"0": [entry]},
+    }));
+    let canceled = next_order_event(&mut rx, Duration::from_secs(2))
+        .await
+        .expect("OrderCanceled");
+
+    let OrderEventAny::Canceled(event) = &canceled else {
+        panic!("expected OrderCanceled, was {canceled:?}");
+    };
+
+    assert_eq!(event.trader_id, trader_id());
+    assert_eq!(event.strategy_id, strategy_id());
+    assert_eq!(event.instrument_id, eth_perp_id());
+    assert_eq!(event.client_order_id, id);
+    assert_eq!(event.venue_order_id, Some(venue_id));
+    assert_eq!(event.account_id, Some(account_id()));
+    cache.borrow_mut().update_order(&canceled).unwrap();
+    let terminal = cache.borrow().order(&id).unwrap().clone();
+    assert_eq!(terminal.status(), OrderStatus::Canceled);
+    assert!(!terminal.is_pending_cancel());
+
+    let mut expected_nonce = cancel_nonce + 1;
+
+    for (offset, reject) in [rejected, false].into_iter().enumerate() {
+        if reject {
+            *state.next_send_tx_ack.lock().await = Some(json!({
+                "type": "jsonapi/sendtx",
+                "code": 21727,
+                "message": "order is not cancelable",
+            }));
+        }
+
+        let command_id = UUID4::new();
+        client
+            .cancel_order(CancelOrder::new(
+                trader_id(),
+                Some(client_id()),
+                strategy_id(),
+                eth_perp_id(),
+                id,
+                Some(venue_id),
+                command_id,
+                UnixNanos::default(),
+                None,
+                None,
+            ))
+            .expect("repeat terminal cancel");
+        await_send_tx_count(&state, offset + 3).await;
+        wait_until_async(
+            || async {
+                let nonce_manager = &client.dispatch.nonce_manager;
+                if reject {
+                    nonce_manager.last_issued(TEST_ACCOUNT_INDEX as i64, TEST_API_KEY_INDEX)
+                        == Some(expected_nonce - 1)
+                } else {
+                    nonce_manager.baseline(TEST_ACCOUNT_INDEX as i64, TEST_API_KEY_INDEX)
+                        == Some(expected_nonce)
+                        && client.dispatch.pending_cancel_nonce(&id)
+                            == Some((client.ws_client.connection_epoch(), expected_nonce))
+                }
+            },
+            Duration::from_secs(2),
+        )
+        .await;
+
+        if reject {
+            let event = next_order_event(&mut rx, Duration::from_secs(2))
+                .await
+                .expect("OrderCancelRejected");
+
+            let OrderEventAny::CancelRejected(event) = event else {
+                panic!("expected OrderCancelRejected, was {event:?}");
+            };
+
+            assert_eq!(event.trader_id, trader_id());
+            assert_eq!(event.strategy_id, strategy_id());
+            assert_eq!(event.instrument_id, eth_perp_id());
+            assert_eq!(event.client_order_id, id);
+            assert_eq!(event.venue_order_id, Some(venue_id));
+            assert_eq!(event.account_id, Some(account_id()));
+            assert_eq!(event.causation_id, Some(command_id));
+            assert_eq!(event.reason, "LIGHTER_21727: order is not cancelable");
+            assert!(!event.reconciliation);
+        }
+
+        let unexpected = tokio::time::timeout(Duration::from_millis(250), async {
+            loop {
+                let event = rx.recv().await.expect("execution event channel");
+                if matches!(event, ExecutionEvent::Order(_) | ExecutionEvent::Report(_)) {
+                    break event;
+                }
+            }
+        })
+        .await;
+
+        assert!(unexpected.is_err(), "unexpected event: {unexpected:?}");
+        assert!(drain_order_and_report_events(&mut rx).is_empty());
+        assert_order_state_unchanged(&cache.borrow().order(&id).unwrap(), &terminal);
+        assert_eq!(
+            client.dispatch.pending_order_action(&id),
+            (!reject).then_some(PendingOrderAction::CancelUnmarked),
+        );
+        assert_eq!(
+            client.dispatch.pending_cancel_identity(&id),
+            (!reject).then_some((
+                command_id,
+                (client.ws_client.connection_epoch(), expected_nonce)
+            )),
+        );
+        assert_eq!(client.dispatch.pending_sendtx_len(), 0);
+        assert_eq!(
+            client
+                .dispatch
+                .resolve_client_order_index_for_venue(index, venue_id),
+            Some(id),
+        );
+        let frames = state.send_txs().await;
+        assert_eq!(send_tx_type(&frames[offset + 2]), 15);
+        let info = send_tx_info(&frames[offset + 2]);
+        assert_eq!(info["MarketIndex"], TEST_MARKET_INDEX);
+        assert_eq!(info["Index"], 281_476_929_510_113_i64);
+        assert_eq!(info["Nonce"], expected_nonce);
+        expected_nonce += i64::from(!reject);
+    }
+
+    assert_eq!(cancel_nonce, create_nonce + 1);
+    client.disconnect().await.expect("disconnect");
+}
+
+#[rstest]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_cancel_order_venue_rejection_emits_cancel_rejected_for_pending_cancel_order() {
     let (addr, state) = start_server().await;
@@ -3606,39 +3893,63 @@ async fn test_cancel_order_venue_rejection_emits_cancel_rejected_for_pending_can
 }
 
 #[rstest]
-#[case::testnet(LighterEnvironment::Testnet, Some(0), Value::Null)]
+#[case::testnet(
+    LighterDeployment::Lighter,
+    LighterEnvironment::Testnet,
+    Some(0),
+    Value::Null
+)]
 #[case::mainnet_unavailable(
+    LighterDeployment::Lighter,
     LighterEnvironment::Mainnet,
     None,
     json!({"1": LIGHTER_NAUTILUS_INTEGRATOR_ACCOUNT_INDEX}),
 )]
 #[case::mainnet_standard(
+    LighterDeployment::Lighter,
     LighterEnvironment::Mainnet,
     Some(0),
     json!({"1": LIGHTER_NAUTILUS_INTEGRATOR_ACCOUNT_INDEX}),
 )]
 #[case::mainnet_premium(
+    LighterDeployment::Lighter,
     LighterEnvironment::Mainnet,
     Some(1),
     json!({"1": LIGHTER_NAUTILUS_INTEGRATOR_ACCOUNT_INDEX}),
 )]
 #[case::mainnet_plus(
+    LighterDeployment::Lighter,
     LighterEnvironment::Mainnet,
     Some(2),
     json!({"1": LIGHTER_NAUTILUS_INTEGRATOR_ACCOUNT_INDEX}),
 )]
 #[case::mainnet_builder(
+    LighterDeployment::Lighter,
     LighterEnvironment::Mainnet,
     Some(3),
     json!({"1": LIGHTER_NAUTILUS_INTEGRATOR_ACCOUNT_INDEX}),
 )]
 #[case::mainnet_unknown(
+    LighterDeployment::Lighter,
     LighterEnvironment::Mainnet,
     Some(7),
     json!({"1": LIGHTER_NAUTILUS_INTEGRATOR_ACCOUNT_INDEX}),
 )]
+#[case::robinhood_mainnet(
+    LighterDeployment::Robinhood,
+    LighterEnvironment::Mainnet,
+    Some(0),
+    json!({"1": LIGHTER_ROBINHOOD_NAUTILUS_INTEGRATOR_ACCOUNT_INDEX}),
+)]
+#[case::robinhood_testnet(
+    LighterDeployment::Robinhood,
+    LighterEnvironment::Testnet,
+    Some(0),
+    Value::Null
+)]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_modify_order_signs_modify_sendtx(
+    #[case] deployment: LighterDeployment,
     #[case] environment: LighterEnvironment,
     #[case] account_type: Option<u8>,
     #[case] expected_attributes: Value,
@@ -3647,6 +3958,9 @@ async fn test_modify_order_signs_modify_sendtx(
     *state.account_type.lock().await = account_type;
     let mut config = build_config(addr);
     config.environment = environment;
+    config.deployment = deployment;
+    config.venue = Some(*LIGHTER_VENUE);
+    state.chain_id.store(config.chain_id(), Ordering::Relaxed);
     let (mut client, _rx, cache) = build_client_with(config);
     client.connect().await.expect("connect");
 
@@ -3694,18 +4008,43 @@ async fn test_modify_order_signs_modify_sendtx(
 }
 
 #[rstest]
-#[case::acknowledged_testnet(false, LighterEnvironment::Testnet, Value::Null)]
-#[case::acknowledged_mainnet(false, LighterEnvironment::Mainnet, json!({"1": LIGHTER_NAUTILUS_INTEGRATOR_ACCOUNT_INDEX}))]
-#[case::venue_rejected(true, LighterEnvironment::Testnet, Value::Null)]
+#[case::acknowledged_testnet(
+    false,
+    LighterDeployment::Lighter,
+    LighterEnvironment::Testnet,
+    Value::Null
+)]
+#[case::acknowledged_mainnet(false, LighterDeployment::Lighter, LighterEnvironment::Mainnet, json!({"1": LIGHTER_NAUTILUS_INTEGRATOR_ACCOUNT_INDEX}))]
+#[case::venue_rejected(
+    true,
+    LighterDeployment::Lighter,
+    LighterEnvironment::Testnet,
+    Value::Null
+)]
+#[case::robinhood_mainnet(
+    false,
+    LighterDeployment::Robinhood,
+    LighterEnvironment::Mainnet,
+    json!({"1": LIGHTER_ROBINHOOD_NAUTILUS_INTEGRATOR_ACCOUNT_INDEX}),
+)]
+#[case::robinhood_testnet(
+    false,
+    LighterDeployment::Robinhood,
+    LighterEnvironment::Testnet,
+    Value::Null
+)]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_batch_modify_orders_shares_transport_and_child_outcomes(
     #[case] rejected: bool,
+    #[case] deployment: LighterDeployment,
     #[case] environment: LighterEnvironment,
     #[case] expected_attributes: Value,
 ) {
     let (addr, state) = start_server().await;
     let mut config = build_config(addr);
     config.environment = environment;
+    config.deployment = deployment;
+    config.venue = Some(*LIGHTER_VENUE);
     state.chain_id.store(config.chain_id(), Ordering::Relaxed);
     let (mut client, mut rx, cache) = build_client_with(config);
     client.connect().await.unwrap();
@@ -4114,6 +4453,422 @@ fn account_all_orders_open_entry(
 
 #[rstest]
 #[tokio::test(flavor = "multi_thread")]
+async fn test_account_cancellation_signs_modes() {
+    let (addr, state) = start_server().await;
+    let (mut client, mut rx, _) = build_client(addr);
+    client.connect().await.unwrap();
+    let now = nautilus_core::time::get_atomic_clock_realtime().get_time_ms();
+    let first = now + 600_123;
+    let replacement = now + 900_456;
+    let hashes = [
+        client.cancel_all_orders_account().await.unwrap(),
+        client.schedule_cancel(Some(first)).await.unwrap(),
+        client.schedule_cancel(Some(replacement)).await.unwrap(),
+        client.schedule_cancel(None).await.unwrap(),
+    ];
+    let frames = state.send_txs().await;
+    assert_eq!(frames.len(), 4);
+
+    for (offset, (frame, (mode, time))) in frames
+        .iter()
+        .zip([(0, 0), (1, first), (1, replacement), (2, 0)])
+        .enumerate()
+    {
+        assert_eq!(send_tx_type(frame), 16);
+        let mut info = send_tx_info(frame);
+        assert_eq!(
+            hashes[offset],
+            order_tx_hash(16, &info, LIGHTER_TESTNET_CHAIN_ID)
+        );
+        let signature = info.as_object_mut().unwrap().remove("Sig").unwrap();
+        let signature: [u8; 80] = STANDARD
+            .decode(signature.as_str().unwrap())
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let signature = Signature::from_le_bytes_reduce(signature);
+
+        let tx = CancelAllOrdersTxInfo {
+            context: TxContext {
+                account_index: TEST_ACCOUNT_INDEX as i64,
+                api_key_index: TEST_API_KEY_INDEX,
+                nonce: TEST_NEXT_NONCE + offset as i64,
+                expired_at: info["ExpiredAt"].as_i64().unwrap(),
+            },
+            time_in_force: mode,
+            scheduled_time_ms: time as i64,
+            skip_nonce: 0,
+        };
+
+        let hash = compute_tx_hash(&tx, LIGHTER_TESTNET_CHAIN_ID).unwrap();
+        let hash = Fp5::try_from_le_bytes(hash).unwrap();
+        let credential =
+            Credential::new(TEST_API_KEY_INDEX, PRIVATE_KEY_HEX, TEST_ACCOUNT_INDEX).unwrap();
+        assert!(
+            credential
+                .private_key()
+                .unwrap()
+                .public_key()
+                .verify(hash, &signature)
+        );
+        let expiry = info
+            .as_object_mut()
+            .unwrap()
+            .remove("ExpiredAt")
+            .unwrap()
+            .as_u64()
+            .unwrap();
+        assert!((now + 300_000..=now + 310_000).contains(&expiry));
+        assert_eq!(
+            info,
+            json!({
+                "AccountIndex": TEST_ACCOUNT_INDEX, "ApiKeyIndex": TEST_API_KEY_INDEX,
+                "TimeInForce": mode, "Time": time, "Nonce": TEST_NEXT_NONCE + offset as i64,
+                "L2TxAttributes": null,
+            })
+        );
+    }
+
+    assert_eq!(state.rest_send_txs().await, Vec::<Value>::new());
+    assert!(
+        next_order_event(&mut rx, Duration::from_millis(50))
+            .await
+            .is_none()
+    );
+    client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[case::past(0)]
+#[case::too_soon(299_000)]
+#[case::too_late(1_296_001_000)]
+#[case::overflow(u64::MAX)]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_account_cancellation_rejects_invalid_deadline_before_nonce(#[case] delay: u64) {
+    let (addr, state) = start_server().await;
+    let (mut client, _, _) = build_client(addr);
+    client.connect().await.unwrap();
+    let now = nautilus_core::time::get_atomic_clock_realtime().get_time_ms();
+
+    let deadline = if delay == 0 {
+        0
+    } else {
+        now.saturating_add(delay)
+    };
+
+    let error = client.schedule_cancel(Some(deadline)).await.unwrap_err();
+
+    let expected = if delay == 0 {
+        "scheduled cancellation is in the past"
+    } else {
+        "scheduled cancellation must be between five minutes and fifteen days ahead"
+    };
+
+    assert_eq!(error.to_string(), expected);
+    assert_eq!(state.rest_send_txs().await, Vec::<Value>::new());
+    client.cancel_all_orders_account().await.unwrap();
+    assert_eq!(
+        send_tx_info(&state.send_txs().await[0])["Nonce"],
+        TEST_NEXT_NONCE
+    );
+    client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[case::pending(1)]
+#[case::pending_final(3)]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_account_cancellation_returns_known_pending_hash(#[case] status: i64) {
+    let (addr, state) = start_server().await;
+    let (mut client, mut rx, _) = build_client(addr);
+    client.connect().await.unwrap();
+    state.tx_responses.lock().await.extend([
+        json!({"code":21500,"message":"transaction not found"}),
+        json!({"status":status,"event_info":""}),
+    ]);
+    let hash = client.schedule_cancel(None).await.unwrap();
+    let frames = state.send_txs().await;
+    assert_eq!(frames.len(), 1);
+    assert_eq!(state.tx_calls.load(Ordering::Relaxed), 2);
+    assert_eq!(
+        hash,
+        order_tx_hash(16, &send_tx_info(&frames[0]), LIGHTER_TESTNET_CHAIN_ID)
+    );
+    assert!(
+        next_order_event(&mut rx, Duration::from_millis(50))
+            .await
+            .is_none()
+    );
+    client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_account_cancellation_invalid_nonce_recovers_before_next_control() {
+    let (addr, state) = start_server().await;
+    let (mut client, mut rx, _) = build_client(addr);
+    client.connect().await.unwrap();
+    state.next_nonce.store(777, Ordering::Release);
+    state.tx_responses_by_nonce.lock().await.insert(
+        TEST_NEXT_NONCE,
+        json!({"code":21500,"message":"transaction not found"}),
+    );
+    *state.next_send_tx_ack.lock().await =
+        Some(json!({"type":"jsonapi/sendtx","code":21104,"message":"invalid nonce"}));
+    assert!(
+        client
+            .schedule_cancel(None)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("confirmation timed out")
+    );
+    client.cancel_all_orders_account().await.unwrap();
+    let frames = state.send_txs().await;
+    assert_eq!(frames.len(), 2);
+    assert_eq!(send_tx_info(&frames[0])["Nonce"], TEST_NEXT_NONCE);
+    assert_eq!(send_tx_info(&frames[1])["Nonce"], 777);
+    assert!(
+        next_order_event(&mut rx, Duration::from_millis(50))
+            .await
+            .is_none()
+    );
+    client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[case::failed(0, "rejected control", Some("rejected control"))]
+#[case::application_error(2, r#"{"ae":"rejected schedule"}"#, Some("rejected schedule"))]
+#[case::malformed_event(2, "invalid event", None)]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_account_cancellation_failed_transaction_returns_error_without_order_event(
+    #[case] status: i64,
+    #[case] event_info: &str,
+    #[case] detail: Option<&str>,
+) {
+    let (addr, state) = start_server().await;
+    let (mut client, mut rx, _) = build_client(addr);
+    client.connect().await.unwrap();
+    state.tx_responses_by_nonce.lock().await.insert(
+        TEST_NEXT_NONCE,
+        json!({"status":status,"event_info":event_info}),
+    );
+    let error = client.schedule_cancel(None).await.unwrap_err();
+    let frames = state.send_txs().await;
+    let hash = order_tx_hash(16, &send_tx_info(&frames[0]), LIGHTER_TESTNET_CHAIN_ID);
+    let expected = detail.map_or_else(
+        || format!("failed to parse Lighter account cancellation transaction {hash} event"),
+        |detail| format!("Lighter account cancellation transaction {hash} failed: {detail}"),
+    );
+    assert_eq!(error.to_string(), expected);
+    client.cancel_all_orders_account().await.unwrap();
+    assert_eq!(
+        send_tx_info(&state.send_txs().await[1])["Nonce"],
+        TEST_NEXT_NONCE + 1
+    );
+    assert!(
+        next_order_event(&mut rx, Duration::from_millis(50))
+            .await
+            .is_none()
+    );
+    client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_account_cancellation_lookup_error_identifies_transaction() {
+    let (addr, state) = start_server().await;
+    let (mut client, mut rx, _) = build_client(addr);
+    client.connect().await.unwrap();
+    state.tx_responses_by_nonce.lock().await.insert(
+        TEST_NEXT_NONCE,
+        json!({"code":21501,"message":"lookup unavailable"}),
+    );
+
+    let error = client.schedule_cancel(None).await.unwrap_err();
+    let frames = state.send_txs().await;
+    let hash = order_tx_hash(16, &send_tx_info(&frames[0]), LIGHTER_TESTNET_CHAIN_ID);
+    client.cancel_all_orders_account().await.unwrap();
+
+    assert_eq!(frames.len(), 1);
+    assert_eq!(
+        error.to_string(),
+        format!("failed to look up Lighter account cancellation transaction {hash}"),
+    );
+    assert_eq!(
+        error.root_cause().to_string(),
+        "venue error 21501: lookup unavailable"
+    );
+    assert_eq!(
+        send_tx_info(&state.send_txs().await[1])["Nonce"],
+        TEST_NEXT_NONCE + 1
+    );
+    assert!(
+        next_order_event(&mut rx, Duration::from_millis(50))
+            .await
+            .is_none()
+    );
+    client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_account_cancellation_dropped_confirmation_does_not_reuse_nonce() {
+    let (addr, state) = start_server().await;
+    let (mut client, _, _) = build_client(addr);
+    client.connect().await.unwrap();
+    state.tx_response_blocked.store(true, Ordering::Release);
+    {
+        let pending = client.cancel_all_orders_account();
+        tokio::pin!(pending);
+        tokio::select! {
+            result=&mut pending=>panic!("confirmation must remain blocked: {result:?}"),
+            ()=await_tx_calls(&state,1)=>{}
+        }
+    }
+
+    state.tx_response_blocked.store(false, Ordering::Release);
+    state.tx_response_release.notify_one();
+    client.schedule_cancel(None).await.unwrap();
+    let frames = state.send_txs().await;
+    assert_eq!(frames.len(), 2);
+    assert_eq!(send_tx_info(&frames[0])["Nonce"], TEST_NEXT_NONCE);
+    assert_eq!(send_tx_info(&frames[1])["Nonce"], TEST_NEXT_NONCE + 1);
+    client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[case::native_first(true)]
+#[case::order_first(false)]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_account_cancellation_shares_ordered_transport(#[case] native_first: bool) {
+    let (addr, state) = start_server().await;
+    let (mut client, _, cache) = build_client(addr);
+    client.connect().await.unwrap();
+    let order = make_limit_order(
+        "O-ACCOUNT-SEQUENCE",
+        OrderSide::Buy,
+        Quantity::from("0.0050"),
+        Price::from("2361.31"),
+        TimeInForce::Gtc,
+        false,
+        false,
+    );
+    cache_order(&cache, order.clone());
+
+    if native_first {
+        let (result, ()) = tokio::join!(client.cancel_all_orders_account(), async {
+            await_send_tx_count(&state, 1).await;
+            client.submit_order(submit_command(&order)).unwrap();
+            await_send_tx_count(&state, 2).await;
+        });
+        result.unwrap();
+    } else {
+        client.submit_order(submit_command(&order)).unwrap();
+        client.cancel_all_orders_account().await.unwrap();
+        await_send_tx_count(&state, 2).await;
+    }
+
+    let frames = state.send_txs().await;
+    assert_eq!(
+        frames.iter().map(send_tx_type).collect::<Vec<_>>(),
+        if native_first {
+            vec![16, 14]
+        } else {
+            vec![14, 16]
+        }
+    );
+    assert_eq!(send_tx_info(&frames[0])["Nonce"], TEST_NEXT_NONCE);
+    assert_eq!(send_tx_info(&frames[1])["Nonce"], TEST_NEXT_NONCE + 1);
+    assert_eq!(state.rest_send_txs().await, Vec::<Value>::new());
+    client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[case::immediate(false)]
+#[case::scheduled(true)]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_account_cancellation_waits_for_venue_order_update(#[case] scheduled: bool) {
+    let (addr, state) = start_server().await;
+    let (mut client, mut rx, cache) = build_client(addr);
+    client.connect().await.unwrap();
+    let (index, venue_id) = seed_open_order(
+        &client,
+        &cache,
+        &state,
+        &mut rx,
+        "O-ACCOUNT-CANCEL",
+        "281476929510125",
+    )
+    .await;
+
+    if scheduled {
+        let now = nautilus_core::time::get_atomic_clock_realtime().get_time_ms();
+        client.schedule_cancel(Some(now + 600_000)).await.unwrap();
+    } else {
+        client.cancel_all_orders_account().await.unwrap();
+    }
+
+    assert!(
+        next_order_event(&mut rx, Duration::from_millis(50))
+            .await
+            .is_none()
+    );
+    let mut entry = account_all_orders_open_entry(
+        index,
+        venue_id.as_str(),
+        &index.to_string(),
+        TEST_ORDER_NONCE,
+    );
+    entry["status"] = json!(if scheduled {
+        "canceled-expired"
+    } else {
+        "canceled"
+    });
+    state.push_frame(&json!({
+        "type": "update/account_all_orders", "channel": format!("account_all_orders:{TEST_ACCOUNT_INDEX}"),
+        "orders": {"0": [entry]},
+    }));
+    let event = next_order_event(&mut rx, Duration::from_secs(2))
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        (&event, scheduled),
+        (OrderEventAny::Expired(_), true) | (OrderEventAny::Canceled(_), false)
+    ));
+    assert_eq!(
+        event.client_order_id(),
+        ClientOrderId::from("O-ACCOUNT-CANCEL")
+    );
+    assert_eq!(event.venue_order_id(), Some(venue_id));
+    assert_eq!(event.instrument_id(), eth_perp_id());
+    assert_eq!(event.strategy_id(), strategy_id());
+    assert_eq!(event.account_id(), Some(account_id()));
+
+    cache.borrow_mut().update_order(&event).unwrap();
+    assert_eq!(
+        cache
+            .borrow()
+            .order(&ClientOrderId::from("O-ACCOUNT-CANCEL"))
+            .unwrap()
+            .status(),
+        if scheduled {
+            OrderStatus::Expired
+        } else {
+            OrderStatus::Canceled
+        }
+    );
+    assert!(
+        next_order_event(&mut rx, Duration::from_millis(50))
+            .await
+            .is_none()
+    );
+    client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_cancel_all_orders_batches_selected_open_orders() {
     // `cancel_all_orders` walks `cache.orders_open` for the target
     // instrument and prepares explicit cancellations, which depend
@@ -4185,7 +4940,7 @@ async fn test_cancel_all_orders_batches_selected_open_orders() {
 
 #[rstest]
 #[tokio::test(flavor = "multi_thread")]
-async fn test_cancel_all_orders_venue_rejection_suppresses_cancel_rejected_for_open_order() {
+async fn test_cancel_all_orders_venue_rejection_preserves_open_order() {
     let (addr, state) = start_server().await;
     let (mut client, mut rx, cache) = build_client(addr);
     client.connect().await.expect("connect");
@@ -4219,16 +4974,37 @@ async fn test_cancel_all_orders_venue_rejection_suppresses_cancel_rejected_for_o
         None,
         None,
     );
+    let cause = cancel_all.command_id;
     client
         .cancel_all_orders(cancel_all)
         .expect("cancel_all_orders");
 
     await_send_tx_count(&state, baseline + 1).await;
-    assert!(
-        next_order_event(&mut rx, Duration::from_millis(250))
-            .await
-            .is_none(),
-        "cancel-all venue rejection for an open order must not emit an invalid cancel rejection",
+    let event = next_order_event(&mut rx, Duration::from_secs(2))
+        .await
+        .unwrap();
+
+    let OrderEventAny::CancelRejected(event) = event else {
+        panic!("expected venue rejection");
+    };
+
+    assert_eq!(
+        event.client_order_id,
+        ClientOrderId::from("O-CXLALL-REJECT")
+    );
+    assert_eq!(event.causation_id, Some(cause));
+    assert_eq!(event.reason, "LIGHTER_21727: order is not cancelable");
+    cache
+        .borrow_mut()
+        .update_order(&OrderEventAny::CancelRejected(event))
+        .unwrap();
+    assert_eq!(
+        cache
+            .borrow()
+            .order(&event.client_order_id)
+            .unwrap()
+            .status(),
+        OrderStatus::Accepted
     );
 
     client.disconnect().await.expect("disconnect");
@@ -4287,20 +5063,42 @@ async fn test_cancel_all_orders_preserves_live_updates(#[case] failed: bool) {
         "orders": {"0": [entry]},
     }));
 
-    match next_order_event(&mut rx, Duration::from_secs(2))
-        .await
-        .expect("live update after cancel-all")
-    {
-        OrderEventAny::Updated(event) => {
-            assert_eq!(event.client_order_id, id);
-            assert_eq!(event.venue_order_id, Some(venue_id));
-            assert_eq!(event.instrument_id, eth_perp_id());
-            assert_eq!(event.strategy_id, strategy_id());
-            assert_eq!(event.price, Some(Price::from("2362.31")));
-            assert_eq!(event.quantity, Quantity::from("0.0050"));
+    let mut updated = 0;
+    let mut rejected = 0;
+
+    for _ in 0..if failed { 2 } else { 1 } {
+        match next_order_event(&mut rx, Duration::from_secs(2))
+            .await
+            .expect("live update after cancel-all")
+        {
+            OrderEventAny::Updated(event) => {
+                updated += 1;
+                assert_eq!(event.client_order_id, id);
+                assert_eq!(event.venue_order_id, Some(venue_id));
+                assert_eq!(event.instrument_id, eth_perp_id());
+                assert_eq!(event.strategy_id, strategy_id());
+                assert_eq!(event.price, Some(Price::from("2362.31")));
+                assert_eq!(event.quantity, Quantity::from("0.0050"));
+            }
+            OrderEventAny::CancelRejected(event) if failed => {
+                assert_eq!(event.client_order_id, id);
+                assert!(event.causation_id.is_some());
+                assert_eq!(
+                    event.reason,
+                    "Lighter cancel transaction failed: invalid client order index"
+                );
+                cache
+                    .borrow_mut()
+                    .update_order(&OrderEventAny::CancelRejected(event))
+                    .unwrap();
+                rejected += 1;
+            }
+            other => panic!("expected update or attributable venue rejection, was {other:?}"),
         }
-        other => panic!("expected update without an invalid cancel rejection, was {other:?}"),
     }
+
+    assert_eq!(updated, 1);
+    assert_eq!(rejected, usize::from(failed));
 
     assert!(
         next_order_event(&mut rx, Duration::from_millis(100))
@@ -5396,10 +6194,8 @@ async fn test_generate_mass_status_fans_out_active_inactive_position_and_trades(
 
     wait_until_async(
         || {
-            let client_ptr = std::ptr::addr_of!(client);
+            let client = &client;
             async move {
-                // SAFETY: this test owns `client` exclusively.
-                let client = unsafe { &*client_ptr };
                 !client
                     .generate_position_status_reports(&GeneratePositionStatusReports::new(
                         UUID4::new(),
@@ -5614,7 +6410,7 @@ async fn test_generate_mass_status_restores_filled_orders_from_trade_market() {
         .expect("reused-index historical fill report");
 
     assert_eq!(state.active_orders_calls.load(Ordering::Relaxed), 1);
-    assert_eq!(state.inactive_orders_calls.load(Ordering::Relaxed), 2);
+    assert_eq!(state.inactive_orders_calls.load(Ordering::Relaxed), 1);
     assert_eq!(state.trades_calls.load(Ordering::Relaxed), 1);
     assert_eq!(order_report.client_order_id, Some(client_order_id));
     assert_eq!(order_report.venue_order_id, venue_order_id);
@@ -6009,10 +6805,8 @@ async fn test_generate_bounded_mass_status_keeps_active_orders_when_history_is_i
     state.push_frame(&load_json("ws_account_all_positions_update.json"));
     wait_until_async(
         || {
-            let client_ptr = std::ptr::addr_of!(client);
+            let client = &client;
             async move {
-                // SAFETY: this test owns `client` exclusively.
-                let client = unsafe { &*client_ptr };
                 client
                     .generate_position_status_reports(&GeneratePositionStatusReports::new(
                         UUID4::new(),
@@ -6078,10 +6872,8 @@ async fn test_generate_bounded_mass_status_keeps_active_orders_when_active_fetch
     state.push_frame(&load_json("ws_account_all_positions_update.json"));
     wait_until_async(
         || {
-            let client_ptr = std::ptr::addr_of!(client);
+            let client = &client;
             async move {
-                // SAFETY: this test owns `client` exclusively.
-                let client = unsafe { &*client_ptr };
                 client
                     .generate_position_status_reports(&GeneratePositionStatusReports::new(
                         UUID4::new(),
@@ -6177,7 +6969,7 @@ async fn test_mass_status_keeps_fill_market_orders_when_history_is_incomplete() 
     assert_eq!(fill_report.venue_order_id, venue_order_id);
     assert_eq!(fill_report.client_order_id, order_report.client_order_id);
     assert_eq!(state.active_orders_calls.load(Ordering::Relaxed), 1);
-    assert_eq!(state.inactive_orders_calls.load(Ordering::Relaxed), 3);
+    assert_eq!(state.inactive_orders_calls.load(Ordering::Relaxed), 2);
 
     client.disconnect().await.expect("disconnect");
 }
@@ -6826,6 +7618,352 @@ async fn test_failed_fill_sweep_does_not_poison_live_replay() {
     }
 
     client.disconnect().await.expect("disconnect");
+}
+
+#[rstest]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_commission_failure_fill_reports_recover_once(
+    #[values(false, true)] worker: bool,
+    #[values(false, true)] scoped: bool,
+) {
+    set_message_bus(Rc::new(RefCell::new(MessageBus::new(
+        trader_id(),
+        UUID4::new(),
+        None,
+        None,
+    ))));
+    let (addr, state) = start_server().await;
+    let (mut client, mut rx, cache) = build_client(addr);
+    let venue_order_id = VenueOrderId::from("562947905631053");
+    let order = make_limit_order(
+        "O-COMMISSION-FILLS",
+        OrderSide::Buy,
+        Quantity::from("0.1336"),
+        Price::from("2361.31"),
+        TimeInForce::Gtc,
+        false,
+        false,
+    );
+    let (_, cloid) = cache_accepted_order(&cache, order, venue_order_id);
+    let before = cache.borrow().order(&cloid).unwrap().clone();
+    client.connect().await.unwrap();
+    let trade = http_trade_fixture(19_209_006_980, 42);
+    let invalid = http_trade_with_commission_failure(&trade);
+    *state.trades_response.lock().await = Some(json!({"code":200,"trades":[invalid]}));
+    drain_order_and_report_events(&mut rx);
+
+    let request = || {
+        GenerateFillReports::new(
+            UUID4::new(),
+            UnixNanos::default(),
+            scoped.then_some(eth_perp_id()),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+    };
+
+    let e = generate_fill_reports(&client, request(), worker)
+        .await
+        .expect_err("unrepresentable commission must fail the fill request");
+
+    assert!(super::is_commission_error(&e));
+    assert_order_state_unchanged(&cache.borrow().order(&cloid).unwrap(), &before);
+    assert!(drain_order_and_report_events(&mut rx).is_empty());
+
+    *state.trades_response.lock().await = Some(json!({"code":200,"trades":[trade]}));
+    let reports = generate_fill_reports(&client, request(), worker)
+        .await
+        .unwrap();
+    let repeated = generate_fill_reports(&client, request(), worker)
+        .await
+        .unwrap();
+    client.disconnect().await.unwrap();
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::default()));
+    let mut engine = ExecutionEngine::new(clock, cache.clone(), None);
+    for report in reports.iter().chain(&repeated) {
+        engine.reconcile_fill_report(report);
+    }
+
+    assert_eq!(reports.len(), 1);
+    assert_eq!(repeated.len(), 1);
+    assert_eq!(reports[0].trade_id, TradeId::from("19209006980"));
+    assert_eq!(reports[0].client_order_id, Some(cloid));
+    assert_eq!(
+        cache.borrow().order(&cloid).unwrap().status(),
+        OrderStatus::Filled
+    );
+    assert_commission_recovery_fill(&cache.borrow().order(&cloid).unwrap(), reports[0].trade_id);
+    let queries = state.trades_queries.lock().await;
+    assert_eq!(queries.len(), 3);
+
+    for query in queries.iter() {
+        assert_eq!(
+            query.get("market_id").map(String::as_str),
+            scoped.then_some("0"),
+        );
+    }
+}
+
+#[rstest]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_commission_failure_targeted_order_defers_terminal_until_recovery(
+    #[values(false, true)] worker: bool,
+) {
+    set_message_bus(Rc::new(RefCell::new(MessageBus::new(
+        trader_id(),
+        UUID4::new(),
+        None,
+        None,
+    ))));
+    let (addr, state) = start_server().await;
+    let (mut client, mut rx, cache) = build_client(addr);
+    let venue_order_id = VenueOrderId::from("562947905631053");
+    let order = make_limit_order(
+        "O-COMMISSION-TARGETED",
+        OrderSide::Buy,
+        Quantity::from("0.1336"),
+        Price::from("2361.31"),
+        TimeInForce::Gtc,
+        false,
+        false,
+    );
+    let (_, cloid) = cache_accepted_order(&cache, order, venue_order_id);
+    let before = cache.borrow().order(&cloid).unwrap().clone();
+    client.connect().await.unwrap();
+    let mut terminal = http_order_fixture(venue_order_id.as_str(), "42", "filled", "0.1336");
+    terminal["initial_base_amount"] = json!("0.1336");
+    terminal["remaining_base_amount"] = json!("0.0000");
+    *state.active_orders_response.lock().await = Some(http_orders_payload(&[], None));
+    *state.inactive_orders_response.lock().await = Some(http_orders_payload(&[terminal], None));
+    let trade = http_trade_fixture(19_209_006_981, 42);
+    let invalid = http_trade_with_commission_failure(&trade);
+    *state.trades_response.lock().await = Some(json!({"code":200,"trades":[invalid]}));
+    drain_order_and_report_events(&mut rx);
+
+    let command = GenerateOrderStatusReport::new(
+        UUID4::new(),
+        UnixNanos::default(),
+        Some(eth_perp_id()),
+        Some(cloid),
+        Some(venue_order_id),
+        None,
+        None,
+    );
+
+    let e = generate_order_status_report(&client, &command, worker)
+        .await
+        .expect_err("failed commission must withhold the terminal order report");
+
+    assert_eq!(
+        e.to_string(),
+        "Lighter order report deferred until execution state is applied"
+    );
+    assert_order_state_unchanged(&cache.borrow().order(&cloid).unwrap(), &before);
+    assert!(drain_order_and_report_events(&mut rx).is_empty());
+
+    *state.trades_response.lock().await = Some(json!({"code":200,"trades":[trade]}));
+    let recovered = generate_order_status_report(&client, &command, worker).await;
+    if let Err(e) = recovered {
+        assert_eq!(
+            e.to_string(),
+            "Lighter order report deferred until execution state is applied"
+        );
+    }
+
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::default()));
+    let mut engine = ExecutionEngine::new(clock, cache.clone(), None);
+    let events = drain_order_and_report_events(&mut rx);
+    assert_eq!(events.len(), 1);
+
+    for event in events {
+        match event {
+            ExecutionEvent::Order(event) => engine.process(&event),
+            ExecutionEvent::Report(report) => engine.reconcile_execution_report(&report),
+            _ => unreachable!(),
+        }
+    }
+
+    let report = generate_order_status_report(&client, &command, worker)
+        .await
+        .unwrap()
+        .expect("terminal report after the real fill applies");
+    engine.reconcile_order_status_report(&report);
+    engine.reconcile_order_status_report(&report);
+    client.disconnect().await.unwrap();
+
+    assert_eq!(report.client_order_id, Some(cloid));
+    assert_eq!(report.venue_order_id, venue_order_id);
+    assert_eq!(report.order_status, OrderStatus::Filled);
+    assert_eq!(
+        cache.borrow().order(&cloid).unwrap().status(),
+        OrderStatus::Filled
+    );
+    assert_commission_recovery_fill(
+        &cache.borrow().order(&cloid).unwrap(),
+        TradeId::from("19209006981"),
+    );
+    assert!(drain_order_and_report_events(&mut rx).is_empty());
+}
+
+#[rstest]
+#[case::filled("filled", OrderStatus::Filled, "0.1336")]
+#[case::canceled("canceled", OrderStatus::Canceled, "0.2000")]
+#[case::expired("canceled-expired", OrderStatus::Expired, "0.2000")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_commission_failure_mass_status_recovers_once(
+    #[case] status: &str,
+    #[case] expected_status: OrderStatus,
+    #[case] qty: &str,
+) {
+    set_message_bus(Rc::new(RefCell::new(MessageBus::new(
+        trader_id(),
+        UUID4::new(),
+        None,
+        None,
+    ))));
+    let (addr, state) = start_server().await;
+    let (mut client, mut rx, cache) = build_client(addr);
+    let venue_order_id = VenueOrderId::from("562947905631053");
+    let order = make_limit_order(
+        "O-COMMISSION-MASS",
+        OrderSide::Buy,
+        Quantity::from(qty),
+        Price::from("2361.31"),
+        TimeInForce::Gtc,
+        false,
+        false,
+    );
+    let (_, cloid) = cache_accepted_order(&cache, order, venue_order_id);
+    let before = cache.borrow().order(&cloid).unwrap().clone();
+    client.connect().await.unwrap();
+    let mut terminal = http_order_fixture(venue_order_id.as_str(), "42", status, "0.1336");
+    terminal["initial_base_amount"] = json!(qty);
+    terminal["remaining_base_amount"] = json!("0.0000");
+    terminal["updated_at"] = json!(1_777_941_385_000_i64);
+    *state.active_orders_response.lock().await = Some(http_orders_payload(&[], None));
+    *state.inactive_orders_unscoped_response.lock().await =
+        Some(http_orders_payload(&[terminal.clone()], None));
+    *state.inactive_orders_response.lock().await = Some(http_orders_payload(&[terminal], None));
+    let trade = http_trade_fixture(19_209_006_982, 42);
+    let invalid = http_trade_with_commission_failure(&trade);
+    *state.trades_response.lock().await = Some(json!({"code":200,"trades":[invalid]}));
+    drain_order_and_report_events(&mut rx);
+
+    let e = client.generate_mass_status(None).await.expect_err(
+        "commission failure must abort mass status rather than return incomplete order-only reports",
+    );
+
+    assert!(super::is_commission_error(&e));
+    assert_order_state_unchanged(&cache.borrow().order(&cloid).unwrap(), &before);
+    assert!(drain_order_and_report_events(&mut rx).is_empty());
+
+    *state.trades_response.lock().await = Some(json!({"code":200,"trades":[trade]}));
+    let mass = client.generate_mass_status(None).await.unwrap().unwrap();
+    client.disconnect().await.unwrap();
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::default()));
+    let engine = RefCell::new(ExecutionEngine::new(clock.clone(), cache.clone(), None));
+    engine
+        .borrow_mut()
+        .register_client(Box::new(client))
+        .unwrap();
+    let mut manager =
+        ExecutionManager::new(clock, cache.clone(), ExecutionManagerConfig::default()).unwrap();
+    let first = manager.reconcile_execution_mass_status(&mass, &engine);
+    let after = cache.borrow().order(&cloid).unwrap().clone();
+    let repeated = manager.reconcile_execution_mass_status(&mass, &engine);
+
+    assert!(mass.reports_complete());
+    assert_eq!(mass.fill_reports().values().map(Vec::len).sum::<usize>(), 1);
+    assert_eq!(
+        first
+            .events
+            .iter()
+            .filter(|event| matches!(event, OrderEventAny::Filled(_)))
+            .count(),
+        1
+    );
+    assert!(repeated.events.is_empty());
+    assert_order_state_unchanged(&cache.borrow().order(&cloid).unwrap(), &after);
+    assert_eq!(after.status(), expected_status);
+    assert_eq!(after.quantity(), Quantity::from(qty));
+    assert_commission_recovery_fill(&after, TradeId::from("19209006982"));
+}
+
+fn http_trade_with_commission_failure(trade: &Value) -> Value {
+    let mut invalid = trade.clone();
+    invalid["price"] = json!("1000000000.00");
+    invalid["size"] = json!("1000000000.0000");
+    invalid["usd_amount"] = json!("1000000000000000000.000000");
+    invalid
+}
+
+fn drain_order_and_report_events(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<ExecutionEvent>,
+) -> Vec<ExecutionEvent> {
+    std::iter::from_fn(|| rx.try_recv().ok())
+        .filter(|event| matches!(event, ExecutionEvent::Order(_) | ExecutionEvent::Report(_)))
+        .collect()
+}
+
+fn assert_order_state_unchanged(actual: &OrderAny, expected: &OrderAny) {
+    assert_eq!(actual.client_order_id(), expected.client_order_id());
+    assert_eq!(actual.venue_order_id(), expected.venue_order_id());
+    assert_eq!(actual.account_id(), expected.account_id());
+    assert_eq!(actual.position_id(), expected.position_id());
+    assert_eq!(actual.status(), expected.status());
+    assert_eq!(actual.quantity(), expected.quantity());
+    assert_eq!(actual.filled_qty(), expected.filled_qty());
+    assert_eq!(actual.leaves_qty(), expected.leaves_qty());
+    assert_eq!(actual.voided_qty(), expected.voided_qty());
+    assert_eq!(actual.overfill_qty(), expected.overfill_qty());
+    assert_eq!(actual.price(), expected.price());
+    assert_eq!(actual.avg_px(), expected.avg_px());
+    assert_eq!(actual.liquidity_side(), expected.liquidity_side());
+    assert_eq!(actual.trade_ids(), expected.trade_ids());
+    assert_eq!(actual.commissions(), expected.commissions());
+    assert_eq!(actual.ts_last(), expected.ts_last());
+    assert_eq!(actual.ts_closed(), expected.ts_closed());
+    assert_eq!(actual.is_pending_update(), expected.is_pending_update());
+    assert_eq!(actual.is_pending_cancel(), expected.is_pending_cancel());
+    assert_eq!(actual.events(), expected.events());
+}
+
+fn assert_commission_recovery_fill(order: &OrderAny, trade_id: TradeId) {
+    let fills: Vec<_> = order
+        .events()
+        .into_iter()
+        .filter_map(|event| match event {
+            OrderEventAny::Filled(fill) => Some(fill),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(fills.len(), 1);
+    let fill = fills[0];
+    assert_eq!(fill.trader_id, trader_id());
+    assert_eq!(fill.strategy_id, strategy_id());
+    assert_eq!(fill.instrument_id, eth_perp_id());
+    assert_eq!(fill.client_order_id, order.client_order_id());
+    assert_eq!(fill.venue_order_id, VenueOrderId::from("562947905631053"));
+    assert_eq!(fill.account_id, account_id());
+    assert_eq!(fill.trade_id, trade_id);
+    assert_eq!(fill.order_side, OrderSide::Buy);
+    assert_eq!(fill.order_type, OrderType::Limit);
+    assert_eq!(fill.last_qty, Quantity::from("0.1336"));
+    assert_eq!(fill.last_px, Price::from("2352.73"));
+    assert_eq!(fill.currency, Currency::USDC());
+    assert_eq!(fill.commission, Some(Money::from("0.06160765 USDC")));
+    assert_eq!(fill.liquidity_side, LiquiditySide::Taker);
+    assert_eq!(fill.ts_event, UnixNanos::from(1_777_941_384_181_000_000));
+    assert_eq!(order.filled_qty(), Quantity::from("0.1336"));
+    assert_eq!(order.trade_ids(), vec![&trade_id]);
+    assert_eq!(
+        order.commissions().get(&Currency::USDC()),
+        Some(&Money::from("0.06160765 USDC"))
+    );
 }
 
 #[rstest]
@@ -7573,9 +8711,8 @@ async fn test_account_all_positions_flat_snapshot_clears_cache_and_emits_flat_re
 
     wait_until_async(
         || {
-            let client_ptr = std::ptr::addr_of!(client);
+            let client = &client;
             async move {
-                let client = unsafe { &*client_ptr };
                 !generate_position_status_reports(
                     client,
                     &GeneratePositionStatusReports::new(
@@ -7723,10 +8860,8 @@ async fn test_account_all_positions_invalid_known_market_does_not_flatten_cached
 
     wait_until_async(
         || {
-            let client_ptr = std::ptr::addr_of!(client);
+            let client = &client;
             async move {
-                // SAFETY: this test owns `client` exclusively.
-                let client = unsafe { &*client_ptr };
                 generate_position_status_reports(
                     client,
                     &GeneratePositionStatusReports::new(
@@ -7785,10 +8920,8 @@ async fn test_bounded_mass_status_rejects_stale_position_coverage_after_reconnec
     state.push_frame(&load_json("ws_account_all_positions_update.json"));
     wait_until_async(
         || {
-            let client_ptr = std::ptr::addr_of!(client);
+            let client = &client;
             async move {
-                // SAFETY: this test owns `client` exclusively.
-                let client = unsafe { &*client_ptr };
                 client
                     .generate_position_status_reports(&GeneratePositionStatusReports::new(
                         UUID4::new(),
@@ -7887,9 +9020,8 @@ async fn test_account_all_positions_empty_snapshot_after_reconnect_flattens_prio
 
     wait_until_async(
         || {
-            let client_ptr = std::ptr::addr_of!(client);
+            let client = &client;
             async move {
-                let client = unsafe { &*client_ptr };
                 !generate_position_status_reports(
                     client,
                     &GeneratePositionStatusReports::new(
@@ -8887,8 +10019,8 @@ async fn test_order_batches_chunk_commands(
             .await
             .unwrap();
 
-        let OrderEventAny::CancelRejected(e) = event else {
-            panic!("expected CancelRejected, was {event:?}");
+        let OrderEventAny::CancelDenied(e) = event else {
+            panic!("expected CancelDenied, was {event:?}");
         };
 
         assert_eq!(e.client_order_id, invalid_cancel_id);
@@ -9293,10 +10425,14 @@ async fn assert_chunked_modify_events(
                 assert_eq!(e.trigger_price, None);
                 updated.push(e.client_order_id);
             }
-            OrderEventAny::ModifyRejected(e) => {
+            OrderEventAny::ModifyDenied(e) => {
                 assert_eq!(
                     Some(e.client_order_id),
                     invalid_modify.map(|i| modifies[i].client_order_id)
+                );
+                assert_eq!(
+                    e.causation_id,
+                    invalid_modify.map(|i| modifies[i].command_id)
                 );
                 assert!(e.reason.contains("below Lighter min_quote_amount"));
                 rejected.push(e.client_order_id);
@@ -9375,6 +10511,166 @@ fn assert_order_batches(
     }
 
     infos
+}
+
+#[rstest]
+#[case::order_then_transaction(true)]
+#[case::transaction_then_order(false)]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_account_tx_confirms_modify_without_rest(
+    #[case] order_first: bool,
+    #[values(false, true)] missing_ack: bool,
+) {
+    let (addr, state) = start_server().await;
+    let (mut client, mut rx, cache) = build_client(addr);
+    client.connect().await.unwrap();
+    let id = ClientOrderId::from("O-STREAM-MODIFY");
+    let (index, venue) = seed_open_order(
+        &client,
+        &cache,
+        &state,
+        &mut rx,
+        id.as_str(),
+        "281476929510118",
+    )
+    .await;
+
+    if missing_ack {
+        *state.next_send_tx_ack.lock().await = Some(Value::Null);
+    }
+
+    let calls_before = state.tx_calls.load(Ordering::Relaxed);
+    client
+        .modify_order(modify_command(id, venue, "2400.00"))
+        .unwrap();
+    await_send_tx_count(&state, 2).await;
+    let info = send_tx_info(&state.send_txs().await[1]);
+    let hash = order_tx_hash(17, &info, state.chain_id.load(Ordering::Relaxed));
+    let mut transaction = load_json("ws_account_tx_update.json");
+    transaction["channel"] = json!(format!("account_tx:{TEST_ACCOUNT_INDEX}"));
+    transaction["txs"][0]["hash"] = json!(format!("0X{}", hash.to_uppercase()));
+    let mut entry =
+        account_all_orders_open_entry(index, venue.as_str(), &index.to_string(), TEST_ORDER_NONCE);
+    state.push_frame(&json!({
+        "type":"update/account_all_orders",
+        "channel":format!("account_all_orders:{TEST_ACCOUNT_INDEX}"),
+        "orders":{"0":[entry.clone()]},
+    }));
+    assert!(
+        next_order_event(&mut rx, Duration::from_millis(50))
+            .await
+            .is_none()
+    );
+    entry["price"] = json!("2400.00");
+    entry["base_price"] = json!(240_000);
+    entry["initial_base_amount"] = json!("0.0100");
+    entry["remaining_base_amount"] = json!("0.0100");
+    entry["base_size"] = json!(100);
+    let order = json!({"type":"update/account_all_orders", "channel":format!("account_all_orders:{TEST_ACCOUNT_INDEX}"), "orders":{"0":[entry]}});
+    let frames = if order_first {
+        [&order, &transaction]
+    } else {
+        [&transaction, &order]
+    };
+
+    state.push_frame(frames[0]);
+    assert!(
+        next_order_event(&mut rx, Duration::from_millis(50))
+            .await
+            .is_none()
+    );
+    state.push_frame(frames[1]);
+    let event = next_order_event(&mut rx, Duration::from_secs(1))
+        .await
+        .expect("stream execution and matching order must confirm without REST");
+
+    let OrderEventAny::Updated(updated) = &event else {
+        panic!("expected Updated, was {event:?}");
+    };
+
+    assert_eq!(updated.trader_id, trader_id());
+    assert_eq!(updated.strategy_id, strategy_id());
+    assert_eq!(updated.instrument_id, eth_perp_id());
+    assert_eq!(updated.client_order_id, id);
+    assert_eq!(updated.venue_order_id, Some(venue));
+    assert_eq!(updated.account_id, Some(account_id()));
+    assert_eq!(updated.quantity, Quantity::from("0.0100"));
+    assert_eq!(updated.price, Some(Price::from("2400.00")));
+    assert_eq!(updated.trigger_price, None);
+    assert!(!updated.reconciliation);
+    assert_eq!(state.tx_calls.load(Ordering::Relaxed), calls_before);
+    cache.borrow_mut().update_order(&event).unwrap();
+    state.push_frame(&transaction);
+    state.push_frame(&order);
+    assert!(
+        next_order_event(&mut rx, Duration::from_millis(100))
+            .await
+            .is_none()
+    );
+    assert_eq!(state.send_txs().await.len(), 2);
+    client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[case::failed_status(0, "")]
+#[case::application_error(2, "{\"ae\":\"invalid order price\"}")]
+#[case::malformed_failure(0, "invalid json")]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_account_tx_rejects_modify_without_rest(#[case] status: u8, #[case] event_info: &str) {
+    let (addr, state) = start_server().await;
+    let (mut client, mut rx, cache) = build_client(addr);
+    client.connect().await.unwrap();
+    let id = ClientOrderId::from("O-STREAM-REJECT");
+    let (_, venue) = seed_open_order(
+        &client,
+        &cache,
+        &state,
+        &mut rx,
+        id.as_str(),
+        "281476929510119",
+    )
+    .await;
+    let calls_before = state.tx_calls.load(Ordering::Relaxed);
+    let command = modify_command(id, venue, "2400.00");
+    client.modify_order(command.clone()).unwrap();
+    await_send_tx_count(&state, 2).await;
+    let info = send_tx_info(&state.send_txs().await[1]);
+    let hash = order_tx_hash(17, &info, state.chain_id.load(Ordering::Relaxed));
+    let mut transaction = load_json("ws_account_tx_update.json");
+    transaction["channel"] = json!(format!("account_tx:{TEST_ACCOUNT_INDEX}"));
+    transaction["txs"][0] = json!({"hash":hash, "status":status, "event_info":event_info});
+    state.push_frame(&transaction);
+    let event = next_order_event(&mut rx, Duration::from_secs(1))
+        .await
+        .unwrap();
+
+    let OrderEventAny::ModifyRejected(rejected) = &event else {
+        panic!("expected ModifyRejected, was {event:?}");
+    };
+
+    assert_eq!(rejected.trader_id, trader_id());
+    assert_eq!(rejected.strategy_id, strategy_id());
+    assert_eq!(rejected.instrument_id, eth_perp_id());
+    assert_eq!(rejected.client_order_id, id);
+    assert_eq!(rejected.venue_order_id, Some(venue));
+    assert_eq!(rejected.account_id, Some(account_id()));
+    assert_eq!(rejected.causation_id, Some(command.command_id));
+    assert_eq!(
+        rejected.reason.as_str(),
+        if status == 2 {
+            "Lighter modify transaction failed: invalid order price"
+        } else {
+            "Lighter modify transaction failed: transaction failed without an application error"
+        }
+    );
+    assert_eq!(state.tx_calls.load(Ordering::Relaxed), calls_before);
+    state.push_frame(&transaction);
+    assert!(
+        next_order_event(&mut rx, Duration::from_millis(100))
+            .await
+            .is_none()
+    );
+    client.disconnect().await.unwrap();
 }
 
 #[rstest]
@@ -9656,10 +10952,11 @@ async fn test_modify_echo_and_overlap_wait_for_transaction_result(
             .await
             .unwrap();
 
-        let OrderEventAny::ModifyRejected(event) = event else {
-            panic!("expected overlap rejection");
+        let OrderEventAny::ModifyDenied(event) = event else {
+            panic!("expected overlap denial");
         };
 
+        assert_eq!(event.causation_id, Some(next.command_id));
         assert_eq!(event.client_order_id, id);
         assert_eq!(event.venue_order_id, Some(venue));
         assert_eq!(
@@ -9993,7 +11290,7 @@ async fn test_acknowledged_modify_ignores_delayed_terminal_report() {
         .await
         .unwrap();
 
-    let OrderEventAny::ModifyRejected(overlap) = overlap else {
+    let OrderEventAny::ModifyDenied(overlap) = overlap else {
         panic!("expected overlapping amendment rejection");
     };
 
@@ -10085,6 +11382,11 @@ async fn test_acknowledged_modify_ignores_delayed_terminal_report() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_native_otoco_uses_one_transaction_and_rejects_all_legs(
     #[case] rejected: bool,
+    #[values(
+        (LighterDeployment::Lighter, 723_813),
+        (LighterDeployment::Robinhood, 17_725)
+    )]
+    attribution: (LighterDeployment, u64),
     #[values(false, true)] override_modes: bool,
     #[values(LighterEnvironment::Testnet, LighterEnvironment::Mainnet)]
     environment: LighterEnvironment,
@@ -10092,6 +11394,9 @@ async fn test_native_otoco_uses_one_transaction_and_rejects_all_legs(
     let (addr, state) = start_server().await;
     let mut config = build_config(addr);
     config.environment = environment;
+    config.deployment = attribution.0;
+    config.venue = Some(*LIGHTER_VENUE);
+    state.chain_id.store(config.chain_id(), Ordering::Relaxed);
     let (mut client, mut rx, cache) = build_client_with(config);
     client.connect().await.expect("connect");
 
@@ -10163,7 +11468,7 @@ async fn test_native_otoco_uses_one_transaction_and_rejects_all_legs(
         json!({"6": u8::from(override_modes), "7": u8::from(override_modes)});
 
     if environment == LighterEnvironment::Mainnet {
-        expected_attributes["1"] = json!(LIGHTER_NAUTILUS_INTEGRATOR_ACCOUNT_INDEX);
+        expected_attributes["1"] = json!(attribution.1);
     }
 
     assert_eq!(body["L2TxAttributes"], expected_attributes);
@@ -10735,10 +12040,40 @@ async fn process_execution_event(
     event
 }
 
+#[rstest]
+#[case::untracked(false, false)]
+#[case::unapplied(true, false)]
+#[case::applied(true, true)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn shutdown_gap_fill_reconciles_without_duplicate_late_live_delivery() {
+async fn shutdown_gap_fill_delivery_tracks_application(
+    #[case] tracked: bool,
+    #[case] applied: bool,
+) {
+    set_message_bus(Rc::new(RefCell::new(MessageBus::new(
+        trader_id(),
+        UUID4::new(),
+        None,
+        None,
+    ))));
     let (address, state) = start_server().await;
-    let (mut client, mut events, _cache) = build_client(address);
+    let (mut client, mut events, cache) = build_client(address);
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
+    let mut engine = ExecutionEngine::new(clock, cache.clone(), None);
+    let cloid = ClientOrderId::from("562947905631053");
+
+    if tracked {
+        let order = make_limit_order(
+            cloid.as_str(),
+            OrderSide::Buy,
+            Quantity::from("0.1336"),
+            Price::from("2361.31"),
+            TimeInForce::Gtc,
+            false,
+            false,
+        );
+        cache_accepted_order(&cache, order, VenueOrderId::from("562947905631053"));
+    }
+
     client.connect().await.unwrap();
     let original_subscriptions = state.subscribes().await.len();
     state.push_frame(&json!({"type":"shutdown", "close_in_ms":10000}));
@@ -10778,6 +12113,33 @@ async fn shutdown_gap_fill_reconciles_without_duplicate_late_live_delivery() {
     let repeated = client.generate_fill_reports(command).await.unwrap();
     assert_eq!(repeated.len(), 1);
     assert_eq!(repeated[0].trade_id, report.trade_id);
+
+    if applied {
+        engine.reconcile_fill_report(report);
+        let cached = cache.borrow().order(&cloid).unwrap().clone();
+        assert_eq!(cached.filled_qty(), report.last_qty);
+        assert_eq!(cached.trade_ids(), vec![&report.trade_id]);
+    }
+
+    state.push_frame(&json!({"type":"update/account_all_trades", "channel":format!("account_all_trades:{TEST_ACCOUNT_INDEX}"), "trades":{"0":[trade.clone()]}}));
+
+    if !applied {
+        let delivered = process_execution_event(&mut events, &mut engine).await;
+        match delivered {
+            ExecutionEvent::Order(OrderEventAny::Filled(fill)) => {
+                assert!(tracked);
+                assert_eq!(fill.trade_id, report.trade_id);
+                assert_eq!(fill.last_qty, report.last_qty);
+            }
+            ExecutionEvent::Report(ExecutionReport::Fill(fill)) => {
+                assert!(!tracked);
+                assert_eq!(fill.trade_id, report.trade_id);
+                assert_eq!(fill.last_qty, report.last_qty);
+            }
+            other => panic!("expected gap fill, was {other:?}"),
+        }
+    }
+
     state.push_frame(&json!({"type":"update/account_all_trades", "channel":format!("account_all_trades:{TEST_ACCOUNT_INDEX}"), "trades":{"0":[trade]}}));
 
     let duplicate = next_event_matching(&mut events, Duration::from_millis(300), |event| {
@@ -10793,6 +12155,14 @@ async fn shutdown_gap_fill_reconciles_without_duplicate_late_live_delivery() {
         duplicate.is_none(),
         "reconciled fill must not be delivered again as live: {duplicate:?}"
     );
+
+    if tracked {
+        let cached = cache.borrow().order(&cloid).unwrap().clone();
+        assert_eq!(cached.status(), OrderStatus::Filled);
+        assert_eq!(cached.filled_qty(), report.last_qty);
+        assert_eq!(cached.trade_ids(), vec![&report.trade_id]);
+    }
+
     client.disconnect().await.unwrap();
 }
 
@@ -11506,4 +12876,261 @@ async fn test_completed_cancel_does_not_consume_queued_rest_token(#[case] reconn
         0,
         "completed cancellation must release its queued recovery lookup"
     );
+}
+
+#[rstest]
+#[case::pending(1)]
+#[case::pending_final(3)]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_scheduled_cancel_startup_waits_for_execution(#[case] status: i64) {
+    let (addr, state) = start_server().await;
+    let mut config = build_config(addr);
+    config.scheduled_cancel_timeout_secs = Some(420);
+    let (mut client, _, _) = build_client_with(config);
+    state
+        .tx_responses
+        .lock()
+        .await
+        .push_back(json!({"status":status,"event_info":"not executed yet"}));
+    client.connect().await.unwrap();
+    assert!(client.is_connected());
+    assert_eq!(state.send_txs().await.len(), 1);
+    assert_eq!(state.tx_calls.load(Ordering::Relaxed), 2);
+    let info = send_tx_info(&state.send_txs().await[0]);
+    assert_eq!(info["TimeInForce"], 1);
+    assert_eq!(info["Nonce"], TEST_NEXT_NONCE);
+    client.disconnect().await.unwrap();
+    assert!(client.pending_tasks_all_finished());
+    assert_eq!(state.send_txs().await.len(), 1);
+}
+
+#[rstest]
+#[case::failed(0, "rejected control")]
+#[case::application_error(2, r#"{"ae":"rejected schedule"}"#)]
+#[case::wrong_identity(2, "")]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_scheduled_cancel_arming_failure_cleans_session(
+    #[case] status: i64,
+    #[case] event: &str,
+) {
+    let (addr, state) = start_server().await;
+    let mut config = build_config(addr);
+    config.scheduled_cancel_timeout_secs = Some(420);
+    let (mut client, _, _) = build_client_with(config);
+    let mut response = json!({"status": status, "event_info": event});
+    if status == 2 && event.is_empty() {
+        response["hash"] = json!("wrong-hash");
+    }
+
+    state.tx_responses.lock().await.push_back(response);
+    let error = client.connect().await.unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "failed to arm Lighter scheduled cancellation"
+    );
+    assert!(!client.is_connected());
+    assert!(client.pending_tasks_all_finished());
+    assert_eq!(state.send_txs().await.len(), 1);
+    client.connect().await.unwrap();
+    client.disconnect().await.unwrap();
+    assert_eq!(state.send_txs().await.len(), 2);
+    assert!(
+        state
+            .send_txs()
+            .await
+            .iter()
+            .all(|frame| send_tx_info(frame)["TimeInForce"] == 1)
+    );
+}
+
+#[rstest]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_scheduled_cancel_pending_startup_is_bounded() {
+    let (addr, state) = start_server().await;
+    let mut config = build_config(addr);
+    config.scheduled_cancel_timeout_secs = Some(420);
+    let (mut client, _, _) = build_client_with(config);
+    state
+        .tx_responses_by_nonce
+        .lock()
+        .await
+        .insert(TEST_NEXT_NONCE, json!({"status":1,"event_info":""}));
+    let error = tokio::time::timeout(Duration::from_secs(35), client.connect())
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("timed out"));
+    assert!(!client.is_connected());
+    assert!(client.pending_tasks_all_finished());
+    assert_eq!(state.send_txs().await.len(), 1);
+}
+
+#[rstest]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_scheduled_cancel_refresh_retries_and_reconnects() {
+    let (addr, state) = start_server().await;
+    let mut config = build_config(addr);
+    config.scheduled_cancel_timeout_secs = Some(420);
+    let (mut client, _, _) = build_client_with(config);
+    client.connect().await.unwrap();
+    client.connect().await.unwrap();
+    state.tx_responses_by_nonce.lock().await.insert(
+        TEST_NEXT_NONCE + 1,
+        json!({"status":2,"event_info":r#"{"ae":"temporary failure"}"#}),
+    );
+    client.scheduled_cancel_notify.notify_one();
+    wait_until_async(
+        || async { state.send_txs().await.len() == 2 },
+        Duration::from_secs(5),
+    )
+    .await;
+    client.scheduled_cancel_notify.notify_one();
+    wait_until_async(
+        || async { state.send_txs().await.len() == 3 },
+        Duration::from_secs(5),
+    )
+    .await;
+    let frames = state.send_txs().await;
+    assert_eq!(send_tx_info(&frames[1])["Nonce"], TEST_NEXT_NONCE + 1);
+    assert_eq!(send_tx_info(&frames[2])["Nonce"], TEST_NEXT_NONCE + 2);
+    assert!(
+        send_tx_info(&frames[2])["Time"].as_i64().unwrap()
+            > send_tx_info(&frames[0])["Time"].as_i64().unwrap()
+    );
+    state.next_nonce.store(777, Ordering::Release);
+    let subscriptions = state.subscribes().await.len();
+    state.close_after_next_frame.store(true, Ordering::Release);
+    client.cancel_all_orders_account().await.unwrap();
+    await_subscribe_count(&state, subscriptions + 5).await;
+    wait_until_async(
+        || async { state.send_txs().await.len() == 5 },
+        Duration::from_secs(10),
+    )
+    .await;
+    assert_eq!(
+        send_tx_info(&state.send_txs().await[3])["Nonce"],
+        TEST_NEXT_NONCE + 3
+    );
+    assert_eq!(send_tx_info(&state.send_txs().await[4])["Nonce"], 777);
+    client.disconnect().await.unwrap();
+    let retained = state.send_txs().await;
+    assert!(client.scheduled_cancel_handle.is_none());
+    assert_eq!(state.send_txs().await, retained);
+    assert!(client.pending_tasks_all_finished());
+    assert_eq!(state.rest_send_txs().await, Vec::<Value>::new());
+    assert_eq!(
+        retained
+            .iter()
+            .map(|frame| send_tx_info(frame)["TimeInForce"].as_u64().unwrap())
+            .collect::<Vec<_>>(),
+        vec![1, 1, 1, 0, 1]
+    );
+}
+
+#[rstest]
+#[case::stop(true)]
+#[case::reset(false)]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_scheduled_cancel_shutdown_retains_deadline_and_restarts_once(#[case] stop: bool) {
+    let (addr, state) = start_server().await;
+    let mut config = build_config(addr);
+    config.scheduled_cancel_timeout_secs = Some(420);
+    let (mut client, _, _) = build_client_with(config);
+    client.connect().await.unwrap();
+    if stop {
+        client.stop().unwrap();
+    } else {
+        client.reset().unwrap();
+    }
+
+    client.connect().await.unwrap();
+    wait_until_async(
+        || async { state.send_txs().await.len() == 3 },
+        Duration::from_secs(45),
+    )
+    .await;
+    client.disconnect().await.unwrap();
+    assert!(client.pending_tasks_all_finished());
+    let frames = state.send_txs().await;
+    assert_eq!(frames.len(), 3);
+    assert!(
+        frames
+            .iter()
+            .all(|frame| send_tx_info(frame)["TimeInForce"] == 1)
+    );
+}
+
+#[tokio::test]
+async fn test_scheduled_cancel_timeout_preserves_order_nonce_on_wire() {
+    let (addr, state) = start_server().await;
+    let mut config = build_config(addr);
+    config.scheduled_cancel_timeout_secs = Some(420);
+    let (mut client, mut rx, cache) = build_client_with(config);
+
+    client.tx_rate_limiter = Arc::new(RateLimiter::new_with_quota(
+        None,
+        vec![(
+            Ustr::from(crate::common::rate_limit::LIGHTER_TX_BUCKET),
+            Quota::with_period(Duration::from_secs(5)).unwrap(),
+        )],
+    ));
+    client.connect().await.unwrap();
+    {
+        let earlier = client.cancel_all_orders_account();
+        tokio::pin!(earlier);
+        assert!(futures_util::poll!(&mut earlier).is_pending());
+    }
+
+    let context = client
+        .fanout_dispatch_context(client.credential.as_ref().unwrap())
+        .unwrap();
+    let renewal = context.refresh_scheduled_cancel(420);
+    tokio::pin!(renewal);
+    assert!(futures_util::poll!(&mut renewal).is_pending());
+    let order = make_limit_order(
+        "AFTER-RENEWAL",
+        OrderSide::Buy,
+        Quantity::from("0.0050"),
+        Price::from("2361.31"),
+        TimeInForce::Gtc,
+        false,
+        false,
+    );
+    cache_order(&cache, order.clone());
+    client.submit_order(submit_command(&order)).unwrap();
+    let event = next_order_event(&mut rx, Duration::from_secs(2))
+        .await
+        .unwrap();
+    assert!(
+        matches!(event, OrderEventAny::Submitted(ref submitted) if submitted.client_order_id == order.client_order_id())
+    );
+    assert_eq!(state.send_txs().await.len(), 1);
+    tokio::time::pause();
+    tokio::time::advance(SCHEDULED_CANCEL_REQUEST_TIMEOUT).await;
+    tokio::time::resume();
+    assert_eq!(
+        renewal.await.unwrap_err().to_string(),
+        "scheduled cancellation request timed out"
+    );
+    wait_until_async(
+        || async { state.send_txs().await.len() == 3 },
+        Duration::from_secs(15),
+    )
+    .await;
+    let frames = state.send_txs().await;
+    assert_eq!(
+        frames.iter().map(send_tx_type).collect::<Vec<_>>(),
+        vec![16, 16, 16]
+    );
+    assert_eq!(
+        frames
+            .iter()
+            .map(|frame| send_tx_info(frame)["Nonce"].as_i64().unwrap())
+            .collect::<Vec<_>>(),
+        vec![TEST_NEXT_NONCE, TEST_NEXT_NONCE + 1, TEST_NEXT_NONCE + 2]
+    );
+    assert_eq!(send_tx_info(&frames[2])["TimeInForce"], 1);
+    client.disconnect().await.unwrap();
+    assert!(client.pending_tasks_all_finished());
+    assert_eq!(state.send_txs().await, frames);
 }

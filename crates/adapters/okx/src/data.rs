@@ -34,9 +34,10 @@ use nautilus_common::{
     messages::{
         DataEvent,
         data::{
-            BarsResponse, BookResponse, DataResponse, FundingRatesResponse, InstrumentResponse,
-            InstrumentsResponse, OptionChainReferencePriceResponse, RequestBars,
-            RequestBookSnapshot, RequestFundingRates, RequestInstrument, RequestInstruments,
+            BarsResponse, BookResponse, DataRequestFailed, DataResponse, DataResponseEnvelope,
+            FundingRatesResponse, InstrumentResponse, InstrumentsResponse,
+            OptionChainReferencePriceResponse, RequestBars, RequestBookSnapshot,
+            RequestFundingRates, RequestInstrument, RequestInstruments,
             RequestOptionChainReferencePrice, RequestTrades, SubscribeBars, SubscribeBookDeltas,
             SubscribeBookDepth, SubscribeFundingRates, SubscribeIndexPrices, SubscribeInstrument,
             SubscribeInstrumentStatus, SubscribeInstruments, SubscribeMarkPrices,
@@ -48,7 +49,7 @@ use nautilus_common::{
     },
 };
 use nautilus_core::{
-    AtomicMap, AtomicSet, Params, UnixNanos,
+    AtomicMap, AtomicSet, Params, UUID4, UnixNanos,
     datetime::datetime_to_unix_nanos,
     time::{AtomicTime, get_atomic_clock_realtime},
 };
@@ -90,7 +91,7 @@ use crate::{
     },
     config::OKXDataClientConfig,
     http::{
-        client::{OKXHttpClient, OKXInstrumentDefinitionError},
+        client::{OKXHistoryCoverage, OKXHttpClient, OKXInstrumentDefinitionError},
         query::GetSpreadsParams,
     },
     websocket::{
@@ -796,8 +797,8 @@ impl OKXDataClient {
                                         ts_init,
                                     ) {
                                         Ok(greeks) => {
-                                            if let Err(e) =
-                                                data_sender.send(DataEvent::OptionGreeks(greeks))
+                                            if let Err(e) = data_sender
+                                                .send(DataEvent::Data(Data::OptionGreeks(greeks)))
                                             {
                                                 log::error!(
                                                     "Failed to emit option greeks event: {e}"
@@ -1580,6 +1581,37 @@ struct InstrumentUpdateLock {
     write_seq: AtomicU64,
 }
 
+/// The event for a historical response, by whether OKX covered the requested window: a covered
+/// window completes the response envelope, so the data engine can write it back to a catalog; a
+/// window the page cap cut short fails the request with the rows fetched, so the requester can
+/// retry with smaller windows; otherwise a plain response, as a retry would not recover more.
+fn history_event(
+    request_id: UUID4,
+    response: DataResponse,
+    coverage: OKXHistoryCoverage,
+) -> DataEvent {
+    match coverage {
+        OKXHistoryCoverage::Complete => {
+            DataEvent::ResponseEnvelope(DataResponseEnvelope::new(response, true, None))
+        }
+        OKXHistoryCoverage::Truncated => DataEvent::RequestFailed(DataRequestFailed {
+            request_id,
+            reason: "OKX page limit reached before the start of the window".to_string(),
+            response: Some(response),
+        }),
+        OKXHistoryCoverage::Unverified => DataEvent::Response(response),
+    }
+}
+
+/// The event that completes a request whose HTTP fetch failed.
+fn request_failure(request_id: UUID4, error: &anyhow::Error) -> DataEvent {
+    DataEvent::RequestFailed(DataRequestFailed {
+        request_id,
+        reason: format!("{error:#}"),
+        response: None,
+    })
+}
+
 fn dispatch_parsed_data(
     msg: NautilusWsMessage,
     data_sender: &EventSender<DataEvent>,
@@ -1606,13 +1638,13 @@ fn dispatch_parsed_data(
             instruments_by_symbol.insert(instrument.symbol().inner(), *instrument);
 
             if let Some(status) = status
-                && let Err(e) = data_sender.send(DataEvent::InstrumentStatus(status))
+                && let Err(e) = data_sender.send(DataEvent::Data(Data::InstrumentStatus(status)))
             {
                 log::error!("Failed to emit instrument status event: {e}");
             }
         }
         NautilusWsMessage::InstrumentStatus(status) => {
-            if let Err(e) = data_sender.send(DataEvent::InstrumentStatus(status)) {
+            if let Err(e) = data_sender.send(DataEvent::Data(Data::InstrumentStatus(status))) {
                 log::error!("Failed to emit instrument status event: {e}");
             }
         }
@@ -1622,7 +1654,7 @@ fn dispatch_parsed_data(
 
 fn emit_funding_rates(sender: &EventSender<DataEvent>, updates: Vec<FundingRateUpdate>) {
     for update in updates {
-        if let Err(e) = sender.send(DataEvent::FundingRate(update)) {
+        if let Err(e) = sender.send(DataEvent::Data(Data::FundingRate(update))) {
             log::error!("Failed to emit funding rate event: {e}");
         }
     }
@@ -1647,7 +1679,7 @@ fn emit_instrument_status(
         None,
     );
 
-    if let Err(e) = sender.send(DataEvent::InstrumentStatus(status)) {
+    if let Err(e) = sender.send(DataEvent::Data(Data::InstrumentStatus(status))) {
         log::error!("Failed to emit instrument status event: {e}");
     }
 }
@@ -1702,7 +1734,7 @@ fn cache_instrument_updates(
         .fetch_add(1, Ordering::SeqCst);
 }
 
-/// Publishes new or changed definitions as [`DataEvent::Instrument`] after
+/// Publishes new or changed definitions as [`DataEvent::Data`] after
 /// updating every cache, so consumers never observe a definition the caches
 /// do not yet hold. Callers serialize diff-update-publish sequences through
 /// the instrument update lock.
@@ -1725,7 +1757,7 @@ fn publish_instrument_updates(
     );
 
     for instrument in changed {
-        if let Err(e) = data_sender.send(DataEvent::Instrument(instrument.clone())) {
+        if let Err(e) = data_sender.send(DataEvent::Data(instrument.clone().into())) {
             log::error!("Failed to emit instrument event: {e}");
         }
     }
@@ -1910,7 +1942,7 @@ struct InstrumentReconciliation {
 /// Fetches every configured instrument type and family, plus spread instruments
 /// when `load_spreads` is set, then updates the data client, HTTP client, and
 /// WebSocket caches with new or materially changed definitions before
-/// publishing them as [`DataEvent::Instrument`]. Unchanged definitions are
+/// publishing them as [`DataEvent::Data`]. Unchanged definitions are
 /// not republished. Cached instruments missing from the response are retained
 /// because they may still back open subscriptions; the instruments WebSocket
 /// channel communicates state changes such as suspension or delisting.
@@ -2837,79 +2869,86 @@ impl DataClient for OKXDataClient {
         self.spawn_task(async move {
             let seq_before = update_lock.write_seq.load(Ordering::SeqCst);
 
-            match http
+            let instrument = match http
                 .request_instrument(instrument_id)
                 .await
                 .context("fetch instrument from API")
             {
-                Ok(instrument) => {
-                    let inst_id = instrument.id();
-                    let symbol = inst_id.symbol.as_str();
-
-                    if instrument.is_spread() {
-                        if !load_spreads {
-                            log::error!(
-                                "Instrument {instrument_id} is a spread but load_spreads is false"
-                            );
-                            return;
-                        }
+                Ok(instrument) => instrument,
+                Err(e) => {
+                    if e.downcast_ref::<OKXInstrumentDefinitionError>().is_some() {
+                        log::warn!("Instrument request skipped: {e:?}");
                     } else {
-                        let inst_type = okx_instrument_type_from_symbol(symbol);
-                        if !instrument_types.contains(&inst_type) {
-                            log::error!(
-                                "Instrument {instrument_id} type {inst_type:?} not in configured types {instrument_types:?}"
-                            );
-                            return;
-                        }
+                        log::error!("Instrument request failed: {e:?}");
                     }
 
-                    if !contract_filter_with_config_types(contract_types.as_ref(), &instrument) {
-                        log::error!(
-                            "Instrument {instrument_id} filtered out by contract_types config"
-                        );
-                        return;
+                    if let Err(e) = sender.send(request_failure(request_id, &e)) {
+                        log::error!("Failed to send instrument request failure: {e}");
                     }
 
-                    {
-                        let _update_guard = update_lock
-                            .mutex
-                            .lock();
-
-                        if update_lock.write_seq.load(Ordering::SeqCst) == seq_before {
-                            cache_instrument_updates(
-                                std::slice::from_ref(&instrument),
-                                &instruments,
-                                &http,
-                                ws_public.as_ref(),
-                                ws_business.as_ref(),
-                                &update_lock,
-                            );
-                        } else {
-                            log::debug!(
-                                "OKX instrument cache changed during request fetch, skipping cache update"
-                            );
-                        }
-                    }
-
-                    let response = DataResponse::Instrument(Box::new(InstrumentResponse::new(
-                        request_id,
-                        client_id,
-                        instrument.id(),
-                        instrument,
-                        start_nanos,
-                        end_nanos,
-                        clock.get_time_ns(),
-                        params,
-                    )));
-
-                    if let Err(e) = sender.send(DataEvent::Response(response)) {
-                        log::error!("Failed to send instrument response: {e}");
-                    }
+                    return;
                 }
-                Err(e) if e.downcast_ref::<OKXInstrumentDefinitionError>().is_some() => {
-                    log::warn!("Instrument request skipped: {e:?}");
+            };
+
+            let inst_id = instrument.id();
+            let symbol = inst_id.symbol.as_str();
+
+            if instrument.is_spread() && !load_spreads {
+                log::error!("Instrument {instrument_id} is a spread but load_spreads is false");
+                return;
+            }
+
+            if !instrument.is_spread() {
+                let inst_type = okx_instrument_type_from_symbol(symbol);
+                if !instrument_types.contains(&inst_type) {
+                    log::error!(
+                        "Instrument {instrument_id} type {inst_type:?} not in configured types {instrument_types:?}"
+                    );
+                    return;
                 }
-                Err(e) => log::error!("Instrument request failed: {e:?}"),
+            }
+
+            if !contract_filter_with_config_types(contract_types.as_ref(), &instrument) {
+                log::error!(
+                    "Instrument {instrument_id} filtered out by contract_types config"
+                );
+                return;
+            }
+
+            {
+                let _update_guard = update_lock
+                    .mutex
+                    .lock();
+
+                if update_lock.write_seq.load(Ordering::SeqCst) == seq_before {
+                    cache_instrument_updates(
+                        std::slice::from_ref(&instrument),
+                        &instruments,
+                        &http,
+                        ws_public.as_ref(),
+                        ws_business.as_ref(),
+                        &update_lock,
+                    );
+                } else {
+                    log::debug!(
+                        "OKX instrument cache changed during request fetch, skipping cache update"
+                    );
+                }
+            }
+
+            let response = DataResponse::Instrument(Box::new(InstrumentResponse::new(
+                request_id,
+                client_id,
+                instrument.id(),
+                instrument,
+                start_nanos,
+                end_nanos,
+                clock.get_time_ns(),
+                params,
+            )));
+
+            if let Err(e) = sender.send(DataEvent::Response(response)) {
+                log::error!("Failed to send instrument response: {e}");
             }
         });
 
@@ -2955,7 +2994,13 @@ impl DataClient for OKXDataClient {
                         log::error!("Failed to send book snapshot response: {e}");
                     }
                 }
-                Err(e) => log::error!("Book snapshot request failed: {e:?}"),
+                Err(e) => {
+                    log::error!("Book snapshot request failed: {e:?}");
+
+                    if let Err(e) = sender.send(request_failure(request_id, &e)) {
+                        log::error!("Failed to send book snapshot request failure: {e}");
+                    }
+                }
             }
         });
 
@@ -2979,11 +3024,11 @@ impl DataClient for OKXDataClient {
 
         self.spawn_task(async move {
             match http
-                .request_trades(instrument_id, start, end, limit)
+                .request_trades_with_coverage(instrument_id, start, end, limit)
                 .await
                 .context("failed to request trades from OKX")
             {
-                Ok(trades) => {
+                Ok((trades, coverage)) => {
                     let response = DataResponse::Trades(TradesResponse::new(
                         request_id,
                         client_id,
@@ -2995,11 +3040,17 @@ impl DataClient for OKXDataClient {
                         params,
                     ));
 
-                    if let Err(e) = sender.send(DataEvent::Response(response)) {
+                    if let Err(e) = sender.send(history_event(request_id, response, coverage)) {
                         log::error!("Failed to send trades response: {e}");
                     }
                 }
-                Err(e) => log::error!("Trade request failed: {e:?}"),
+                Err(e) => {
+                    log::error!("Trade request failed: {e:?}");
+
+                    if let Err(e) = sender.send(request_failure(request_id, &e)) {
+                        log::error!("Failed to send trades request failure: {e}");
+                    }
+                }
             }
         });
 
@@ -3023,11 +3074,11 @@ impl DataClient for OKXDataClient {
 
         self.spawn_task(async move {
             match http
-                .request_bars(bar_type, start, end, limit)
+                .request_bars_with_coverage(bar_type, start, end, limit)
                 .await
                 .context("failed to request bars from OKX")
             {
-                Ok(bars) => {
+                Ok((bars, coverage)) => {
                     let response = DataResponse::Bars(BarsResponse::new(
                         request_id,
                         client_id,
@@ -3039,11 +3090,17 @@ impl DataClient for OKXDataClient {
                         params,
                     ));
 
-                    if let Err(e) = sender.send(DataEvent::Response(response)) {
+                    if let Err(e) = sender.send(history_event(request_id, response, coverage)) {
                         log::error!("Failed to send bars response: {e}");
                     }
                 }
-                Err(e) => log::error!("Bar request failed: {e:?}"),
+                Err(e) => {
+                    log::error!("Bar request failed: {e:?}");
+
+                    if let Err(e) = sender.send(request_failure(request_id, &e)) {
+                        log::error!("Failed to send bars request failure: {e}");
+                    }
+                }
             }
         });
 
@@ -3067,11 +3124,11 @@ impl DataClient for OKXDataClient {
 
         self.spawn_task(async move {
             match http
-                .request_funding_rates(instrument_id, start, end, limit)
+                .request_funding_rates_with_coverage(instrument_id, start, end, limit)
                 .await
                 .context("failed to request funding rates from OKX")
             {
-                Ok(funding_rates) => {
+                Ok((funding_rates, coverage)) => {
                     let response = DataResponse::FundingRates(FundingRatesResponse::new(
                         request_id,
                         client_id,
@@ -3083,11 +3140,17 @@ impl DataClient for OKXDataClient {
                         params,
                     ));
 
-                    if let Err(e) = sender.send(DataEvent::Response(response)) {
+                    if let Err(e) = sender.send(history_event(request_id, response, coverage)) {
                         log::error!("Failed to send funding rates response: {e}");
                     }
                 }
-                Err(e) => log::error!("Funding rates request failed: {e:?}"),
+                Err(e) => {
+                    log::error!("Funding rates request failed: {e:?}");
+
+                    if let Err(e) = sender.send(request_failure(request_id, &e)) {
+                        log::error!("Failed to send funding rates request failure: {e}");
+                    }
+                }
             }
         });
 
@@ -3571,8 +3634,8 @@ mod tests {
         );
 
         match receiver.try_recv().expect("instrument status event") {
-            DataEvent::InstrumentStatus(received) => assert_eq!(received, status),
-            other => panic!("Expected DataEvent::InstrumentStatus, was {other:?}"),
+            DataEvent::Data(Data::InstrumentStatus(received)) => assert_eq!(received, status),
+            other => panic!("Expected DataEvent::Data(Data::InstrumentStatus(...)), was {other:?}"),
         }
         assert!(instruments_by_symbol.load().is_empty());
     }
@@ -4261,22 +4324,22 @@ mod tests {
         );
 
         match receiver.try_recv().expect("instrument event") {
-            DataEvent::Instrument(instrument) => {
+            DataEvent::Data(Data::Instrument(instrument)) => {
                 assert_eq!(instrument.id(), InstrumentId::from("BTC-USDT-SWAP.OKX"));
                 assert_eq!(instrument.price_increment(), Price::from("0.1"));
             }
-            other => panic!("Expected DataEvent::Instrument, was {other:?}"),
+            other => panic!("Expected DataEvent::Data(Data::Instrument(...)), was {other:?}"),
         }
 
         match receiver.try_recv().expect("instrument status event") {
-            DataEvent::InstrumentStatus(status) => {
+            DataEvent::Data(Data::InstrumentStatus(status)) => {
                 assert_eq!(
                     status.instrument_id,
                     InstrumentId::from("BTC-USDT-SWAP.OKX")
                 );
                 assert_eq!(status.action, MarketStatusAction::Trading);
             }
-            other => panic!("Expected DataEvent::InstrumentStatus, was {other:?}"),
+            other => panic!("Expected DataEvent::Data(Data::InstrumentStatus(...)), was {other:?}"),
         }
         assert!(receiver.try_recv().is_err());
 
@@ -4318,23 +4381,26 @@ mod tests {
             );
         }
 
-        assert!(matches!(receiver.try_recv(), Ok(DataEvent::Instrument(_))));
         assert!(matches!(
             receiver.try_recv(),
-            Ok(DataEvent::InstrumentStatus(_))
+            Ok(DataEvent::Data(Data::Instrument(_)))
+        ));
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(DataEvent::Data(Data::InstrumentStatus(_)))
         ));
 
         match receiver
             .try_recv()
             .expect("status event for repeat definition")
         {
-            DataEvent::InstrumentStatus(status) => {
+            DataEvent::Data(Data::InstrumentStatus(status)) => {
                 assert_eq!(
                     status.instrument_id,
                     InstrumentId::from("BTC-USDT-SWAP.OKX")
                 );
             }
-            other => panic!("Expected DataEvent::InstrumentStatus, was {other:?}"),
+            other => panic!("Expected DataEvent::Data(Data::InstrumentStatus(...)), was {other:?}"),
         }
         assert!(
             receiver.try_recv().is_err(),
@@ -4367,31 +4433,34 @@ mod tests {
             ws_instruments_message(swap_definition("0.5")),
         );
 
-        assert!(matches!(receiver.try_recv(), Ok(DataEvent::Instrument(_))));
         assert!(matches!(
             receiver.try_recv(),
-            Ok(DataEvent::InstrumentStatus(_))
+            Ok(DataEvent::Data(Data::Instrument(_)))
+        ));
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(DataEvent::Data(Data::InstrumentStatus(_)))
         ));
 
         match receiver.try_recv().expect("republished instrument") {
-            DataEvent::Instrument(instrument) => {
+            DataEvent::Data(Data::Instrument(instrument)) => {
                 assert_eq!(instrument.id(), InstrumentId::from("BTC-USDT-SWAP.OKX"));
                 assert_eq!(instrument.price_increment(), Price::from("0.5"));
             }
-            other => panic!("Expected DataEvent::Instrument, was {other:?}"),
+            other => panic!("Expected DataEvent::Data(Data::Instrument(...)), was {other:?}"),
         }
 
         match receiver
             .try_recv()
             .expect("status for republished instrument")
         {
-            DataEvent::InstrumentStatus(status) => {
+            DataEvent::Data(Data::InstrumentStatus(status)) => {
                 assert_eq!(
                     status.instrument_id,
                     InstrumentId::from("BTC-USDT-SWAP.OKX")
                 );
             }
-            other => panic!("Expected DataEvent::InstrumentStatus, was {other:?}"),
+            other => panic!("Expected DataEvent::Data(Data::InstrumentStatus(...)), was {other:?}"),
         }
         assert!(receiver.try_recv().is_err());
 
@@ -4423,13 +4492,13 @@ mod tests {
             .try_recv()
             .expect("status event for invalid definition")
         {
-            DataEvent::InstrumentStatus(status) => {
+            DataEvent::Data(Data::InstrumentStatus(status)) => {
                 assert_eq!(
                     status.instrument_id,
                     InstrumentId::from("BTC-USDT-SWAP.OKX")
                 );
             }
-            other => panic!("Expected DataEvent::InstrumentStatus, was {other:?}"),
+            other => panic!("Expected DataEvent::Data(Data::InstrumentStatus(...)), was {other:?}"),
         }
         assert!(
             receiver.try_recv().is_err(),
@@ -4467,8 +4536,10 @@ mod tests {
 
         while let Ok(event) = receiver.try_recv() {
             match event {
-                DataEvent::Instrument(instrument) => published.push(instrument.id()),
-                DataEvent::InstrumentStatus(status) => statuses.push(status.instrument_id),
+                DataEvent::Data(Data::Instrument(instrument)) => published.push(instrument.id()),
+                DataEvent::Data(Data::InstrumentStatus(status)) => {
+                    statuses.push(status.instrument_id);
+                }
                 other => panic!("Unexpected event {other:?}"),
             }
         }
@@ -4512,13 +4583,13 @@ mod tests {
         );
 
         match receiver.try_recv().expect("status event") {
-            DataEvent::InstrumentStatus(status) => {
+            DataEvent::Data(Data::InstrumentStatus(status)) => {
                 assert_eq!(
                     status.instrument_id,
                     InstrumentId::from("BTC-USDT-SWAP.OKX")
                 );
             }
-            other => panic!("Expected DataEvent::InstrumentStatus, was {other:?}"),
+            other => panic!("Expected DataEvent::Data(Data::InstrumentStatus(...)), was {other:?}"),
         }
         assert!(
             receiver.try_recv().is_err(),
@@ -4543,14 +4614,14 @@ mod tests {
         );
 
         match receiver.try_recv().expect("instrument event") {
-            DataEvent::Instrument(instrument) => {
+            DataEvent::Data(Data::Instrument(instrument)) => {
                 assert_eq!(instrument.id(), InstrumentId::from("BTC-USD-SWAP.OKX"));
             }
-            other => panic!("Expected DataEvent::Instrument, was {other:?}"),
+            other => panic!("Expected DataEvent::Data(Data::Instrument(...)), was {other:?}"),
         }
         assert!(matches!(
             receiver.try_recv(),
-            Ok(DataEvent::InstrumentStatus(_))
+            Ok(DataEvent::Data(Data::InstrumentStatus(_)))
         ));
         assert_eq!(instruments_by_symbol.load().len(), 1);
     }
@@ -4580,13 +4651,13 @@ mod tests {
         );
 
         match receiver.try_recv().expect("status event") {
-            DataEvent::InstrumentStatus(status) => {
+            DataEvent::Data(Data::InstrumentStatus(status)) => {
                 assert_eq!(
                     status.instrument_id,
                     InstrumentId::from("ETH-USDT-SWAP.OKX")
                 );
             }
-            other => panic!("Expected DataEvent::InstrumentStatus, was {other:?}"),
+            other => panic!("Expected DataEvent::Data(Data::InstrumentStatus(...)), was {other:?}"),
         }
         assert!(
             receiver.try_recv().is_err(),
@@ -4605,14 +4676,14 @@ mod tests {
         );
 
         match receiver.try_recv().expect("instrument event") {
-            DataEvent::Instrument(instrument) => {
+            DataEvent::Data(Data::Instrument(instrument)) => {
                 assert_eq!(instrument.id(), InstrumentId::from("BTC-USDT-SWAP.OKX"));
             }
-            other => panic!("Expected DataEvent::Instrument, was {other:?}"),
+            other => panic!("Expected DataEvent::Data(Data::Instrument(...)), was {other:?}"),
         }
         assert!(matches!(
             receiver.try_recv(),
-            Ok(DataEvent::InstrumentStatus(_))
+            Ok(DataEvent::Data(Data::InstrumentStatus(_)))
         ));
         assert_eq!(instruments_by_symbol.load().len(), 1);
     }
@@ -4754,13 +4825,13 @@ mod tests {
         );
 
         match receiver.try_recv().expect("status event") {
-            DataEvent::InstrumentStatus(status) => {
+            DataEvent::Data(Data::InstrumentStatus(status)) => {
                 assert_eq!(
                     status.instrument_id,
                     InstrumentId::from("BTC-USDT-SWAP.OKX")
                 );
             }
-            other => panic!("Expected DataEvent::InstrumentStatus, was {other:?}"),
+            other => panic!("Expected DataEvent::Data(Data::InstrumentStatus(...)), was {other:?}"),
         }
         assert!(
             receiver.try_recv().is_err(),
@@ -4943,8 +5014,8 @@ mod tests {
         receiver: &mut tokio::sync::mpsc::UnboundedReceiver<DataEvent>,
     ) -> Vec<InstrumentAny> {
         let mut events = Vec::new();
-        while let Ok(DataEvent::Instrument(instrument)) = receiver.try_recv() {
-            events.push(instrument);
+        while let Ok(DataEvent::Data(Data::Instrument(instrument))) = receiver.try_recv() {
+            events.push(*instrument);
         }
         events
     }
@@ -5282,8 +5353,9 @@ mod tests {
         });
 
         let event = receiver.recv().await.expect("instrument event");
-        let DataEvent::Instrument(instrument) = event else {
-            panic!("Expected DataEvent::Instrument, was {event:?}");
+
+        let DataEvent::Data(Data::Instrument(instrument)) = event else {
+            panic!("Expected DataEvent::Data(Data::Instrument(...)), was {event:?}");
         };
 
         assert!(
@@ -5386,10 +5458,10 @@ mod tests {
         }
 
         match receiver.try_recv().expect("concurrent update event") {
-            DataEvent::Instrument(instrument) => {
+            DataEvent::Data(Data::Instrument(instrument)) => {
                 assert_eq!(instrument.price_increment(), Price::from("0.5"));
             }
-            other => panic!("Expected DataEvent::Instrument, was {other:?}"),
+            other => panic!("Expected DataEvent::Data(Data::Instrument(...)), was {other:?}"),
         }
 
         gate.add_permits(1);
@@ -5736,6 +5808,37 @@ mod tests {
         );
 
         client.disconnect().await.expect("disconnect");
+    }
+
+    #[rstest]
+    #[case::complete(OKXHistoryCoverage::Complete)]
+    #[case::truncated(OKXHistoryCoverage::Truncated)]
+    #[case::unverified(OKXHistoryCoverage::Unverified)]
+    fn test_history_event_follows_coverage(#[case] coverage: OKXHistoryCoverage) {
+        let request_id = UUID4::new();
+        let response = DataResponse::Trades(TradesResponse::new(
+            request_id,
+            *OKX_CLIENT_ID,
+            InstrumentId::from("BTC-USD.OKX"),
+            Vec::new(),
+            None,
+            None,
+            UnixNanos::default(),
+            None,
+        ));
+
+        match (coverage, history_event(request_id, response, coverage)) {
+            (OKXHistoryCoverage::Complete, DataEvent::ResponseEnvelope(envelope)) => {
+                assert!(envelope.completed());
+                assert!(envelope.response().is_some());
+            }
+            (OKXHistoryCoverage::Truncated, DataEvent::RequestFailed(failure)) => {
+                assert_eq!(failure.request_id, request_id);
+                assert!(failure.response.is_some());
+            }
+            (OKXHistoryCoverage::Unverified, DataEvent::Response(_)) => {}
+            (coverage, event) => panic!("{coverage:?} gave {event:?}"),
+        }
     }
 }
 

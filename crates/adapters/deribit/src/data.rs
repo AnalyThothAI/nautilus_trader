@@ -27,6 +27,7 @@ use ahash::{AHashMap, AHashSet};
 use anyhow::Context;
 use async_trait::async_trait;
 use futures_util::StreamExt;
+use indexmap::IndexMap;
 use nautilus_common::{
     clients::{DataClient, execute_bar_subscriptions, execute_instrument_subscriptions},
     live::{runner::get_data_event_sender, sender::EventSender},
@@ -64,11 +65,13 @@ use nautilus_model::{
     instruments::{Instrument, InstrumentAny},
     types::Price,
 };
+use parking_lot::Mutex;
 use rust_decimal::Decimal;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
     common::{
+        capabilities,
         consts::{
             DERIBIT_BOOK_DEFAULT_DEPTH, DERIBIT_BOOK_DEFAULT_GROUP, DERIBIT_BOOK_VALID_DEPTHS,
             DERIBIT_VENUE,
@@ -100,6 +103,7 @@ pub struct DeribitDataClient {
     command_tasks: TaskGroup,
     data_sender: EventSender<DataEvent>,
     instruments: Arc<AtomicMap<InstrumentId, InstrumentAny>>,
+    instruments_lock: Arc<Mutex<()>>,
     mark_price_subs: Arc<AtomicSet<InstrumentId>>,
     index_price_subs: Arc<AtomicSet<InstrumentId>>,
     option_greeks_subs: Arc<AtomicSet<InstrumentId>>,
@@ -187,6 +191,7 @@ impl DeribitDataClient {
             command_tasks,
             data_sender,
             instruments: Arc::new(AtomicMap::new()),
+            instruments_lock: Arc::new(Mutex::new(())),
             mark_price_subs: Arc::new(AtomicSet::new()),
             index_price_subs: Arc::new(AtomicSet::new()),
             option_greeks_subs: Arc::new(AtomicSet::new()),
@@ -325,6 +330,71 @@ impl DeribitDataClient {
         Ok(())
     }
 
+    /// Spawns a task that refreshes instruments for the configured product types.
+    fn spawn_instrument_refresh(&self) -> anyhow::Result<()> {
+        if let Some(future) = self.instrument_refresh() {
+            self.session_tasks
+                .spawn(future)
+                .context("failed to register Deribit instrument refresh task")?;
+        }
+
+        Ok(())
+    }
+
+    fn instrument_refresh(&self) -> Option<impl Future<Output = ()> + Send + 'static> {
+        let minutes = self.config.update_instruments_interval_mins;
+
+        if minutes == 0 {
+            return None;
+        }
+
+        let product_types = if self.config.product_types.is_empty() {
+            vec![DeribitProductType::Future]
+        } else {
+            self.config.product_types.clone()
+        };
+        let interval = Duration::from_secs(minutes.saturating_mul(60));
+        let cancellation = self.cancellation_token.clone();
+        let http_client = self.http_client.clone();
+        let ws_client = self.ws_client.clone();
+        let instruments = Arc::clone(&self.instruments);
+        let instruments_lock = Arc::clone(&self.instruments_lock);
+        let sender = self.data_sender.clone();
+
+        Some(async move {
+            loop {
+                tokio::select! {
+                    biased;
+                    () = cancellation.cancelled() => break,
+                    () = tokio::time::sleep(interval) => {}
+                }
+
+                for product_type in &product_types {
+                    let result = tokio::select! {
+                        biased;
+                        () = cancellation.cancelled() => return,
+                        result = http_client.request_instruments(DeribitCurrency::ANY, Some(*product_type)) => result,
+                    };
+
+                    match result {
+                        Ok(fetched) => cache_instruments(
+                            fetched,
+                            &instruments,
+                            &http_client,
+                            ws_client.as_ref(),
+                            &sender,
+                            &cancellation,
+                            &instruments_lock,
+                        ),
+                        Err(e) => {
+                            log::warn!("Failed to refresh instruments for {product_type:?}: {e}");
+                        }
+                    }
+                }
+            }
+        })
+    }
+
     /// Handles incoming WebSocket messages.
     fn handle_ws_message(
         message: NautilusWsMessage,
@@ -344,12 +414,12 @@ impl DeribitDataClient {
                 let instrument_any = *instrument;
                 instruments.insert(instrument_any.id(), instrument_any.clone());
 
-                if let Err(e) = sender.send(DataEvent::Instrument(instrument_any)) {
+                if let Err(e) = sender.send(DataEvent::Data(instrument_any.into())) {
                     log::warn!("Failed to send instrument update: {e}");
                 }
             }
             NautilusWsMessage::OptionGreeks(greeks) => {
-                if let Err(e) = sender.send(DataEvent::OptionGreeks(greeks)) {
+                if let Err(e) = sender.send(DataEvent::Data(Data::OptionGreeks(greeks))) {
                     log::error!("Failed to send option greeks: {e}");
                 }
             }
@@ -367,13 +437,13 @@ impl DeribitDataClient {
             }
             NautilusWsMessage::FundingRates(funding_rates) => {
                 for funding_rate in funding_rates {
-                    if let Err(e) = sender.send(DataEvent::FundingRate(funding_rate)) {
+                    if let Err(e) = sender.send(DataEvent::Data(Data::FundingRate(funding_rate))) {
                         log::error!("Failed to send funding rate: {e}");
                     }
                 }
             }
             NautilusWsMessage::InstrumentStatus(status) => {
-                if let Err(e) = sender.send(DataEvent::InstrumentStatus(status)) {
+                if let Err(e) = sender.send(DataEvent::Data(Data::InstrumentStatus(status))) {
                     log::error!("Failed to send instrument status event: {e}");
                 }
             }
@@ -419,6 +489,12 @@ impl DeribitDataClient {
                     "Data client received OrderUpdated message (should be handled by execution client): {order:?}"
                 );
             }
+            NautilusWsMessage::OrderModifyDenied(order) => {
+                log::warn!("Data client received order modify denial: {order:?}");
+            }
+            NautilusWsMessage::OrderCancelDenied(order) => {
+                log::warn!("Data client received order cancel denial: {order:?}");
+            }
             NautilusWsMessage::OrderCancelRejected(order) => {
                 log::warn!(
                     "Data client received OrderCancelRejected message (should be handled by execution client): {order:?}"
@@ -461,6 +537,14 @@ impl DeribitDataClient {
             );
         }
         Ok(true)
+    }
+
+    fn validate_public_trades(&self, instrument_id: InstrumentId) -> anyhow::Result<()> {
+        if let Some(instrument) = self.instruments.get_cloned(&instrument_id) {
+            capabilities::validate_public_trades(&instrument)?;
+        }
+
+        Ok(())
     }
 
     // Fetches an instrument over HTTP and seeds the local, HTTP, and WebSocket caches.
@@ -633,6 +717,90 @@ impl DeribitDataClient {
 
         leg_ids
     }
+
+    async fn load_data_instruments(&self) -> anyhow::Result<Vec<InstrumentAny>> {
+        let product_types = if self.config.product_types.is_empty() {
+            vec![DeribitProductType::Future]
+        } else {
+            self.config.product_types.clone()
+        };
+
+        let mut all_instruments = Vec::new();
+
+        for product_type in &product_types {
+            let fetched = self
+                .http_client
+                .request_instruments(DeribitCurrency::ANY, Some(*product_type))
+                .await
+                .with_context(|| format!("failed to request instruments for {product_type:?}"))?;
+            self.cache_loaded_instruments(&fetched);
+            all_instruments.extend(fetched);
+        }
+
+        let required = self
+            .http_client
+            .request_uncached_instruments(self.config.load_ids.as_deref().unwrap_or(&[]))
+            .await
+            .context("failed to load reconciliation instruments")?;
+        self.cache_loaded_instruments(&required);
+        all_instruments.extend(required);
+        self.append_cached_load_ids(&mut all_instruments);
+        log::debug!(
+            "Cached instruments: client_id={}, total={}",
+            self.client_id,
+            all_instruments.len()
+        );
+        Ok(all_instruments)
+    }
+
+    fn cache_loaded_instruments(&self, instruments: &[InstrumentAny]) {
+        if instruments.is_empty() {
+            return;
+        }
+
+        self.http_client.cache_instruments(instruments);
+        self.instruments.rcu(|cached| {
+            for instrument in instruments {
+                cached.insert(instrument.id(), instrument.clone());
+            }
+        });
+    }
+
+    fn append_cached_load_ids(&self, instruments: &mut Vec<InstrumentAny>) {
+        let Some(load_ids) = self
+            .config
+            .load_ids
+            .as_deref()
+            .filter(|ids| !ids.is_empty())
+        else {
+            return;
+        };
+
+        let mut cached = Vec::new();
+
+        for instrument_id in load_ids {
+            if instruments
+                .iter()
+                .any(|instrument| instrument.id() == *instrument_id)
+            {
+                continue;
+            }
+
+            let Some(instrument) = self
+                .http_client
+                .get_instrument(&instrument_id.symbol.inner())
+            else {
+                continue;
+            };
+
+            if instrument.id() == *instrument_id {
+                cached.push(instrument);
+            }
+        }
+
+        self.cache_loaded_instruments(&cached);
+        instruments.extend(cached);
+    }
 }
 
 #[async_trait(?Send)]
@@ -657,6 +825,7 @@ impl DataClient for DeribitDataClient {
     fn stop(&mut self) -> anyhow::Result<()> {
         log::info!("Stopping data client: {}", self.client_id);
         self.session_tasks.begin_shutdown();
+        let _guard = self.instruments_lock.lock();
         self.command_tasks.begin_shutdown();
         if let Some(ws) = self.ws_client.as_ref() {
             ws.begin_shutdown();
@@ -674,7 +843,10 @@ impl DataClient for DeribitDataClient {
         }
         self.is_connected.store(false, Ordering::Relaxed);
 
-        self.instruments.store(AHashMap::new());
+        {
+            let _guard = self.instruments_lock.lock();
+            self.instruments.store(AHashMap::new());
+        }
         self.combo_leg_trade_subs.store(AHashMap::new());
         Ok(())
     }
@@ -711,45 +883,11 @@ impl DataClient for DeribitDataClient {
 
         register_deribit_custom_data();
 
-        // Fetch instruments for each configured product type
-        let product_types = if self.config.product_types.is_empty() {
-            vec![DeribitProductType::Future]
-        } else {
-            self.config.product_types.clone()
-        };
-
-        let mut all_instruments = Vec::new();
-
-        for product_type in &product_types {
-            let fetched = self
-                .http_client
-                .request_instruments(DeribitCurrency::ANY, Some(*product_type))
-                .await
-                .with_context(|| format!("failed to request instruments for {product_type:?}"))?;
-
-            // Cache in http client
-            self.http_client.cache_instruments(&fetched);
-
-            // Cache locally
-            self.instruments.rcu(|m| {
-                for instrument in &fetched {
-                    m.insert(instrument.id(), instrument.clone());
-                }
-            });
-
-            all_instruments.extend(fetched);
-        }
-
-        log::debug!(
-            "Cached instruments: client_id={}, total={}",
-            self.client_id,
-            all_instruments.len()
-        );
-
+        let all_instruments = self.load_data_instruments().await?;
         for instrument in &all_instruments {
             if let Err(e) = self
                 .data_sender
-                .send(DataEvent::Instrument(instrument.clone()))
+                .send(DataEvent::Data(instrument.clone().into()))
             {
                 log::warn!("Failed to send instrument: {e}");
             }
@@ -806,7 +944,10 @@ impl DataClient for DeribitDataClient {
             }
         };
 
-        if let Err(e) = self.spawn_stream_task(stream) {
+        if let Err(e) = self
+            .spawn_stream_task(stream)
+            .and_then(|()| self.spawn_instrument_refresh())
+        {
             if let Err(teardown_error) = self.teardown_partial_connect().await {
                 return Err(e.context(format!(
                     "Deribit data startup teardown failed: {teardown_error}"
@@ -1015,7 +1156,7 @@ impl DataClient for DeribitDataClient {
                 }
 
                 if let Err(e) = ws
-                    .subscribe_book_grouped(instrument_id, &group, 10, interval)
+                    .subscribe_book_depth(instrument_id, &group, interval)
                     .await
                 {
                     log::error!("Failed to subscribe to book depth for {instrument_id}: {e}");
@@ -1153,6 +1294,7 @@ impl DataClient for DeribitDataClient {
     fn subscribe_bars(&mut self, cmd: SubscribeBars) -> anyhow::Result<()> {
         execute_bar_subscriptions(&cmd.bar_types, |bar_type| {
             let instrument_id = bar_type.instrument_id();
+            self.validate_public_trades(instrument_id)?;
             let needs_load = self.prepare_subscribe(instrument_id)?;
 
             let ws = self
@@ -1515,7 +1657,7 @@ impl DataClient for DeribitDataClient {
 
             self.spawn_command(async move {
                 if let Err(e) = ws
-                    .unsubscribe_book_grouped(instrument_id, &group, 10, interval)
+                    .unsubscribe_book_depth(instrument_id, &group, interval)
                     .await
                 {
                     log::error!("Failed to unsubscribe from book depth for {instrument_id}: {e}");
@@ -1944,6 +2086,7 @@ impl DataClient for DeribitDataClient {
 
     fn request_trades(&self, request: RequestTrades) -> anyhow::Result<()> {
         let instrument_id = request.single_instrument_id()?;
+        self.validate_public_trades(instrument_id)?;
 
         let http_client = self.http_client.clone();
         let sender = self.data_sender.clone();
@@ -1988,6 +2131,7 @@ impl DataClient for DeribitDataClient {
 
     fn request_bars(&self, request: RequestBars) -> anyhow::Result<()> {
         let bar_type = request.single_bar_type()?;
+        self.validate_public_trades(bar_type.instrument_id())?;
 
         let http_client = self.http_client.clone();
         let sender = self.data_sender.clone();
@@ -2226,6 +2370,7 @@ impl DeribitDataClient {
         instrument_id: InstrumentId,
         cmd: &SubscribeTrades,
     ) -> anyhow::Result<()> {
+        self.validate_public_trades(instrument_id)?;
         let command_id = cmd.command_id;
         let needs_load = self.prepare_subscribe(instrument_id)?;
         let subscribe_combo_legs = Self::subscribe_combo_legs(&cmd.params);
@@ -2327,5 +2472,246 @@ impl DeribitDataClient {
         }
 
         subscription_ids
+    }
+}
+
+// Caches and publishes refreshed instruments unless shutdown has begun, taking the lock orders
+// a refresh against `stop` and `reset`, so one finishing during either cannot repopulate the
+// cache or publish after it.
+fn cache_instruments(
+    mut fetched: Vec<InstrumentAny>,
+    instruments: &AtomicMap<InstrumentId, InstrumentAny>,
+    http_client: &DeribitHttpClient,
+    ws_client: Option<&DeribitWebSocketClient>,
+    sender: &EventSender<DataEvent>,
+    cancellation: &CancellationToken,
+    instruments_lock: &Mutex<()>,
+) {
+    fetched.sort_by_key(|instrument| instrument.id());
+    let _guard = instruments_lock.lock();
+
+    if cancellation.is_cancelled() {
+        return;
+    }
+
+    let cached = instruments.load();
+    for instrument in &mut fetched {
+        if let Some(cached) = cached.get(&instrument.id()) {
+            preserve_combo_leg_info(instrument, cached);
+        }
+    }
+    drop(cached);
+
+    instruments.rcu(|m| {
+        for instrument in &fetched {
+            m.insert(instrument.id(), instrument.clone());
+        }
+    });
+    http_client.cache_instruments(&fetched);
+
+    if let Some(ws) = ws_client {
+        ws.cache_instruments(&fetched);
+    }
+
+    for instrument in fetched {
+        if let Err(e) = sender.send(DataEvent::Data(instrument.into())) {
+            log::warn!("Failed to send instrument: {e}");
+        }
+    }
+}
+
+// `request_instruments` still succeeds when its supplementary `get_combos` request fails, returning
+// combos without leg metadata, so carry the last known legs forward until a later refresh reloads
+// them and combo leg subscriptions keep working.
+fn preserve_combo_leg_info(instrument: &mut InstrumentAny, cached: &InstrumentAny) {
+    let (info, cached_info) = match (instrument, cached) {
+        (InstrumentAny::CryptoOptionSpread(spread), InstrumentAny::CryptoOptionSpread(cached)) => {
+            (&mut spread.info, &cached.info)
+        }
+        (
+            InstrumentAny::CryptoFuturesSpread(spread),
+            InstrumentAny::CryptoFuturesSpread(cached),
+        ) => (&mut spread.info, &cached.info),
+        _ => return,
+    };
+
+    if info
+        .as_ref()
+        .is_some_and(|info| info.contains_key("deribit_combo_legs"))
+    {
+        return;
+    }
+
+    let Some(cached_info) = cached_info
+        .as_ref()
+        .filter(|cached_info| cached_info.contains_key("deribit_combo_legs"))
+    else {
+        return;
+    };
+
+    let mut merged = info
+        .as_ref()
+        .map(|info| IndexMap::clone(info))
+        .unwrap_or_default();
+
+    for key in [
+        "deribit_combo_id",
+        "deribit_combo_state",
+        "deribit_combo_legs",
+    ] {
+        if let Some(value) = cached_info.get(key) {
+            merged.insert(key.to_string(), value.clone());
+        }
+    }
+    *info = Some(Params::new(merged));
+}
+
+#[cfg(test)]
+#[path = "../tests/integration/data_client.rs"]
+mod data_client_tests;
+
+#[cfg(test)]
+mod tests {
+    use nautilus_common::live::runner::replace_data_event_sender;
+    use nautilus_core::UnixNanos;
+    use rstest::rstest;
+
+    use super::*;
+    use crate::{
+        common::{
+            consts::DERIBIT_CLIENT_ID, parse::parse_deribit_instrument_any,
+            rpc::DeribitJsonRpcResponse, testing::load_test_json,
+        },
+        http::models::DeribitInstrument,
+    };
+
+    fn perpetual(ts_init: u64) -> InstrumentAny {
+        let response: DeribitJsonRpcResponse<Vec<DeribitInstrument>> =
+            serde_json::from_str(&load_test_json("http_get_instruments.json")).unwrap();
+        let definition = response
+            .result
+            .unwrap()
+            .into_iter()
+            .find(|instrument| instrument.instrument_name == "BTC-PERPETUAL")
+            .unwrap();
+        let ts_init = UnixNanos::from(ts_init);
+        parse_deribit_instrument_any(&definition, ts_init, ts_init)
+            .unwrap()
+            .unwrap()
+    }
+
+    #[rstest]
+    #[case::stop("stop")]
+    #[case::reset("reset")]
+    #[case::dispose("dispose")]
+    #[tokio::test]
+    async fn test_cache_instruments_rejects_completion_after_shutdown(#[case] shutdown: &str) {
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        replace_data_event_sender(sender);
+        let mut client =
+            DeribitDataClient::new(*DERIBIT_CLIENT_ID, DeribitDataClientConfig::default()).unwrap();
+        let original = perpetual(1);
+        let instrument_id = original.id();
+        client.instruments.insert(instrument_id, original);
+        let cancellation = client.cancellation_token.clone();
+
+        match shutdown {
+            "stop" => client.stop().unwrap(),
+            "reset" => client.reset().unwrap(),
+            "dispose" => client.dispose().unwrap(),
+            _ => unreachable!(),
+        }
+
+        cache_instruments(
+            vec![perpetual(2)],
+            &client.instruments,
+            &client.http_client,
+            client.ws_client.as_ref(),
+            &client.data_sender,
+            &cancellation,
+            &client.instruments_lock,
+        );
+
+        let expected = (shutdown != "reset").then_some(UnixNanos::from(1));
+        assert_eq!(
+            client
+                .instruments
+                .get_cloned(&instrument_id)
+                .map(|instrument| instrument.ts_init()),
+            expected
+        );
+        assert!(
+            client
+                .http_client
+                .get_instrument(&instrument_id.symbol.inner())
+                .is_none()
+        );
+        assert!(receiver.try_recv().is_err());
+    }
+
+    fn combo(fixture: &str, legs: Option<&str>) -> InstrumentAny {
+        let response: DeribitJsonRpcResponse<Vec<DeribitInstrument>> =
+            serde_json::from_str(&load_test_json(fixture)).unwrap();
+        let definition = response.result.unwrap().remove(0);
+        let ts_init = UnixNanos::default();
+        let mut instrument = parse_deribit_instrument_any(&definition, ts_init, ts_init)
+            .unwrap()
+            .unwrap();
+        let info = legs.map(|leg| {
+            Params::new(IndexMap::from([(
+                "deribit_combo_legs".to_string(),
+                serde_json::json!([{ "instrument_name": leg }]),
+            )]))
+        });
+
+        match &mut instrument {
+            InstrumentAny::CryptoOptionSpread(spread) => spread.info = info,
+            InstrumentAny::CryptoFuturesSpread(spread) => spread.info = info,
+            _ => panic!("expected spread, was {instrument:?}"),
+        }
+        instrument
+    }
+
+    fn combo_leg_name(instrument: &InstrumentAny) -> Option<&str> {
+        let info = match instrument {
+            InstrumentAny::CryptoOptionSpread(spread) => spread.info.as_ref(),
+            InstrumentAny::CryptoFuturesSpread(spread) => spread.info.as_ref(),
+            _ => None,
+        }?;
+        info.get("deribit_combo_legs")?[0]["instrument_name"].as_str()
+    }
+
+    #[rstest]
+    #[case::option_preserved(
+        "http_get_instruments_option_combo.json",
+        None,
+        Some("cached"),
+        Some("cached")
+    )]
+    #[case::futures_preserved(
+        "http_get_instruments_future_combo.json",
+        None,
+        Some("cached"),
+        Some("cached")
+    )]
+    #[case::fresh_wins(
+        "http_get_instruments_future_combo.json",
+        Some("fresh"),
+        Some("cached"),
+        Some("fresh")
+    )]
+    #[case::nothing_cached("http_get_instruments_future_combo.json", None, None, None)]
+    fn test_preserve_combo_leg_info(
+        #[case] fixture: &str,
+        #[case] fetched_legs: Option<&str>,
+        #[case] cached_legs: Option<&str>,
+        #[case] expected: Option<&str>,
+    ) {
+        let mut fetched = combo(fixture, fetched_legs);
+        let cached = combo(fixture, cached_legs);
+
+        preserve_combo_leg_info(&mut fetched, &cached);
+
+        assert_eq!(combo_leg_name(&fetched), expected);
     }
 }

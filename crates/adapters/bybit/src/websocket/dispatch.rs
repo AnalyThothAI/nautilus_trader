@@ -101,6 +101,7 @@ pub type PendingRequestData = (
     Vec<ClientOrderId>,
     Vec<Option<VenueOrderId>>,
     PendingOperation,
+    Vec<Option<UUID4>>,
 );
 
 /// Snapshot of an order's price, quantity, and trigger price at last dispatch.
@@ -274,6 +275,9 @@ pub fn dispatch_ws_message(
                     Err(e) => log::error!("Failed to parse position status report: {e}"),
                 }
             }
+        }
+        BybitWsMessage::OrderNotSent { request_id, reason } => {
+            dispatch_order_not_sent(request_id, reason, emitter, state, clock.get_time_ns());
         }
         BybitWsMessage::OrderResponse(resp) => {
             let ts_init = clock.get_time_ns();
@@ -686,20 +690,19 @@ fn dispatch_execution_fill(
         .and_then(|cid| state.order_identities.get(cid).map(|r| r.clone()));
 
     if let (Some(client_order_id), Some(identity)) = (client_order_id, identity) {
-        let venue_order_id = VenueOrderId::new(exec.order_id);
-
-        ensure_accepted_emitted(
-            client_order_id,
-            account_id,
-            venue_order_id,
-            &identity,
-            emitter,
-            state,
-            ts_init,
-        );
-
         match parse_order_filled(exec, instrument, &identity, emitter, account_id, ts_init) {
             Ok(filled) => {
+                let venue_order_id = filled.venue_order_id;
+                ensure_accepted_emitted(
+                    client_order_id,
+                    account_id,
+                    venue_order_id,
+                    &identity,
+                    emitter,
+                    state,
+                    ts_init,
+                );
+
                 let is_spot_buy =
                     exec.category == BybitProductType::Spot && exec.side == BybitOrderSide::Buy;
 
@@ -858,7 +861,7 @@ fn dispatch_order_response(
             .and_then(|rid| state.pending_requests.remove(rid))
             .map(|(_, v)| v);
 
-        if let Some((cids, voids, pending_op)) = pending {
+        if let Some((cids, voids, pending_op, command_ids)) = pending {
             let batch_errors = resp.extract_batch_errors();
             let data_array = resp.data.as_array();
 
@@ -910,6 +913,7 @@ fn dispatch_order_response(
                     emitter,
                     state,
                     ts_init,
+                    command_ids.get(idx).copied().flatten(),
                 );
             }
         }
@@ -924,11 +928,13 @@ fn dispatch_order_response(
         .map(|(_, v)| v);
 
     let is_batch_response = is_batch_order_op(resp.op.as_str())
-        || pending.as_ref().is_some_and(|(cids, _, _)| cids.len() > 1);
+        || pending
+            .as_ref()
+            .is_some_and(|(cids, _, _, _)| cids.len() > 1);
 
     if is_batch_response {
         if is_bybit_ambiguous_order_error_code(resp.ret_code) {
-            let order_count = pending.as_ref().map_or(0, |(cids, _, _)| cids.len());
+            let order_count = pending.as_ref().map_or(0, |(cids, _, _, _)| cids.len());
             log::warn!(
                 "Ambiguous batch order response failure for {order_count} orders: op={}, ret_code={}, ret_msg={}; awaiting reconciliation",
                 resp.op,
@@ -938,7 +944,7 @@ fn dispatch_order_response(
             return;
         }
 
-        let Some((client_order_ids, venue_order_ids, pending_op)) = pending else {
+        let Some((client_order_ids, venue_order_ids, pending_op, command_ids)) = pending else {
             log::warn!(
                 "Batch order response error without correlation: op={}, ret_code={}, ret_msg={}, req_id={:?}",
                 resp.op,
@@ -971,6 +977,7 @@ fn dispatch_order_response(
                 emitter,
                 state,
                 ts_init,
+                command_ids.get(index).copied().flatten(),
             );
         }
         return;
@@ -988,7 +995,7 @@ fn dispatch_order_response(
 
     let effective_op = pending
         .as_ref()
-        .map(|(_, _, op)| *op)
+        .map(|(_, _, op, _)| *op)
         .or_else(|| pending_op_from_str(resp.op.as_str()))
         .unwrap_or_else(|| {
             log::warn!("Unknown order operation '{}', defaulting to Place", resp.op);
@@ -999,12 +1006,12 @@ fn dispatch_order_response(
     let client_order_id = extract_order_link_id_from_data(&resp.data).or_else(|| {
         pending
             .as_ref()
-            .and_then(|(cids, _, _)| cids.first().copied())
+            .and_then(|(cids, _, _, _)| cids.first().copied())
     });
 
     let stored_venue_order_id = pending
         .as_ref()
-        .and_then(|(_, voids, _)| voids.first().and_then(|v| *v));
+        .and_then(|(_, voids, _, _)| voids.first().and_then(|v| *v));
 
     let Some(client_order_id) = client_order_id else {
         log::warn!(
@@ -1040,7 +1047,72 @@ fn dispatch_order_response(
         emitter,
         state,
         ts_init,
+        pending.as_ref().and_then(|(cids, _, _, command_ids)| {
+            cids.iter()
+                .position(|id| *id == client_order_id)
+                .and_then(|index| command_ids.get(index).copied().flatten())
+        }),
     );
+}
+
+fn dispatch_order_not_sent(
+    request_id: &str,
+    reason: &str,
+    emitter: &ExecutionEventEmitter,
+    state: &WsDispatchState,
+    ts_init: UnixNanos,
+) {
+    let Some((_, (client_order_ids, venue_order_ids, operation, command_ids))) =
+        state.pending_requests.remove(request_id)
+    else {
+        log::warn!("Unsent order command has no request correlation: {request_id}");
+        return;
+    };
+
+    for (index, client_order_id) in client_order_ids.into_iter().enumerate() {
+        let Some(identity) = state
+            .order_identities
+            .get(&client_order_id)
+            .map(|entry| entry.clone())
+        else {
+            continue;
+        };
+
+        let venue_order_id = venue_order_ids.get(index).copied().flatten();
+        let causation_id = command_ids.get(index).copied().flatten();
+
+        match operation {
+            PendingOperation::Place => emit_rejection_for_op(
+                &operation,
+                client_order_id,
+                &identity,
+                venue_order_id,
+                reason,
+                emitter,
+                state,
+                ts_init,
+                causation_id,
+            ),
+            PendingOperation::Amend => emitter.emit_order_modify_denied_event(
+                identity.strategy_id,
+                identity.instrument_id,
+                client_order_id,
+                venue_order_id,
+                reason,
+                ts_init,
+                causation_id,
+            ),
+            PendingOperation::Cancel => emitter.emit_order_cancel_denied_event(
+                identity.strategy_id,
+                identity.instrument_id,
+                client_order_id,
+                venue_order_id,
+                reason,
+                ts_init,
+                causation_id,
+            ),
+        }
+    }
 }
 
 /// Emits the appropriate rejection event based on the pending operation type.
@@ -1054,6 +1126,7 @@ fn emit_rejection_for_op(
     emitter: &ExecutionEventEmitter,
     state: &WsDispatchState,
     ts_init: UnixNanos,
+    causation_id: Option<UUID4>,
 ) {
     match pending_op {
         PendingOperation::Place => {
@@ -1076,6 +1149,7 @@ fn emit_rejection_for_op(
                 venue_order_id,
                 reason,
                 ts_init,
+                causation_id,
             );
         }
         PendingOperation::Amend => {
@@ -1086,6 +1160,7 @@ fn emit_rejection_for_op(
                 venue_order_id,
                 reason,
                 ts_init,
+                causation_id,
             );
         }
     }
@@ -1279,14 +1354,18 @@ mod tests {
         UnixNanos,
         time::{AtomicTime, get_atomic_clock_realtime},
     };
-    use nautilus_live::emitter::ExecutionEventEmitter;
+    use nautilus_live::{emitter::ExecutionEventEmitter, testing::ExecutionHarness};
     use nautilus_model::{
-        enums::{AccountType, OrderSide, OrderType},
+        accounts::MarginAccount,
+        enums::{AccountType, OrderSide, OrderStatus, OrderType},
         events::OrderEventAny,
         identifiers::{
             AccountId, ClientOrderId, InstrumentId, PositionId, StrategyId, TraderId, VenueOrderId,
         },
         instruments::{Instrument, InstrumentAny},
+        orders::{Order, builder::OrderTestBuilder, stubs::TestOrderEventStubs},
+        reports::FillReport,
+        types::Currency,
     };
     use rstest::rstest;
     use ustr::Ustr;
@@ -1610,6 +1689,327 @@ mod tests {
             }
             other => panic!("Expected Filled event, found {other:?}"),
         }
+    }
+
+    #[rstest]
+    #[case::commission_overflow("execFee", "9999999999999999999999999999")]
+    #[case::commission_parse("execFee", "invalid")]
+    #[case::qty("execQty", "invalid")]
+    #[case::price("execPrice", "invalid")]
+    #[case::timestamp("execTime", "invalid")]
+    #[case::trade_id("execId", "")]
+    fn test_dispatch_invalid_execution_preserves_state(
+        #[case] field: &str,
+        #[case] value: &str,
+        #[values(false, true)] spot: bool,
+    ) {
+        let instrument = if spot {
+            spot_instrument()
+        } else {
+            linear_instrument()
+        };
+
+        let instruments = build_instruments(std::slice::from_ref(&instrument));
+        let (emitter, mut rx) = create_emitter();
+        let state = WsDispatchState::default();
+        let (repay_tx, mut repay_rx) = tokio::sync::mpsc::unbounded_channel();
+        state.set_repay_sender(repay_tx);
+        let mut payload: serde_json::Value =
+            serde_json::from_str(&load_test_json("ws_account_execution.json")).unwrap();
+        payload["data"][0][field] = serde_json::Value::String(value.to_string());
+        payload["data"][0]["side"] = serde_json::Value::String("Buy".to_string());
+        if spot {
+            payload["data"][0]["category"] = serde_json::Value::String("spot".to_string());
+        }
+
+        let msg: crate::websocket::messages::BybitWsAccountExecutionMsg =
+            serde_json::from_value(payload).unwrap();
+        let cid = ClientOrderId::new(msg.data[0].order_link_id);
+
+        let identity = OrderIdentity {
+            instrument_id: instrument.id(),
+            venue_position_id: Some(PositionId::from("P-001")),
+            ..default_identity()
+        };
+
+        state.order_identities.insert(cid, identity.clone());
+        state.order_snapshots.insert(
+            cid,
+            OrderStateSnapshot {
+                quantity: Quantity::from("0.500"),
+                price: Some(Price::from("95900.1")),
+                trigger_price: Some(Price::from("95800.2")),
+            },
+        );
+
+        state.insert_triggered(cid);
+
+        dispatch_ws_message(
+            &BybitWsMessage::AccountExecution(msg),
+            &emitter,
+            &state,
+            test_account_id(),
+            &instruments,
+            get_atomic_clock_realtime(),
+        );
+
+        assert!(rx.try_recv().is_err());
+        assert!(repay_rx.try_recv().is_err());
+        assert!(state.emitted_accepted.is_empty());
+        assert!(state.filled_orders.is_empty());
+        assert!(state.spot_repay_fills.is_empty());
+        assert!(state.pending_requests.is_empty());
+        assert_eq!(state.triggered_orders.len(), 1);
+        assert!(state.triggered_orders.contains(&cid));
+        assert_eq!(state.order_identities.len(), 1);
+        let retained = state.order_identities.get(&cid).unwrap();
+        assert_eq!(retained.instrument_id, identity.instrument_id);
+        assert_eq!(retained.strategy_id, identity.strategy_id);
+        assert_eq!(retained.order_side, identity.order_side);
+        assert_eq!(retained.order_type, identity.order_type);
+        assert_eq!(retained.venue_position_id, identity.venue_position_id);
+        assert_eq!(state.order_snapshots.len(), 1);
+        let snapshot = state.order_snapshots.get(&cid).unwrap();
+        assert_eq!(snapshot.quantity, Quantity::from("0.500"));
+        assert_eq!(snapshot.price, Some(Price::from("95900.1")));
+        assert_eq!(snapshot.trigger_price, Some(Price::from("95800.2")));
+    }
+
+    #[rstest]
+    #[case::partial("0.5", "1.000", OrderStatus::PartiallyFilled)]
+    #[case::terminal("0", "0.500", OrderStatus::Filled)]
+    fn test_dispatch_execution_commission_failure_recovery_and_replay(
+        #[case] leaves_qty: &str,
+        #[case] order_qty: &str,
+        #[case] expected_status: OrderStatus,
+    ) {
+        let instrument = linear_instrument();
+        let instruments = build_instruments(std::slice::from_ref(&instrument));
+        let (emitter, mut rx) = create_emitter();
+        let state = WsDispatchState::default();
+        let clock = AtomicTime::new(false, UnixNanos::new(1_746_270_400_400_000_000));
+        let mut msg: crate::websocket::messages::BybitWsAccountExecutionMsg =
+            serde_json::from_str(&load_test_json("ws_account_execution.json")).unwrap();
+        msg.data[0].leaves_qty = leaves_qty.to_string();
+        msg.data[0].side = BybitOrderSide::Buy;
+        msg.data[0].exec_fee = "9999999999999999999999999999".to_string();
+        let cid = ClientOrderId::new(msg.data[0].order_link_id);
+        let identity = default_identity();
+        state.order_identities.insert(cid, identity.clone());
+
+        let harness = ExecutionHarness::new(
+            emitter.trader_id(),
+            *crate::common::consts::BYBIT_CLIENT_ID,
+            test_account_id(),
+            instrument.clone(),
+        );
+        let wallet: crate::websocket::messages::BybitWsAccountWalletMsg =
+            serde_json::from_str(&load_test_json("ws_account_wallet.json")).unwrap();
+        let account_state = parse_ws_account_state(
+            &wallet.data[0],
+            test_account_id(),
+            UnixNanos::default(),
+            UnixNanos::default(),
+        )
+        .unwrap();
+        let account = MarginAccount::new(account_state, false);
+        harness
+            .cache()
+            .borrow_mut()
+            .add_account(account.into())
+            .unwrap();
+        let mut order = OrderTestBuilder::new(identity.order_type)
+            .trader_id(emitter.trader_id())
+            .strategy_id(identity.strategy_id)
+            .instrument_id(instrument.id())
+            .client_order_id(cid)
+            .side(identity.order_side)
+            .quantity(Quantity::from(order_qty))
+            .price(Price::from("94942.5"))
+            .build();
+        let submitted = TestOrderEventStubs::submitted(&order, test_account_id());
+        order.apply(submitted).unwrap();
+        harness
+            .cache()
+            .borrow_mut()
+            .add_order(order, None, None, false)
+            .unwrap();
+
+        dispatch_ws_message(
+            &BybitWsMessage::AccountExecution(msg.clone()),
+            &emitter,
+            &state,
+            test_account_id(),
+            &instruments,
+            &clock,
+        );
+
+        assert!(rx.try_recv().is_err());
+        assert!(state.emitted_accepted.is_empty());
+        assert!(state.filled_orders.is_empty());
+        assert_eq!(state.order_identities.len(), 1);
+
+        msg.data[0].exec_fee = "0.01234567".to_string();
+        let message = BybitWsMessage::AccountExecution(msg);
+        dispatch_ws_message(
+            &message,
+            &emitter,
+            &state,
+            test_account_id(),
+            &instruments,
+            &clock,
+        );
+
+        let ExecutionEvent::Order(OrderEventAny::Accepted(accepted)) = rx.try_recv().unwrap()
+        else {
+            panic!("expected Accepted before Filled");
+        };
+
+        let expected_accepted = OrderAccepted::new(
+            emitter.trader_id(),
+            identity.strategy_id,
+            instrument.id(),
+            cid,
+            VenueOrderId::from("9aac161b-8ed6-450d-9cab-c5cc67c21784"),
+            test_account_id(),
+            accepted.event_id,
+            clock.get_time_ns(),
+            clock.get_time_ns(),
+            false,
+        );
+        assert_eq!(accepted, expected_accepted);
+        harness
+            .exec_engine()
+            .borrow_mut()
+            .process(&OrderEventAny::Accepted(accepted));
+
+        let ExecutionEvent::Order(OrderEventAny::Filled(filled)) = rx.try_recv().unwrap() else {
+            panic!("expected Filled after Accepted");
+        };
+
+        let commission = Money::from("0.01234567 USDT");
+
+        let expected_filled = OrderFilled::new(
+            emitter.trader_id(),
+            identity.strategy_id,
+            instrument.id(),
+            cid,
+            VenueOrderId::from("9aac161b-8ed6-450d-9cab-c5cc67c21784"),
+            test_account_id(),
+            TradeId::from("0ab1bdf7-4219-438b-b30a-32ec863018f7"),
+            OrderSide::Buy,
+            OrderType::Limit,
+            Quantity::from("0.500"),
+            Price::from("95900.1"),
+            Currency::USDT(),
+            LiquiditySide::Taker,
+            filled.event_id,
+            UnixNanos::new(1_746_270_400_353_000_000),
+            clock.get_time_ns(),
+            false,
+            None,
+            Some(commission),
+            None,
+        );
+        assert_eq!(filled, expected_filled);
+        assert!(rx.try_recv().is_err());
+        harness
+            .exec_engine()
+            .borrow_mut()
+            .process(&OrderEventAny::Filled(filled.clone()));
+        let applied = harness.cache().borrow().order(&cid).unwrap().clone();
+        assert_eq!(applied.status(), expected_status);
+        assert_eq!(applied.filled_qty(), Quantity::from("0.500"));
+        assert_eq!(
+            applied.commissions().get(&Currency::USDT()),
+            Some(&commission)
+        );
+        assert_eq!(applied.trade_ids(), vec![&filled.trade_id]);
+        let position_id = *harness.cache().borrow().position_id(&cid).unwrap();
+        let position = harness
+            .cache()
+            .borrow()
+            .position(&position_id)
+            .unwrap()
+            .clone();
+        assert_eq!(position.quantity, Quantity::from("0.500"));
+        assert_eq!(position.commissions(), vec![commission]);
+        let mut expected_position_fill = filled.clone();
+        expected_position_fill.position_id = Some(position_id);
+        assert_eq!(position.events, vec![expected_position_fill]);
+
+        dispatch_ws_message(
+            &message,
+            &emitter,
+            &state,
+            test_account_id(),
+            &instruments,
+            &clock,
+        );
+        let replay = rx.try_recv().unwrap();
+        match replay {
+            ExecutionEvent::Order(OrderEventAny::Filled(replayed)) => {
+                let expected_replay = OrderFilled {
+                    event_id: replayed.event_id,
+                    ..filled.clone()
+                };
+
+                assert_eq!(replayed, expected_replay);
+                assert_eq!(leaves_qty, "0.5");
+                harness
+                    .exec_engine()
+                    .borrow_mut()
+                    .process(&OrderEventAny::Filled(replayed));
+            }
+            ExecutionEvent::Report(ExecutionReport::Fill(report)) => {
+                let expected_report = FillReport::new(
+                    filled.account_id,
+                    filled.instrument_id,
+                    filled.venue_order_id,
+                    filled.trade_id,
+                    filled.order_side,
+                    filled.last_qty,
+                    filled.last_px,
+                    commission,
+                    filled.liquidity_side,
+                    Some(cid),
+                    None,
+                    filled.ts_event,
+                    filled.ts_init,
+                    Some(report.report_id),
+                );
+                assert_eq!(*report, expected_report);
+                assert_eq!(leaves_qty, "0");
+                harness
+                    .exec_engine()
+                    .borrow_mut()
+                    .reconcile_fill_report(&report);
+            }
+            other => panic!("unexpected replay: {other:?}"),
+        }
+
+        harness
+            .exec_engine()
+            .borrow_mut()
+            .process(&OrderEventAny::Filled(filled));
+
+        assert!(rx.try_recv().is_err());
+        assert_eq!(
+            serde_json::to_value(harness.cache().borrow().order(&cid).unwrap().clone()).unwrap(),
+            serde_json::to_value(&applied).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(
+                harness
+                    .cache()
+                    .borrow()
+                    .position(&position_id)
+                    .unwrap()
+                    .clone()
+            )
+            .unwrap(),
+            serde_json::to_value(&position).unwrap()
+        );
     }
 
     #[rstest]
@@ -2268,6 +2668,7 @@ mod tests {
             &ctx.emitter,
             &ctx.state,
             UnixNanos::from(1u64),
+            None,
         );
 
         assert!(!ctx.state.order_identities.contains_key(&cid));
@@ -2301,18 +2702,15 @@ mod tests {
         ctx.state.order_identities.insert(cid, default_identity());
         ctx.state.pending_requests.insert(
             "req-not-sent".to_string(),
-            (vec![cid], vec![None], PendingOperation::Place),
+            (vec![cid], vec![None], PendingOperation::Place, Vec::new()),
         );
-        let response = order_response(
-            BYBIT_OP_ORDER_CREATE,
-            -1,
-            "Order command was not written",
+        dispatch_order_not_sent(
             "req-not-sent",
-            serde_json::json!({}),
-            None,
+            "Order command was not written",
+            &ctx.emitter,
+            &ctx.state,
+            UnixNanos::from(1u64),
         );
-
-        dispatch_order_response(&response, &ctx.emitter, &ctx.state, UnixNanos::from(1u64));
 
         let event = ctx.rx.try_recv().expect("expected OrderRejected event");
         assert!(
@@ -2326,8 +2724,73 @@ mod tests {
     }
 
     #[rstest]
+    #[case::modify(PendingOperation::Amend)]
+    #[case::cancel(PendingOperation::Cancel)]
+    fn test_dispatch_local_refusal_preserves_each_command(#[case] operation: PendingOperation) {
+        let mut ctx = DispatchTestContext::new();
+        let first = ClientOrderId::from("O-LOCAL-FIRST");
+        let second = ClientOrderId::from("O-LOCAL-SECOND");
+        let first_cause = UUID4::new();
+        let second_cause = UUID4::new();
+        let venue_order_id = VenueOrderId::from("V-LOCAL-FIRST");
+        ctx.state.order_identities.insert(first, default_identity());
+        ctx.state
+            .order_identities
+            .insert(second, default_identity());
+        ctx.state.pending_requests.insert(
+            "req-local".to_string(),
+            (
+                vec![first, second],
+                vec![Some(venue_order_id), None],
+                operation,
+                vec![Some(first_cause), Some(second_cause)],
+            ),
+        );
+        dispatch_order_not_sent(
+            "req-local",
+            "Command was not written",
+            &ctx.emitter,
+            &ctx.state,
+            UnixNanos::from(17),
+        );
+
+        for (client_order_id, cause, venue) in [
+            (first, first_cause, Some(venue_order_id)),
+            (second, second_cause, None),
+        ] {
+            let ExecutionEvent::Order(event) = ctx.rx.try_recv().unwrap() else {
+                panic!("expected order outcome")
+            };
+
+            let (actual_cause, reason) = match (operation, &event) {
+                (PendingOperation::Amend, OrderEventAny::ModifyDenied(event)) => {
+                    (event.causation_id, event.reason.as_str())
+                }
+                (PendingOperation::Cancel, OrderEventAny::CancelDenied(event)) => {
+                    (event.causation_id, event.reason.as_str())
+                }
+                _ => panic!("unexpected refusal {event:?}"),
+            };
+
+            assert_eq!(actual_cause, Some(cause));
+            assert_eq!(reason, "Command was not written");
+            assert_eq!(event.client_order_id(), client_order_id);
+            assert_eq!(event.venue_order_id(), venue);
+            assert_eq!(event.strategy_id(), default_identity().strategy_id);
+            assert_eq!(event.instrument_id(), default_identity().instrument_id);
+            assert_eq!(event.ts_event(), UnixNanos::from(17));
+        }
+
+        assert!(ctx.rx.try_recv().is_err());
+        assert!(!ctx.state.pending_requests.contains_key("req-local"));
+        assert!(ctx.state.order_identities.contains_key(&first));
+        assert!(ctx.state.order_identities.contains_key(&second));
+    }
+
+    #[rstest]
     fn test_dispatch_single_cancel_rejection_emits_cancel_rejected() {
         let mut ctx = DispatchTestContext::new();
+        let cause = UUID4::new();
         let cid = ClientOrderId::from("cancel-reject-1");
         let venue_order_id = VenueOrderId::from("venue-cancel-1");
         ctx.state.order_identities.insert(cid, default_identity());
@@ -2337,6 +2800,7 @@ mod tests {
                 vec![cid],
                 vec![Some(venue_order_id)],
                 PendingOperation::Cancel,
+                vec![Some(cause)],
             ),
         );
 
@@ -2356,7 +2820,7 @@ mod tests {
 
         let event = ctx.rx.try_recv().expect("expected CancelRejected event");
         assert!(
-            matches!(event, ExecutionEvent::Order(OrderEventAny::CancelRejected(ref rejected)) if rejected.client_order_id == cid),
+            matches!(event, ExecutionEvent::Order(OrderEventAny::CancelRejected(ref rejected)) if rejected.client_order_id == cid && rejected.causation_id == Some(cause)),
             "Expected CancelRejected for {cid}, found {event:?}"
         );
         assert!(
@@ -2368,6 +2832,7 @@ mod tests {
     #[rstest]
     fn test_dispatch_single_modify_rejection_emits_modify_rejected() {
         let mut ctx = DispatchTestContext::new();
+        let cause = UUID4::new();
         let cid = ClientOrderId::from("modify-reject-1");
         let venue_order_id = VenueOrderId::from("venue-modify-1");
         ctx.state.order_identities.insert(cid, default_identity());
@@ -2377,6 +2842,7 @@ mod tests {
                 vec![cid],
                 vec![Some(venue_order_id)],
                 PendingOperation::Amend,
+                vec![Some(cause)],
             ),
         );
 
@@ -2396,7 +2862,7 @@ mod tests {
 
         let event = ctx.rx.try_recv().expect("expected ModifyRejected event");
         assert!(
-            matches!(event, ExecutionEvent::Order(OrderEventAny::ModifyRejected(ref rejected)) if rejected.client_order_id == cid),
+            matches!(event, ExecutionEvent::Order(OrderEventAny::ModifyRejected(ref rejected)) if rejected.client_order_id == cid && rejected.causation_id == Some(cause)),
             "Expected ModifyRejected for {cid}, found {event:?}"
         );
         assert!(
@@ -2417,6 +2883,7 @@ mod tests {
                 vec![cid],
                 vec![Some(venue_order_id)],
                 PendingOperation::Cancel,
+                Vec::new(),
             ),
         );
 
@@ -2455,6 +2922,7 @@ mod tests {
                 vec![cid],
                 vec![Some(venue_order_id)],
                 PendingOperation::Amend,
+                Vec::new(),
             ),
         );
 
@@ -2495,6 +2963,7 @@ mod tests {
                     Some(VenueOrderId::from("venue-batch-2")),
                 ],
                 PendingOperation::Cancel,
+                Vec::new(),
             ),
         );
 
@@ -2528,6 +2997,7 @@ mod tests {
                 vec![cid],
                 vec![Some(VenueOrderId::from("venue-batch-single"))],
                 PendingOperation::Cancel,
+                Vec::new(),
             ),
         );
 
@@ -2564,6 +3034,7 @@ mod tests {
                 vec![cid_1, cid_2],
                 vec![Some(venue_1), Some(venue_2)],
                 PendingOperation::Cancel,
+                Vec::new(),
             ),
         );
 
@@ -2591,10 +3062,18 @@ mod tests {
     }
 
     #[rstest]
-    fn test_dispatch_batch_cancel_per_item_error_emits_only_failed_item() {
+    fn test_dispatch_batch_cancel_per_item_error_emits_only_failed_item(
+        #[values(false, true)] repeated: bool,
+    ) {
         let mut ctx = DispatchTestContext::new();
         let cid_1 = ClientOrderId::from("batch-cancel-ok");
-        let cid_2 = ClientOrderId::from("batch-cancel-reject");
+        let cid_2 = if repeated {
+            cid_1
+        } else {
+            ClientOrderId::from("batch-cancel-reject")
+        };
+
+        let causes = [UUID4::new(), UUID4::new()];
         ctx.state.order_identities.insert(cid_1, default_identity());
         ctx.state.order_identities.insert(cid_2, default_identity());
         ctx.state.pending_requests.insert(
@@ -2606,6 +3085,7 @@ mod tests {
                     Some(VenueOrderId::from("venue-batch-reject")),
                 ],
                 PendingOperation::Cancel,
+                causes.into_iter().map(Some).collect(),
             ),
         );
 
@@ -2632,7 +3112,7 @@ mod tests {
 
         let event = ctx.rx.try_recv().expect("expected CancelRejected event");
         assert!(
-            matches!(event, ExecutionEvent::Order(OrderEventAny::CancelRejected(ref rejected)) if rejected.client_order_id == cid_2),
+            matches!(event, ExecutionEvent::Order(OrderEventAny::CancelRejected(ref rejected)) if rejected.client_order_id == cid_2 && rejected.causation_id == Some(causes[1])),
             "Expected CancelRejected for failed batch item {cid_2}, found {event:?}"
         );
         assert!(
@@ -2653,6 +3133,7 @@ mod tests {
                 vec![cid],
                 vec![Some(venue_order_id)],
                 PendingOperation::Cancel,
+                Vec::new(),
             ),
         );
 

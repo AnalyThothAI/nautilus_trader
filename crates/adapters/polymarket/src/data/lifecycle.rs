@@ -148,41 +148,11 @@ impl PolymarketDataClient {
         let interval_secs = self.config.resolve_poll_interval_secs.max(1);
         let grace_secs = self.config.resolve_poll_grace_secs;
         let max_wait_secs = self.config.resolve_poll_max_wait_secs.max(grace_secs);
-        let instruments = self.instruments.clone();
-        let closure_client = gamma_client.clone();
-        let closure_sender = self.data_sender.clone();
-        let closed_condition_ids = self.subscriptions.closed_condition_ids.clone();
 
-        let task_spawner = self
-            .tasks
+        self.tasks
             .spawner()
             .map_err(|e| anyhow::anyhow!("Polymarket task admission is closed: {e}"))?;
-        let ctx = WsMessageContext {
-            subscriptions: self.subscriptions.clone(),
-            clock: self.clock,
-            data_sender: self.data_sender.clone(),
-            instruments: self.instruments.clone(),
-            instrument_update_state: self.instrument_update_state.clone(),
-            gamma_client: gamma_client.clone(),
-            filters: self.provider.filters(),
-            resolve_poll_watchlist: self.resolve_poll_watchlist.clone(),
-            resolve_watch_apply_mutex: self.resolve_watch_apply_mutex.clone(),
-            pending_resolutions: self.pending_resolutions.clone(),
-            deferred_resolutions: self.deferred_resolutions.clone(),
-            book_snapshot_timeout: Duration::from_secs(self.config.book_snapshot_timeout_secs),
-            new_market_inflight_keys: self.new_market_inflight_keys.clone(),
-            new_market_fetch_semaphore: self.new_market_fetch_semaphore.clone(),
-            tasks: task_spawner,
-            polybolt_feed: self.polybolt_feed.clone(),
-            new_market_filter: self.config.new_market_filter.clone(),
-            drop_quotes_missing_side: self.config.drop_quotes_missing_side,
-            compute_effective_deltas: self.config.compute_effective_deltas,
-            cancellation_token: cancellation.clone(),
-        };
-
-        let watchlist = self.resolve_poll_watchlist.clone();
-
-        let resolve_ctx = ctx.resolve_context();
+        let resolve_ctx = self.resolution_context();
 
         if resolve_poll_enabled {
             log::debug!("Polymarket resolve poll task started");
@@ -207,9 +177,9 @@ impl PolymarketDataClient {
                         // cycle. Without an expired instrument reported open, no request is sent.
                         let refresh_result = tokio::select! {
                             result = refresh_expired_market_closure(
-                                &closure_client,
-                                &instruments,
-                                &closure_sender,
+                                &gamma_client,
+                                &resolve_ctx.instruments,
+                                &resolve_ctx.data_sender,
                                 now_ns,
                                 &subscriptions,
                                 Some(&cancellation),
@@ -228,8 +198,7 @@ impl PolymarketDataClient {
 
                         // A set-wide sweep never converges and grows for the process lifetime
                         let pending_retirement = {
-                            let terminal_conditions = closed_condition_ids
-                                .lock();
+                            let terminal_conditions = subscriptions.closed_condition_ids.lock();
 
                             terminal_conditions
                                 .difference(&retired_condition_ids)
@@ -259,20 +228,22 @@ impl PolymarketDataClient {
                         subscriptions.retire_expired(now_ns)
                         .await;
 
-                        let snapshot = watchlist.load();
-                        let watched_conditions = snapshot.len();
-                        let watched_instruments = snapshot
-                            .values()
-                            .map(|entry| entry.tracked.len())
-                            .sum::<usize>();
-                        let selection = collect_resolve_watch_selection(
-                            &snapshot,
-                            now_ns,
-                            grace_secs,
-                            max_wait_secs,
-                            ResolveWatchSelectionMode::AutoPoll,
-                        );
-                        drop(snapshot);
+                        let (watched_conditions, watched_instruments, selection) = {
+                            let snapshot = resolve_ctx.watchlist.read();
+                            let watched_conditions = snapshot.len();
+                            let watched_instruments = snapshot
+                                .values()
+                                .map(|entry| entry.tracked.len())
+                                .sum::<usize>();
+                            let selection = collect_resolve_watch_selection(
+                                &snapshot,
+                                now_ns,
+                                grace_secs,
+                                max_wait_secs,
+                                ResolveWatchSelectionMode::AutoPoll,
+                            );
+                            (watched_conditions, watched_instruments, selection)
+                        };
 
                         if !selection.pause_condition_ids.is_empty() {
                             log::warn!(
@@ -427,7 +398,7 @@ impl PolymarketDataClient {
 
         // Fence callbacks which resume after cancellation without yielding to the task runner
         update_guard.retire_generation();
-        self.resolve_poll_watchlist = std::sync::Arc::new(AtomicMap::new());
+        self.resolve_poll_watchlist = std::sync::Arc::default();
         self.pending_resolutions.clear();
         self.deferred_resolutions.rcu(|entries| entries.clear());
         self.instruments = std::sync::Arc::new(AtomicMap::new());
@@ -576,9 +547,7 @@ impl PolymarketDataClient {
             && !self.polybolt_feed.has_retained_tasks().await;
 
         if drained {
-            self.subscriptions
-                .ws_open_tokens
-                .rcu(|tokens| tokens.clear());
+            self.subscriptions.ws_open_tokens.clear();
 
             if self.reset_pending {
                 self.ws_client.clear_reconnect_state();
@@ -1080,6 +1049,7 @@ mod tests {
 
         let info = Params::new(
             [
+                ("market_version".to_string(), "v1".into()),
                 (
                     "token_id".to_string(),
                     serde_json::Value::String(raw_symbol.to_string()),
@@ -1607,7 +1577,10 @@ mod tests {
                 expected_ids.insert(instrument_id);
             }
 
-            assert_eq!(**set.load(), expected_ids);
+            assert_eq!(
+                set.iter().map(|id| *id).collect::<ahash::AHashSet<_>>(),
+                expected_ids
+            );
         }
 
         let mut expected_pending = ahash::AHashSet::from_iter([unrelated_id]);
@@ -1853,6 +1826,20 @@ mod tests {
     }
 
     #[rstest]
+    fn resolve_poll_task_rejects_closed_task_admission() {
+        let client = make_client_for_reset_test();
+        client.tasks.begin_shutdown();
+
+        let error = client.register_resolve_poll_task().unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "Polymarket task admission is closed: task group admission is closed",
+        );
+        assert!(client.tasks.is_empty());
+    }
+
+    #[rstest]
     #[tokio::test]
     async fn resolve_poll_task_retires_expired_runtime_state_when_auto_poll_disabled() {
         let mut client = make_client_for_reset_test();
@@ -1944,6 +1931,7 @@ mod tests {
         assert!(
             client
                 .resolve_poll_watchlist
+                .read()
                 .contains_key(&"0xCOND-POLL".to_string())
         );
     }
@@ -1993,7 +1981,7 @@ mod tests {
                 .last_quotes
                 .contains_key(&instrument_id)
         );
-        assert!(client.resolve_poll_watchlist.load().is_empty());
+        assert!(client.resolve_poll_watchlist.read().is_empty());
     }
 
     #[rstest]
@@ -2104,6 +2092,7 @@ mod tests {
         // Settlement drops the watch entry, so the next cycle must revisit the condition
         client
             .resolve_poll_watchlist
+            .write()
             .remove(&"0xCOND-WATCH".to_string());
 
         wait_until_async(
@@ -2181,7 +2170,7 @@ mod tests {
                         .all(|id| !client.subscriptions.book_sync.book_gated(*id))
                     && client.subscriptions.pending_auto_loads.lock().is_empty()
                     && client.instruments.load().len() == watched_count
-                    && client.resolve_poll_watchlist.load().len() == watched_count
+                    && client.resolve_poll_watchlist.read().len() == watched_count
             },
             tokio::time::Duration::from_secs(5),
         )
@@ -2215,7 +2204,7 @@ mod tests {
         );
         assert!(client.subscriptions.pending_auto_loads.lock().is_empty());
         assert_eq!(client.instruments.load().len(), watched_count);
-        assert_eq!(client.resolve_poll_watchlist.load().len(), watched_count);
+        assert_eq!(client.resolve_poll_watchlist.read().len(), watched_count);
     }
 
     #[rstest]
@@ -2480,7 +2469,7 @@ mod tests {
 
             // Quote-only churn opens no position, so nothing reaches the resolution watchlist and
             // no instrument is retained as watchlist metadata.
-            assert_eq!(client.resolve_poll_watchlist.len(), 0);
+            assert_eq!(client.resolve_poll_watchlist.read().len(), 0);
 
             let sweep_events = sandbox
                 .test_clock
@@ -2526,7 +2515,7 @@ mod tests {
                 );
             }
 
-            assert_eq!(client.resolve_poll_watchlist.len(), 0);
+            assert_eq!(client.resolve_poll_watchlist.read().len(), 0);
         }
 
         // Neither sweep settles: an expired quote-only instrument has no exposure to close.
