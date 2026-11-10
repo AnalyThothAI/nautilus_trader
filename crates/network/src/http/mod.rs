@@ -84,6 +84,7 @@ pub mod error;
 pub mod types;
 
 mod stream;
+mod timing;
 
 #[cfg(not(all(feature = "simulation", madsim)))]
 mod connector;
@@ -104,6 +105,9 @@ pub use http::{
 };
 use nautilus_core::consts::NAUTILUS_USER_AGENT;
 pub use stream::HttpResponseStream;
+pub use timing::{
+    HttpAttemptTiming, HttpConnectionTiming, HttpRequestTiming, HttpRequestTrace, HttpSocketEvent,
+};
 pub use types::{HttpMethod, HttpResponse, HttpStatus, parse_retry_after};
 pub use url::Url;
 
