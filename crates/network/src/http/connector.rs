@@ -25,7 +25,6 @@ use std::{
 };
 
 use http::{HeaderMap, HeaderValue, Uri, header::USER_AGENT};
-use hyper::rt::{Read, ReadBufCursor, Write};
 use hyper_rustls::{HttpsConnector, MaybeHttpsStream};
 use hyper_util::{
     client::{
@@ -34,9 +33,13 @@ use hyper_util::{
     },
     rt::TokioIo,
 };
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tower_service::Service;
 
-use super::HttpClientError;
+use super::{
+    HttpClientError,
+    timing::{ConnectionProbe, now},
+};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -45,6 +48,7 @@ pub(super) struct Connector {
     http: HttpConnector,
     proxy_tls: HttpsConnector<HttpConnector>,
     user_agent: Option<HeaderValue>,
+    connection_timing: bool,
     pub(super) proxies: Arc<Matcher>,
 }
 
@@ -54,6 +58,7 @@ impl Connector {
         proxy: Option<&str>,
         use_system_proxy: bool,
         user_agent: Option<HeaderValue>,
+        connection_timing: bool,
     ) -> Result<Self, HttpClientError> {
         let proxies = if let Some(proxy) = proxy {
             let mut url = match url::Url::parse(proxy) {
@@ -105,15 +110,16 @@ impl Connector {
             proxy_tls: HttpsConnector::from((http.clone(), tls)),
             http,
             user_agent,
+            connection_timing,
             proxies: Arc::new(proxies),
         })
     }
 }
 
 impl Service<Uri> for Connector {
-    type Response = Stream;
+    type Response = TokioIo<Stream>;
     type Error = BoxError;
-    type Future = Pin<Box<dyn Future<Output = Result<Stream, BoxError>> + Send>>;
+    type Future = Pin<Box<dyn Future<Output = Result<TokioIo<Stream>, BoxError>> + Send>>;
 
     fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         Poll::Ready(Ok(()))
@@ -124,13 +130,16 @@ impl Service<Uri> for Connector {
         let mut http = self.http.clone();
         let mut proxy_tls = self.proxy_tls.clone();
         let user_agent = self.user_agent.clone();
+        let connection_timing = self.connection_timing;
 
         Box::pin(async move {
+            let started_ns = connection_timing.then(now);
             let Some(proxy) = proxy else {
-                return Ok(Stream {
-                    inner: MaybeHttpsStream::Http(http.call(dst).await?),
+                return Ok(TokioIo::new(Stream {
+                    inner: TokioIo::new(MaybeHttpsStream::Http(http.call(dst).await?)),
                     proxied: false,
-                });
+                    probe: started_ns.map(|started| ConnectionProbe::new(started, false)),
+                }));
             };
 
             if dst.scheme_str() == Some("https") {
@@ -143,15 +152,17 @@ impl Service<Uri> for Connector {
                     tunnel = tunnel.with_headers(HeaderMap::from_iter([(USER_AGENT, user_agent)]));
                 }
 
-                Ok(Stream {
-                    inner: tunnel.call(dst).await?,
+                Ok(TokioIo::new(Stream {
+                    inner: TokioIo::new(tunnel.call(dst).await?),
                     proxied: false,
-                })
+                    probe: started_ns.map(|started| ConnectionProbe::new(started, true)),
+                }))
             } else {
-                Ok(Stream {
-                    inner: proxy_tls.call(proxy.uri().clone()).await?,
+                Ok(TokioIo::new(Stream {
+                    inner: TokioIo::new(proxy_tls.call(proxy.uri().clone()).await?),
                     proxied: true,
-                })
+                    probe: started_ns.map(|started| ConnectionProbe::new(started, true)),
+                }))
             }
         })
     }
@@ -159,33 +170,49 @@ impl Service<Uri> for Connector {
 
 #[derive(Debug)]
 pub(super) struct Stream {
-    inner: MaybeHttpsStream<TokioIo<tokio::net::TcpStream>>,
+    inner: TokioIo<MaybeHttpsStream<TokioIo<tokio::net::TcpStream>>>,
     proxied: bool,
+    probe: Option<ConnectionProbe>,
 }
 
 impl Connection for Stream {
     fn connected(&self) -> Connected {
-        self.inner.connected().proxy(self.proxied)
+        let connected = self.inner.connected().proxy(self.proxied);
+        match &self.probe {
+            Some(probe) => connected.extra(probe.clone()),
+            None => connected,
+        }
     }
 }
 
-impl Read for Stream {
+impl AsyncRead for Stream {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-        buf: ReadBufCursor<'_>,
+        buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.get_mut().inner).poll_read(cx, buf)
+        let this = self.get_mut();
+        let filled = buf.filled().len();
+        let result = Pin::new(&mut this.inner).poll_read(cx, buf);
+        if let Some(probe) = &this.probe {
+            probe.record(false, buf.filled().len() - filled);
+        }
+        result
     }
 }
 
-impl Write for Stream {
+impl AsyncWrite for Stream {
     fn poll_write(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
+        let this = self.get_mut();
+        let result = Pin::new(&mut this.inner).poll_write(cx, buf);
+        if let (Poll::Ready(Ok(bytes)), Some(probe)) = (&result, &this.probe) {
+            probe.record(true, *bytes);
+        }
+        result
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -205,6 +232,38 @@ impl Write for Stream {
         cx: &mut Context<'_>,
         bufs: &[io::IoSlice<'_>],
     ) -> Poll<io::Result<usize>> {
-        Pin::new(&mut self.get_mut().inner).poll_write_vectored(cx, bufs)
+        let this = self.get_mut();
+        let result = Pin::new(&mut this.inner).poll_write_vectored(cx, bufs);
+        if let (Poll::Ready(Ok(bytes)), Some(probe)) = (&result, &this.probe) {
+            probe.record(true, *bytes);
+        }
+        result
+    }
+}
+
+/// Preserves the TLS connector and records its completion separately from TCP or proxy setup.
+#[derive(Clone, Debug)]
+pub(super) struct TimedConnector(pub(super) HttpsConnector<Connector>);
+
+impl Service<Uri> for TimedConnector {
+    type Response = MaybeHttpsStream<TokioIo<Stream>>;
+    type Error = BoxError;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.0.poll_ready(cx)
+    }
+
+    fn call(&mut self, uri: Uri) -> Self::Future {
+        let future = self.0.call(uri);
+        Box::pin(async move {
+            let stream = future.await?;
+            let mut extras = http::Extensions::new();
+            stream.connected().get_extras(&mut extras);
+            if let Some(probe) = extras.get::<ConnectionProbe>() {
+                probe.established();
+            }
+            Ok(stream)
+        })
     }
 }
