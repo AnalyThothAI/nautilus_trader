@@ -1995,7 +1995,28 @@ impl LighterExecutionClient {
                 order.trigger_price(),
             );
         }
-        validate_order_amount(&instrument, order.quantity(), price_ticks, price_precision)?;
+        if let Err(error) =
+            validate_order_amount(&instrument, order.quantity(), price_ticks, price_precision)
+        {
+            // Lighter accepts a reduce-only market order for the entire remaining position
+            // below its ordinary order minimums. RiskEngine binds native closes to a position.
+            let full_exit = order.order_type() == OrderType::Market
+                && order.is_reduce_only()
+                && self
+                    .core
+                    .cache()
+                    .position_for_order_ref(&order.client_order_id())
+                    .is_some_and(|p| {
+                        p.account_id == self.core.account_id
+                            && p.instrument_id == instrument_id
+                            && p.strategy_id == order.strategy_id()
+                            && p.quantity == order.quantity()
+                            && order.would_reduce_only(p.side, p.quantity)
+                    });
+            if !full_exit {
+                return Err(error);
+            }
+        }
 
         Ok(CreateOrderPlan {
             order: order.clone(),
@@ -18637,6 +18658,64 @@ mod tests {
         }
 
         assert_nonce_reusable(&client.dispatch);
+    }
+
+    #[rstest]
+    #[case(OrderSide::Sell, "0.0020", true, true)]
+    #[case(OrderSide::Sell, "0.0010", true, false)]
+    #[case(OrderSide::Buy, "0.0020", true, false)]
+    #[case(OrderSide::Sell, "0.0020", false, false)]
+    fn prepare_subminimum_market_close(
+        #[case] side: OrderSide,
+        #[case] quantity: &str,
+        #[case] reduce_only: bool,
+        #[case] allowed: bool,
+    ) {
+        let (client, cache, _rx) = create_execution_client();
+        let id = register_test_instrument(&client, &cache);
+        add_test_quote(&cache, id, "2352.72", "2352.73");
+        let position_id = PositionId::new("SMALL-POSITION");
+        let parent = test_market_order(&mut test_order_factory(), id, "OPEN", OrderSide::Buy);
+        let instrument = cache.borrow().try_instrument(&id).unwrap().clone();
+        let OrderEventAny::Filled(fill) = TestOrderEventStubs::filled(
+            &parent,
+            &instrument,
+            None,
+            Some(position_id),
+            Some(Price::from("2352.73")),
+            Some(Quantity::from("0.0020")),
+            None,
+            None,
+            None,
+            Some(account_id()),
+        ) else {
+            unreachable!()
+        };
+        let position = Position::new(&instrument, fill);
+        cache
+            .borrow_mut()
+            .add_position(&position, OmsType::Netting)
+            .unwrap();
+        let order = test_order_factory().market(
+            id,
+            side,
+            Quantity::from(quantity),
+            Some(TimeInForce::Ioc),
+            Some(reduce_only),
+            None,
+            None,
+            None,
+            None,
+            Some(ClientOrderId::from("SMALL-CLOSE")),
+        );
+        cache
+            .borrow_mut()
+            .add_order(order.clone(), Some(position_id), Some(client_id()), false)
+            .unwrap();
+        assert_eq!(
+            client.prepare_create_order_plan(&order, None).is_ok(),
+            allowed
+        );
     }
 
     #[tokio::test]
