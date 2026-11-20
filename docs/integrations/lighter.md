@@ -907,6 +907,28 @@ Order updates and transaction lookups resolve create and cancel outcomes. REST r
 modifications, performs up to three lookups at two-second intervals while the pending action remains current.
 It validates transaction hash, type, account, API key, and original submission nonce.
 
+A create still unanswered when its connection drops follows Lighter's procedure for an accepted transaction
+with an unknown outcome. After the reconnect, the adapter looks the transaction up by hash up to three times,
+500 ms apart, and compares its nonce with the `nextNonce` read during the reconnect, before the new
+connection signs anything:
+
+- Not received: two lookups, the later at least two seconds after the send, do not find the hash, and the
+  nonce is unconsumed. The order is rejected with a reason starting with `Lighter create not received`
+  (`LIGHTER_CREATE_NOT_RECEIVED`).
+- Failed: the order is rejected with the venue's error.
+- Executed: the order it placed, matched by client order index and nonce even when filled or canceled,
+  is published with its fills.
+
+Any other result retains the order identity for reconciliation. Grouped creates resolve each order.
+
+A live engine using `RetainUnresolved` publishes a submission recovery diagnostic when its
+automatic queries end. For a retained IOC, later open-order sweeps use the original signed
+transaction identity to find the placed order and fetch its trades. One background sweep runs
+at a time. Failed reads and an absent hash leave the order unresolved. A confirmed transaction
+may still be waiting for the venue's order index. A confirmed rejection, cancellation, or
+fill follows the normal execution path. A partially filled terminal waits for its original
+trades even after the fast terminal retries exhaust. Real trade recovery is independent of position coverage. A live node reports any unresolved submission at shutdown.
+
 Resolved or superseded cancels stop their probes, including requests waiting for REST quota.
 When a cancel transaction executes, recovery retries missing or nonterminal order status within the same three lookups.
 

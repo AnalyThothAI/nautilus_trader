@@ -409,6 +409,10 @@ Exhausted unacknowledged submissions stay unresolved, with further automatic per
 stopped. Select `ResolveLocally` to close them through the local resolution rules instead. Clients can also
 require retention when `ResolveLocally` is selected. Polymarket enables this protection automatically.
 
+An account and instrument with an active IOC under submission retention can already reflect its trade in
+the venue position snapshot. Position checks still seek authoritative fills and defer a synthetic
+adjustment for that account and instrument while the submission can account for the discrepancy.
+
 The policy also selects how [in-flight checks](#in-flight-checks) resolve a pending cancel or update on an
 accepted order.
 
