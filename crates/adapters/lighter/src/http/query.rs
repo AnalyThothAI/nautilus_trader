@@ -19,13 +19,30 @@
 //! in the HTTP Authorization header. Serialization omits both fields.
 
 use derive_builder::Builder;
-use nautilus_core::string::secret::SecretString;
+use nautilus_core::{UnixNanos, string::secret::SecretString};
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroize;
 
 use crate::common::enums::{
     LighterCandleResolution, LighterFundingResolution, LighterOrderBookFilter, LighterTradeType,
 };
+
+/// Inclusive venue order-history query bounds in whole seconds.
+pub(crate) fn format_between_timestamps(
+    start: Option<UnixNanos>,
+    end: Option<UnixNanos>,
+    ts_now: UnixNanos,
+) -> Option<String> {
+    let (start, end) = match (start, end) {
+        (None, None) => return None,
+        (Some(s), Some(e)) => (s, e),
+        (Some(s), None) => (s, ts_now),
+        (None, Some(e)) => (UnixNanos::from(0), e),
+    };
+    let start_secs = start.as_u64() / 1_000_000_000;
+    let end_secs = end.as_u64() / 1_000_000_000;
+    Some(format!("{start_secs}-{end_secs}"))
+}
 
 #[derive(Copy, Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]

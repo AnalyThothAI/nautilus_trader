@@ -921,6 +921,14 @@ connection signs anything:
 
 Any other result retains the order identity for reconciliation. Grouped creates resolve each order.
 
+A live engine using `RetainUnresolved` publishes a submission recovery diagnostic when its
+automatic queries end. For a retained IOC, later open-order sweeps use the original signed
+transaction identity to find the placed order and fetch its trades. One background sweep runs
+at a time. Failed reads and an absent hash leave the order unresolved. A confirmed transaction
+may still be waiting for the venue's order index. A confirmed rejection, cancellation, or
+fill follows the normal execution path. A partially filled terminal waits for its original
+trades even after the fast terminal retries exhaust. Real trade recovery is independent of position coverage. A live node reports any unresolved submission at shutdown.
+
 Resolved or superseded cancels stop their probes, including requests waiting for REST quota.
 When a cancel transaction executes, recovery retries missing or nonterminal order status within the same three lookups.
 

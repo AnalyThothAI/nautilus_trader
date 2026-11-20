@@ -22,7 +22,7 @@
 //! `ExecutionClient` trait wiring.
 
 use std::{
-    collections::VecDeque,
+    collections::{BTreeSet, VecDeque},
     hash::{BuildHasher, Hasher},
     sync::{
         Arc, LazyLock,
@@ -113,7 +113,7 @@ pub(crate) struct OrderIdentity {
 #[derive(Debug, Default)]
 struct OrderIdentityBinding {
     venue_order_id: Option<VenueOrderId>,
-    submission_nonce: Option<i64>,
+    submission: Option<SignedCreate>,
     external_venue_ids: AHashSet<VenueOrderId>,
     create_resolution: CreateResolution,
     trigger_price: Option<Price>,
@@ -123,6 +123,15 @@ struct OrderIdentityBinding {
     filled_qty: Decimal,
     fill_ids: AHashSet<TradeId>,
     fills_inferred: bool,
+}
+
+/// Identity of the transaction signed for this create, available after its WebSocket ACK is drained.
+#[derive(Debug, Clone)]
+pub(crate) struct SignedCreate {
+    pub(crate) nonce: i64,
+    pub(crate) api_key_index: u8,
+    pub(crate) connection_epoch: u64,
+    pub(crate) tx_hash: String,
 }
 
 #[derive(Debug, Clone)]
@@ -393,8 +402,18 @@ impl OrderIdentity {
         quantity >= report.filled_qty.as_decimal()
     }
 
-    fn mark_submission(&self, nonce: i64) {
-        self.binding.lock().submission_nonce = Some(nonce);
+    pub(crate) fn signed_create(&self) -> Option<SignedCreate> {
+        self.binding.lock().submission.clone()
+    }
+
+    pub(crate) fn submission_matches(&self, nonce: i64, venue: Option<VenueOrderId>) -> bool {
+        let binding = self.binding.lock();
+        binding
+            .submission
+            .as_ref()
+            .is_some_and(|tx| tx.nonce == nonce)
+            && binding.create_resolution != CreateResolution::Rejected
+            && binding.venue_order_id.is_none_or(|id| Some(id) == venue)
     }
 
     fn bind_venue_order_id(&self, venue_order_id: VenueOrderId) -> bool {
@@ -414,7 +433,7 @@ impl OrderIdentity {
             }
             None => {
                 if binding.external_venue_ids.contains(&venue_order_id)
-                    || binding.submission_nonce.is_none()
+                    || binding.submission.is_none()
                 {
                     binding.external_venue_ids.insert(venue_order_id);
                     return false;
@@ -435,8 +454,8 @@ impl OrderIdentity {
     }
 
     pub(crate) fn shares_submission(&self, other: &Self) -> bool {
-        let nonce = self.binding.lock().submission_nonce;
-        nonce.is_some() && nonce == other.binding.lock().submission_nonce
+        let nonce = self.binding.lock().submission.as_ref().map(|tx| tx.nonce);
+        nonce.is_some() && nonce == other.binding.lock().submission.as_ref().map(|tx| tx.nonce)
     }
 
     fn accepted_was_emitted(&self) -> bool {
@@ -459,7 +478,10 @@ impl OrderIdentity {
         }
 
         let binding = self.binding.lock();
-        binding.submission_nonce == Some(nonce)
+        binding
+            .submission
+            .as_ref()
+            .is_some_and(|tx| tx.nonce == nonce)
             && binding.create_resolution == CreateResolution::Pending
     }
 
@@ -469,7 +491,10 @@ impl OrderIdentity {
         }
 
         let mut binding = self.binding.lock();
-        if binding.submission_nonce != Some(nonce)
+        if binding
+            .submission
+            .as_ref()
+            .is_none_or(|tx| tx.nonce != nonce)
             || binding.create_resolution == CreateResolution::Rejected
         {
             return false;
@@ -489,7 +514,10 @@ impl OrderIdentity {
         }
 
         let mut binding = self.binding.lock();
-        if binding.submission_nonce != Some(nonce)
+        if binding
+            .submission
+            .as_ref()
+            .is_none_or(|tx| tx.nonce != nonce)
             || binding.create_resolution != CreateResolution::Pending
         {
             return false;
@@ -923,6 +951,8 @@ pub(crate) struct WsDispatchState {
     pub(crate) last_account_state: Arc<Mutex<Option<AccountState>>>,
     pub(crate) active_markets: Arc<DashSet<i64>>,
     position_snapshot: Arc<Mutex<PositionSnapshot>>,
+    // IOC submissions explicitly retained by the live manager; a later sweep drops closed IDs.
+    pub(crate) retained_iocs: Arc<Mutex<BTreeSet<ClientOrderId>>>,
     pub(crate) order_identities: Arc<DashMap<ClientOrderId, OrderIdentity>>,
     order_restorations: Arc<DashMap<VenueOrderId, OrderAny>>,
     create_registry: Arc<Mutex<()>>,
@@ -1141,6 +1171,7 @@ impl WsDispatchState {
             last_account_state: Arc::new(Mutex::new(None)),
             active_markets: Arc::new(DashSet::new()),
             position_snapshot: Arc::new(Mutex::new(PositionSnapshot::default())),
+            retained_iocs: Arc::default(),
             order_identities: Arc::new(DashMap::new()),
             order_restorations: Arc::new(DashMap::new()),
             create_registry: Arc::new(Mutex::new(())),
@@ -1164,7 +1195,13 @@ impl WsDispatchState {
     /// milliseconds; sustained queue growth indicates a stuck WS read loop.
     pub(crate) fn enqueue_pending_sendtx(&self, pending: PendingSendTx) {
         for (order, _) in pending.kind.creates() {
-            self.mark_order_submission(&order.client_order_id(), pending.nonce);
+            self.mark_order_submission(
+                &order.client_order_id(),
+                pending.nonce,
+                pending.api_key_index,
+                pending.connection_epoch,
+                &pending.tx_hash,
+            );
         }
 
         if let PendingSendTxKind::Modify {
@@ -1715,9 +1752,21 @@ impl WsDispatchState {
         Ok(client_order_index)
     }
 
-    pub(crate) fn mark_order_submission(&self, cloid: &ClientOrderId, nonce: i64) {
+    pub(crate) fn mark_order_submission(
+        &self,
+        cloid: &ClientOrderId,
+        nonce: i64,
+        api_key_index: u8,
+        connection_epoch: u64,
+        tx_hash: &str,
+    ) {
         if let Some(identity) = self.order_identities.get(cloid) {
-            identity.mark_submission(nonce);
+            identity.binding.lock().submission = Some(SignedCreate {
+                nonce,
+                api_key_index,
+                connection_epoch,
+                tx_hash: tx_hash.to_owned(),
+            });
         }
     }
 
@@ -2715,6 +2764,7 @@ pub(crate) struct OrderReportLookup {
     // Nonce of an executed create transaction: binds a terminal order to it, which a client
     // index alone cannot do once the venue reuses that index
     submission_nonce: Option<i64>,
+    history_window: Option<String>,
     supplied_cloid: Option<ClientOrderId>,
 }
 
@@ -2755,14 +2805,21 @@ impl OrderReportLookup {
             target_venue_index,
             target_client_index,
             submission_nonce: None,
+            history_window: None,
             supplied_cloid: client_order_id.copied(),
         })
     }
 
     /// Restricts a client-index lookup to the order placed by the executed create transaction
     /// signed with `nonce`, terminal orders included.
-    pub(crate) fn with_submission_nonce(mut self, nonce: i64) -> Self {
-        self.submission_nonce = Some(nonce);
+    pub(crate) fn for_executed_create(
+        mut self,
+        nonce: i64,
+        start: UnixNanos,
+        now: UnixNanos,
+    ) -> Self {
+        self.submission_nonce = self.target_venue_index.is_none().then_some(nonce);
+        self.history_window = crate::http::query::format_between_timestamps(Some(start), None, now);
         self
     }
 
@@ -2856,7 +2913,12 @@ pub(crate) async fn collect_order_while_pending(
             )
         })?;
 
-    let matches_order = |o: &LighterOrder| lookup.matches(o);
+    let matches_order = |order: &LighterOrder| {
+        lookup.matches(order)
+            && (lookup.history_window.is_none()
+                || (order.market_index == market_index
+                    && order.owner_account_index == credential.account_index()))
+    };
 
     let auth = mint_auth_token(credential)?;
 
@@ -2883,33 +2945,37 @@ pub(crate) async fn collect_order_while_pending(
         account_index: credential.account_index(),
         market_id: market_index,
     });
-    let active = http_client
-        .get_account_active_orders(&query)
-        .await
-        .context("failed to fetch Lighter active orders")?;
 
-    if !is_pending() {
-        return Ok(None);
+    match http_client.get_account_active_orders(&query).await {
+        Ok(active) => {
+            if !is_pending() {
+                return Ok(None);
+            }
+            let mut matches = active.orders.iter().filter(|order| matches_order(order));
+            let first = matches.next();
+
+            if lookup.target_venue_index.is_none() {
+                anyhow::ensure!(
+                    matches.next().is_none(),
+                    "ambiguous Lighter active-order lookup for client_order_index {}",
+                    lookup.target_client_index.unwrap_or_default()
+                );
+            }
+
+            if let Some(order) = first {
+                return Ok(Some(order.clone()));
+            }
+        }
+        Err(e) if lookup.history_window.is_none() => {
+            return Err(e).context("failed to fetch Lighter active orders");
+        }
+        Err(_) => log::debug!(
+            "Lighter active-order read failed, checking bounded executed-create history"
+        ),
     }
 
-    let mut active_matches = active.orders.iter().filter(|order| matches_order(order));
-    let active_match = active_matches.next();
-
-    if lookup.target_venue_index.is_none() {
-        anyhow::ensure!(
-            active_matches.next().is_none(),
-            "ambiguous Lighter active-order lookup for client_order_index {}",
-            lookup.target_client_index.unwrap_or_default(),
-        );
-    }
-
-    if let Some(order) = active_match {
-        return Ok(Some(order.clone()));
-    }
-
-    if lookup.target_venue_index.is_none() {
-        // Lighter reuses client indexes, so paginated inactive history cannot safely
-        // identify an order by client index alone.
+    if lookup.target_venue_index.is_none() && lookup.submission_nonce.is_none() {
+        // Client indexes can be reused; an unbound index alone cannot identify a terminal order.
         return Ok(None);
     }
 
@@ -2919,6 +2985,7 @@ pub(crate) async fn collect_order_while_pending(
     let mut cursor: Option<String> = None;
     let mut seen_cursors = AHashSet::new();
     let mut pages = 0_usize;
+    let mut candidate: Option<LighterOrder> = None;
 
     loop {
         if !is_pending() {
@@ -2936,7 +3003,7 @@ pub(crate) async fn collect_order_while_pending(
             account_index: credential.account_index(),
             market_id: Some(market_index),
             ask_filter: None,
-            between_timestamps: None,
+            between_timestamps: lookup.history_window.clone(),
             cursor: cursor.clone(),
             limit: LIGHTER_REST_PAGE_SIZE,
         });
@@ -2951,7 +3018,16 @@ pub(crate) async fn collect_order_while_pending(
 
         for order in &inactive.orders {
             if matches_order(order) {
-                return Ok(Some(order.clone()));
+                if lookup.target_venue_index.is_some() {
+                    return Ok(Some(order.clone()));
+                }
+                anyhow::ensure!(
+                    candidate
+                        .as_ref()
+                        .is_none_or(|prior| prior.order_index == order.order_index),
+                    "ambiguous Lighter inactive-order lookup for executed create"
+                );
+                candidate = Some(order.clone());
             }
         }
 
@@ -2967,7 +3043,7 @@ pub(crate) async fn collect_order_while_pending(
         }
     }
 
-    Ok(None)
+    Ok(candidate)
 }
 
 async fn collect_account_order(
@@ -3004,7 +3080,9 @@ async fn collect_account_order(
     }
 
     let mut matches = response.orders.iter().filter(|order| {
-        if order.market_index != market_index {
+        if order.market_index != market_index
+            || order.owner_account_index != credential.account_index()
+        {
             return false;
         }
 
@@ -3989,7 +4067,7 @@ mod tests {
 
         state.register_cloid(1, active).unwrap();
         state.register_order_identity(active, identity.clone());
-        state.mark_order_submission(&active, 41);
+        state.mark_order_submission(&active, 41, 0, 0, "test-tx");
         state.store_snapshot(active, shape.clone());
         assert_eq!(
             state.resolve_live_order_cloid("1", venue_order_id),
@@ -4147,7 +4225,7 @@ mod tests {
                 index,
             ),
         );
-        state.mark_order_submission(&cid, 10);
+        state.mark_order_submission(&cid, 10, 0, 0, "test-tx");
 
         state.register_order_identity(
             cid,
@@ -4159,7 +4237,7 @@ mod tests {
                 index,
             ),
         );
-        state.mark_order_submission(&cid, 11);
+        state.mark_order_submission(&cid, 11, 0, 0, "test-tx");
 
         assert!(!state.observe_create_submission(&cid, index, 10, voi("281476929510110")));
         assert!(state.lookup_venue_order_id(&cid).is_none());
@@ -4189,7 +4267,7 @@ mod tests {
                 42,
             ),
         );
-        state.mark_order_submission(&original, 9);
+        state.mark_order_submission(&original, 9, 0, 0, "test-tx");
 
         let report = stub_open_order_status_report("42");
         assert_eq!(
@@ -4350,7 +4428,7 @@ mod tests {
                 42,
             ),
         );
-        state.mark_order_submission(&original, 9);
+        state.mark_order_submission(&original, 9, 0, 0, "test-tx");
 
         let report = stub_fill_report("42");
         assert_eq!(
@@ -4420,7 +4498,7 @@ mod tests {
                 42,
             ),
         );
-        state.mark_order_submission(&original, 9);
+        state.mark_order_submission(&original, 9, 0, 0, "test-tx");
         assert_eq!(
             state.resolve_live_order_cloid("42", VenueOrderId::new("281476929510109")),
             Some(original),
