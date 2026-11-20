@@ -2088,7 +2088,8 @@ impl LighterExecutionClient {
                 order.trigger_price(),
             );
         }
-        if let Err(error) =
+
+        if let Err(e) =
             validate_order_amount(&instrument, order.quantity(), price_ticks, price_precision)
         {
             // Lighter accepts a reduce-only market order for the entire remaining position
@@ -2106,8 +2107,9 @@ impl LighterExecutionClient {
                             && p.quantity == order.quantity()
                             && order.would_reduce_only(p.side, p.quantity)
                     });
+
             if !full_exit {
-                return Err(error);
+                return Err(e);
             }
         }
 
@@ -11299,7 +11301,10 @@ mod tests {
         testing::wait_until_async,
     };
     use nautilus_execution::engine::ExecutionEngine;
-    use nautilus_live::manager::{ExecutionManager, ExecutionManagerConfig};
+    use nautilus_live::{
+        execution::submission::SubmissionRecoverySource,
+        manager::{ExecutionManager, ExecutionManagerConfig},
+    };
     use nautilus_model::{
         accounts::MarginAccount,
         data::QuoteTick,
@@ -23151,18 +23156,16 @@ mod tests {
     ) {
         let rig = dispatcher_rig("RETAINED-IOC");
         let mut leg = drained_create_leg(&rig, rig.cloid, TEST_SUBMISSION_NONCE);
-        leg.order = Box::new(
-            OrderTestBuilder::new(OrderType::Limit)
-                .trader_id(trader_id())
-                .strategy_id(strategy_id())
-                .instrument_id(rig.instrument_id)
-                .client_order_id(rig.cloid)
-                .side(OrderSide::Buy)
-                .time_in_force(TimeInForce::Ioc)
-                .quantity(Quantity::from("0.0050"))
-                .price(Price::from("2352.74"))
-                .build(),
-        );
+        *leg.order = OrderTestBuilder::new(OrderType::Limit)
+            .trader_id(trader_id())
+            .strategy_id(strategy_id())
+            .instrument_id(rig.instrument_id)
+            .client_order_id(rig.cloid)
+            .side(OrderSide::Buy)
+            .time_in_force(TimeInForce::Ioc)
+            .quantity(Quantity::from("0.0050"))
+            .price(Price::from("2352.74"))
+            .build();
         rig.dispatch.mark_order_submission(
             &rig.cloid,
             leg.nonce,
@@ -23238,7 +23241,7 @@ mod tests {
                 instrument_id: rig.instrument_id,
                 client_id: Some(client.core.client_id),
                 client_order_id: rig.cloid,
-                source: nautilus_live::execution::submission::SubmissionRecoverySource::Inflight,
+                source: SubmissionRecoverySource::Inflight,
                 retry_count: 2,
                 ts_event: client.clock.get_time_ns(),
             },
@@ -23285,9 +23288,10 @@ mod tests {
             for _ in 0..=ACKED_ORDER_PROBE_ATTEMPTS {
                 recover_terminals(&context, true).await;
             }
-            let pending = client.dispatch.terminals_pending.lock();
-            assert_eq!(pending[&rig.cloid].attempts, ACKED_ORDER_PROBE_ATTEMPTS);
-            drop(pending);
+            assert_eq!(
+                client.dispatch.terminals_pending.lock()[&rig.cloid].attempts,
+                ACKED_ORDER_PROBE_ATTEMPTS
+            );
 
             if shutdown {
                 client.begin_session_shutdown();

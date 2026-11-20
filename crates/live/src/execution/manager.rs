@@ -73,7 +73,7 @@ use nautilus_execution::{
     },
 };
 use nautilus_model::{
-    enums::{AvgPxReconciliation, OmsType, OrderSide, OrderStatus},
+    enums::{AvgPxReconciliation, OmsType, OrderSide, OrderStatus, TimeInForce},
     events::{OrderEventAny, OrderFilled, OrderInitialized, OrderUpdated},
     identifiers::{
         AccountId, ClientId, ClientOrderId, InstrumentId, PositionId, StrategyId, TradeId,
@@ -3860,7 +3860,7 @@ impl ExecutionManager {
             let open =
                 cache.orders_open_refs(None, Some(&instrument_id), None, Some(&account_id), None);
             if inflight.into_iter().chain(open).any(|order| {
-                order.time_in_force() == nautilus_model::enums::TimeInForce::Ioc
+                order.time_in_force() == TimeInForce::Ioc
                     && self.submission_retention_enabled(order.client_order_id(), None)
             }) {
                 return None;
