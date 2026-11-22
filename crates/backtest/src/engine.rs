@@ -50,7 +50,7 @@ use nautilus_core::{
     string::formatting::Separable, time::nanos_since_unix_epoch,
 };
 use nautilus_data::client::DataClientAdapter;
-use nautilus_execution::models::fill::FillModelHandle;
+use nautilus_execution::models::{fill::FillModelHandle, latency::LatencyModelHandle};
 use nautilus_model::{
     accounts::{Account, AccountAny},
     data::{Data, DataBatch, DataRef, HasTsInit},
@@ -341,6 +341,19 @@ impl BacktestEngine {
         } else {
             log::warn!(
                 "BacktestEngine::change_fill_model called for unknown venue {venue}, ignoring"
+            );
+        }
+    }
+
+    /// Changes the latency model for the specified venue.
+    ///
+    /// Commands already in flight keep the arrival time their previous model gave them.
+    pub fn change_latency_model(&mut self, venue: Venue, latency_model: LatencyModelHandle) {
+        if let Some(exchange) = self.venues.get_mut(&venue) {
+            exchange.borrow_mut().set_latency_model(latency_model);
+        } else {
+            log::warn!(
+                "BacktestEngine::change_latency_model called for unknown venue {venue}, ignoring"
             );
         }
     }
@@ -5219,6 +5232,51 @@ mod tests {
         engine
             .set_unconsumed_trade_ids(instrument_id, trade_ids())
             .unwrap();
+    }
+
+    #[rstest]
+    fn test_change_latency_model_delays_later_commands(crypto_perpetual_ethusdt: CryptoPerpetual) {
+        let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt);
+        let mut engine = engine_with_quoted_instrument(&instrument);
+        let venue = instrument.id().venue;
+        let exchange = Rc::clone(&engine.venues[&venue]);
+        let trader_id = engine.trader_id();
+        let submit = |id: &str| {
+            let order = OrderTestBuilder::new(OrderType::Market)
+                .trader_id(trader_id)
+                .instrument_id(instrument.id())
+                .client_order_id(ClientOrderId::from(id))
+                .side(OrderSide::Buy)
+                .quantity(Quantity::from("1.000"))
+                .build();
+            TradingCommand::SubmitOrder(create_submit_order_command(&order))
+        };
+        let insert_latency = |nanos| {
+            LatencyModelHandle::new(StaticLatencyModel::new(
+                DurationNanos::default(),
+                DurationNanos::new(nanos),
+                DurationNanos::default(),
+                DurationNanos::default(),
+            ))
+        };
+
+        engine.change_latency_model(Venue::from("UNKNOWN"), insert_latency(5));
+        exchange.borrow_mut().send(submit("O-1"));
+        assert_eq!(exchange.borrow().max_inflight_command_ts(), None);
+
+        engine.change_latency_model(venue, insert_latency(7));
+        exchange.borrow_mut().send(submit("O-2"));
+        assert_eq!(
+            exchange.borrow().max_inflight_command_ts(),
+            Some(UnixNanos::from(7))
+        );
+
+        engine.change_latency_model(venue, insert_latency(9));
+        exchange.borrow_mut().send(submit("O-3"));
+        assert_eq!(
+            exchange.borrow().max_inflight_command_ts(),
+            Some(UnixNanos::from(9))
+        );
     }
 
     #[rstest]
