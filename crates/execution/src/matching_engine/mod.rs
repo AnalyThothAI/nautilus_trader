@@ -35,6 +35,7 @@ use std::{
     rc::Rc,
 };
 
+use ahash::AHashSet;
 use indexmap::{IndexMap, IndexSet};
 use jiff::SignedDuration;
 use nautilus_common::{
@@ -144,6 +145,7 @@ pub struct OrderMatchingEngine {
     ask_consumption: IndexMap<PriceRaw, (QuantityRaw, QuantityRaw)>,
     bid_touch: TouchObservation,
     ask_touch: TouchObservation,
+    unconsumed_trade_ids: AHashSet<TradeId>,
     queue_pending: IndexMap<ClientOrderId, PriceRaw>,
     queue_ahead_orders: IndexMap<ClientOrderId, IndexMap<OrderId, QuantityRaw>>,
     queue_ahead_total: IndexMap<ClientOrderId, (PriceRaw, QuantityRaw)>,
@@ -246,6 +248,7 @@ impl OrderMatchingEngine {
             ask_consumption: IndexMap::new(),
             bid_touch: TouchObservation::default(),
             ask_touch: TouchObservation::default(),
+            unconsumed_trade_ids: AHashSet::new(),
             queue_pending: IndexMap::new(),
             queue_ahead_orders: IndexMap::new(),
             queue_ahead_total: IndexMap::new(),
@@ -316,6 +319,17 @@ impl OrderMatchingEngine {
     /// Cross-instrument OTO orders require the shared record and protocol in [`MatchingOrders`].
     pub fn set_matching_orders(&mut self, orders: MatchingOrders) {
         self.orders = orders;
+    }
+
+    /// Sets the trade IDs whose prints do not consume book liquidity.
+    ///
+    /// A replay of an account's own history sees that account's taker prints in the public
+    /// trades. The simulated order standing for the same historical order would otherwise find
+    /// the liquidity it took already consumed. Such a print still updates the last price and
+    /// drives trade execution; a simulated fill of that liquidity consumes it as usual. The set
+    /// replaces any previous one and survives [`Self::reset`], like the config.
+    pub fn set_unconsumed_trade_ids(&mut self, trade_ids: AHashSet<TradeId>) {
+        self.unconsumed_trade_ids = trade_ids;
     }
 
     fn dispatch_order_event(&self, event: OrderEventAny) {
@@ -2603,7 +2617,10 @@ impl OrderMatchingEngine {
         let (original_bid, original_ask) = self.update_trade_prices(trade);
         self.start_trade_iteration(trade.size);
 
-        if self.config.liquidity_consumption && self.book_type != BookType::L1_MBP {
+        if self.config.liquidity_consumption
+            && self.book_type != BookType::L1_MBP
+            && !self.unconsumed_trade_ids.contains(&trade.trade_id)
+        {
             self.seed_trade_consumption(
                 trade.price.raw(),
                 trade.size.raw(),

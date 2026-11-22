@@ -55,7 +55,7 @@ use nautilus_model::{
     accounts::{Account, AccountAny},
     data::{Data, DataBatch, DataRef, HasTsInit},
     enums::{AccountType, AggregationSource, BookType},
-    identifiers::{AccountId, ClientId, InstrumentId, StrategyId, TraderId, Venue},
+    identifiers::{AccountId, ClientId, InstrumentId, StrategyId, TradeId, TraderId, Venue},
     instruments::{Instrument, InstrumentAny},
     position::Position,
 };
@@ -345,6 +345,26 @@ impl BacktestEngine {
                 "BacktestEngine::change_fill_model called for unknown venue {venue}, ignoring"
             );
         }
+    }
+
+    /// Sets the trade IDs whose prints do not consume book liquidity for the given instrument.
+    ///
+    /// See [`SimulatedExchange::set_unconsumed_trade_ids`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the instrument's venue or matching engine has not been added.
+    pub fn set_unconsumed_trade_ids(
+        &mut self,
+        instrument_id: InstrumentId,
+        trade_ids: AHashSet<TradeId>,
+    ) -> anyhow::Result<()> {
+        let Some(exchange) = self.venues.get(&instrument_id.venue) else {
+            anyhow::bail!("No venue for {instrument_id}");
+        };
+        exchange
+            .borrow_mut()
+            .set_unconsumed_trade_ids(instrument_id, trade_ids)
     }
 
     /// Adds an instrument to the backtest engine for the specified venue.
@@ -5495,6 +5515,42 @@ mod tests {
         assert_ne!(best_ask_after, best_ask_before);
         assert_eq!(best_bid_after, Some(Price::from("2000.00")));
         assert_eq!(best_ask_after, Some(Price::from("2001.00")));
+    }
+
+    #[rstest]
+    fn test_set_unconsumed_trade_ids_requires_matching_engine(
+        crypto_perpetual_ethusdt: CryptoPerpetual,
+    ) {
+        let mut engine = BacktestEngine::new(BacktestEngineConfig::default()).unwrap();
+        let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt);
+        let instrument_id = instrument.id();
+        let trade_ids = || AHashSet::from([TradeId::from("T-1")]);
+        assert!(
+            engine
+                .set_unconsumed_trade_ids(instrument_id, trade_ids())
+                .is_err()
+        );
+
+        let venue_config = SimulatedVenueConfig::builder()
+            .venue(instrument_id.venue)
+            .oms_type(OmsType::Netting)
+            .account_type(AccountType::Margin)
+            .book_type(BookType::L2_MBP)
+            .starting_balances(vec![Money::from("1_000_000 USDT")])
+            .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into())
+            .build()
+            .unwrap();
+        engine.add_venue(venue_config).unwrap();
+        assert!(
+            engine
+                .set_unconsumed_trade_ids(instrument_id, trade_ids())
+                .is_err()
+        );
+
+        engine.add_instrument(&instrument).unwrap();
+        engine
+            .set_unconsumed_trade_ids(instrument_id, trade_ids())
+            .unwrap();
     }
 
     #[rstest]

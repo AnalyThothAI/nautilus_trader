@@ -67,7 +67,7 @@ use nautilus_model::{
         AccountState, FundingSettlement, OrderEventAny, OrderUpdated, PositionAdjusted,
         PositionEvent,
     },
-    identifiers::{AccountId, InstrumentId, Venue},
+    identifiers::{AccountId, InstrumentId, TradeId, Venue},
     instruments::{Instrument, InstrumentAny},
     orderbook::OrderBook,
     orders::{Order, OrderAny},
@@ -342,6 +342,25 @@ impl SimulatedExchange {
             log::info!("Setting fill model for {}", matching_engine.venue);
         }
         self.fill_model = fill_model;
+    }
+
+    /// Sets the trade IDs whose prints do not consume book liquidity for the given instrument.
+    ///
+    /// See [`OrderMatchingEngine::set_unconsumed_trade_ids`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the instrument has no matching engine.
+    pub fn set_unconsumed_trade_ids(
+        &mut self,
+        instrument_id: InstrumentId,
+        trade_ids: AHashSet<TradeId>,
+    ) -> anyhow::Result<()> {
+        let Some(matching_engine) = self.matching_engines.get_mut(&instrument_id) else {
+            anyhow::bail!("No matching engine for {instrument_id}");
+        };
+        matching_engine.set_unconsumed_trade_ids(trade_ids);
+        Ok(())
     }
 
     /// Sets the latency model for the exchange.

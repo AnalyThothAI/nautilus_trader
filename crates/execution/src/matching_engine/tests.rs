@@ -5436,6 +5436,80 @@ fn test_readded_l2_level_has_fresh_liquidity(#[values(false, true)] batched: boo
 }
 
 #[rstest]
+#[case::own(&[("OWN", "6.000")], "10.000")]
+#[case::other(&[("OTHER", "6.000")], "4.000")]
+#[case::own_and_other(&[("OWN", "6.000"), ("OTHER", "3.000")], "7.000")]
+fn test_unconsumed_trade_ids_leave_their_liquidity_once(
+    #[case] prints: &[(&str, &str)],
+    #[case] expected: &str,
+    #[values(false, true)] delayed: bool,
+) {
+    let (mut engine, _) = custom_book_engine(BookType::L2_MBP, true, false);
+    let id = engine.instrument.id();
+    let price = Price::from("1499.00");
+    engine.set_unconsumed_trade_ids(ahash::AHashSet::from([TradeId::from("OWN")]));
+    // A delayed print is charged at a touch which predates it (another level updated since)
+    let (ts_event, ts_init) = if delayed {
+        let update = OrderBookDelta::new(
+            id,
+            BookAction::Update,
+            BookOrder::new(
+                OrderSide::Buy,
+                Price::from("1498.00"),
+                Quantity::from("10.000"),
+                0,
+            ),
+            RecordFlag::F_LAST as u8,
+            2,
+            4.into(),
+            4.into(),
+        );
+        engine
+            .process_order_book_deltas(&OrderBookDeltas::new(id, vec![update]))
+            .unwrap();
+        (3, 5)
+    } else {
+        (2, 2)
+    };
+    for &(trade_id, size) in prints {
+        engine.process_trade_tick(&TradeTick::new(
+            id,
+            price,
+            Quantity::from(size),
+            AggressorSide::Sell,
+            TradeId::from(trade_id),
+            ts_event.into(),
+            ts_init.into(),
+        ));
+        assert_eq!(engine.core.last, Some(price));
+    }
+
+    // The first order takes what the prints left, consuming it for the second
+    let mut filled = Vec::new();
+    for client_order_id in ["O-1", "O-2"] {
+        let mut ioc = OrderTestBuilder::new(OrderType::Limit)
+            .instrument_id(id)
+            .client_order_id(ClientOrderId::from(client_order_id))
+            .side(OrderSide::Sell)
+            .price(price)
+            .quantity(Quantity::from("10.000"))
+            .time_in_force(TimeInForce::Ioc)
+            .submit(true)
+            .build();
+        process_cached_order(&mut engine, &mut ioc, AccountId::from("SIM-001"));
+        filled.push(
+            engine
+                .cache
+                .borrow()
+                .order(&ioc.client_order_id())
+                .unwrap()
+                .filled_qty(),
+        );
+    }
+    assert_eq!(filled, [Quantity::from(expected), Quantity::from("0.000")]);
+}
+
+#[rstest]
 fn test_seller_trade_seeds_every_crossed_bid_level() {
     let (mut engine, _) = custom_book_engine(BookType::L2_MBP, true, false);
     engine.book.clear(1, 1.into());
