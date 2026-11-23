@@ -72,6 +72,7 @@ use nautilus_model::{
     types::{Price, Quantity, currency::Currency},
 };
 use nautilus_network::{
+    http::{HttpRequestCompletion, HttpRequestTrace},
     ratelimiter::quota::Quota,
     retry::{RetryConfig, RetryManager},
 };
@@ -161,8 +162,13 @@ async fn raw_client_get_order_books_sends_query_and_parses_response() {
     assert_eq!(response.order_books[0].market_id, 0);
 }
 
+#[rstest]
+#[case::with_retries(false)]
+#[case::single_attempt(true)]
 #[tokio::test]
-async fn raw_client_get_order_book_details_sends_query_and_parses_response() {
+async fn raw_client_get_order_book_details_sends_query_and_parses_response(
+    #[case] single_attempt: bool,
+) {
     let base_url = spawn_server(Router::new().route(
         "/api/v1/orderBookDetails",
         get(handle_order_book_details_filtered),
@@ -175,15 +181,24 @@ async fn raw_client_get_order_book_details_sends_query_and_parses_response() {
         .build()
         .unwrap();
 
-    let response = client.get_order_book_details(&query).await.unwrap();
+    let response = if single_attempt {
+        client.get_order_book_details_once(&query).await.unwrap()
+    } else {
+        client.get_order_book_details(&query).await.unwrap()
+    };
 
     assert_eq!(response.code, 200);
     assert_eq!(response.order_book_details.len(), 1);
     assert_eq!(response.order_book_details[0].order_book.market_id, 0);
 }
 
+#[rstest]
+#[case::with_retries(false)]
+#[case::single_attempt(true)]
 #[tokio::test]
-async fn raw_client_get_order_book_orders_sends_query_and_parses_response() {
+async fn raw_client_get_order_book_orders_sends_query_and_parses_response(
+    #[case] single_attempt: bool,
+) {
     let base_url =
         spawn_server(Router::new().route("/api/v1/orderBookOrders", get(handle_order_book_orders)))
             .await;
@@ -193,7 +208,11 @@ async fn raw_client_get_order_book_orders_sends_query_and_parses_response() {
         limit: 25,
     };
 
-    let response = client.get_order_book_orders(&query).await.unwrap();
+    let response = if single_attempt {
+        client.get_order_book_orders_once(&query).await.unwrap()
+    } else {
+        client.get_order_book_orders(&query).await.unwrap()
+    };
 
     assert_eq!(response.code, 200);
     assert_eq!(response.asks.len(), 1);
@@ -902,6 +921,174 @@ async fn raw_client_returns_persistent_503_after_retry_exhaustion() {
 
     assert!(matches!(error, LighterHttpError::Http { status: 503, .. }));
     assert_eq!(calls.load(Ordering::SeqCst), 4);
+}
+
+#[rstest]
+#[case::metadata_503(true, StatusCode::SERVICE_UNAVAILABLE)]
+#[case::orders_503(false, StatusCode::SERVICE_UNAVAILABLE)]
+#[case::metadata_429(true, StatusCode::TOO_MANY_REQUESTS)]
+#[case::orders_429(false, StatusCode::TOO_MANY_REQUESTS)]
+#[case::metadata_405(true, StatusCode::METHOD_NOT_ALLOWED)]
+#[case::orders_405(false, StatusCode::METHOD_NOT_ALLOWED)]
+#[case::metadata_body_rate_limit(true, StatusCode::OK)]
+#[case::orders_body_rate_limit(false, StatusCode::OK)]
+#[tokio::test]
+async fn raw_client_owner_single_attempt_bypasses_adapter_retries(
+    #[case] metadata: bool,
+    #[case] status: StatusCode,
+    #[values(false, true)] traced: bool,
+) {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let requests = Arc::clone(&calls);
+    let endpoint = if metadata {
+        "/api/v1/orderBookDetails"
+    } else {
+        "/api/v1/orderBookOrders"
+    };
+    let router = Router::new().route(
+        endpoint,
+        get(move || {
+            let calls = Arc::clone(&requests);
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                let body = if status == StatusCode::OK {
+                    r#"{"code":429,"message":"slow down"}"#
+                } else {
+                    "busy"
+                };
+
+                (status, [("retry-after", "1")], body).into_response()
+            }
+        }),
+    );
+    let base_url = spawn_server(router).await;
+
+    // The configured retry manager would retry these errors for ordinary GET calls
+    let client = raw_client(base_url);
+    let trace = HttpRequestTrace::new();
+    let result = if traced {
+        if metadata {
+            client
+                .get_order_book_details_once_with_trace(
+                    &LighterOrderBookDetailsQuery::default(),
+                    &trace,
+                )
+                .await
+                .map(|response| response.code)
+        } else {
+            client
+                .get_order_book_orders_once_with_trace(
+                    &LighterOrderBookOrdersQuery {
+                        market_id: 0,
+                        limit: 25,
+                    },
+                    &trace,
+                )
+                .await
+                .map(|response| response.code)
+        }
+    } else if metadata {
+        client
+            .get_order_book_details_once(&LighterOrderBookDetailsQuery::default())
+            .await
+            .map(|response| response.code)
+    } else {
+        client
+            .get_order_book_orders_once(&LighterOrderBookOrdersQuery {
+                market_id: 0,
+                limit: 25,
+            })
+            .await
+            .map(|response| response.code)
+    };
+    let error = result.unwrap_err();
+
+    if status == StatusCode::SERVICE_UNAVAILABLE {
+        assert!(matches!(error, LighterHttpError::Http { status: 503, .. }));
+    } else {
+        assert!(matches!(error, LighterHttpError::RateLimit { .. }));
+    }
+
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+    if traced {
+        let timing = trace.snapshot();
+        assert_eq!(timing.status, Some(status.as_u16()));
+        assert_eq!(timing.transport_invocations, 1);
+        assert!(timing.body_received.is_some());
+        assert_eq!(timing.completion, Some(HttpRequestCompletion::Returned));
+    }
+}
+
+#[rstest]
+#[case::single_attempt_metadata(true)]
+#[case::ordinary_metadata(false)]
+#[tokio::test]
+async fn raw_client_owner_single_attempt_shares_rest_quota(#[case] single_attempt: bool) {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let metadata_calls = Arc::clone(&calls);
+    let order_calls = Arc::clone(&calls);
+    let router = Router::new()
+        .route(
+            "/api/v1/orderBookDetails",
+            get(move || {
+                let calls = Arc::clone(&metadata_calls);
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    (StatusCode::OK, HTTP_ORDER_BOOK_DETAILS).into_response()
+                }
+            }),
+        )
+        .route(
+            "/api/v1/orderBookOrders",
+            get(move || {
+                let calls = Arc::clone(&order_calls);
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    (StatusCode::OK, HTTP_ORDER_BOOK_ORDERS).into_response()
+                }
+            }),
+        );
+    let base_url = spawn_server(router).await;
+    let client = LighterRawHttpClient::new_with_quotas(
+        LighterEnvironment::Mainnet,
+        Some(base_url),
+        3,
+        None,
+        Quota::with_period(Duration::from_secs(3_600)).unwrap(),
+        None,
+    )
+    .unwrap();
+    let query = LighterOrderBookDetailsQuery::default();
+
+    if single_attempt {
+        client.get_order_book_details_once(&query).await.unwrap();
+    } else {
+        client.get_order_book_details(&query).await.unwrap();
+    }
+
+    let trace = HttpRequestTrace::new();
+    let query = LighterOrderBookOrdersQuery {
+        market_id: 0,
+        limit: 25,
+    };
+    let result = tokio::time::timeout(
+        Duration::from_millis(50),
+        client.get_order_book_orders_once_with_trace(&query, &trace),
+    )
+    .await;
+
+    assert!(
+        result.is_err(),
+        "REST quota should block the second endpoint"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    let timing = trace.snapshot();
+    assert!(timing.limiter_started.is_some());
+    assert!(timing.limiter_acquired.is_none());
+    assert_eq!(timing.transport_invocations, 0);
+    assert!(timing.transport_invoked.is_none());
+    assert_eq!(timing.completion, Some(HttpRequestCompletion::Cancelled));
 }
 
 #[tokio::test]
@@ -2625,4 +2812,68 @@ fn create_test_instrument() -> InstrumentAny {
             .build()
             .unwrap(),
     )
+}
+
+#[rstest]
+#[case::metadata_valid(true, true)]
+#[case::metadata_invalid_json(true, false)]
+#[case::orders_valid(false, true)]
+#[case::orders_invalid_json(false, false)]
+#[tokio::test]
+async fn raw_client_owner_trace_separates_network_body_from_adapter_result(
+    #[case] metadata: bool,
+    #[case] valid_json: bool,
+) {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let count = Arc::clone(&calls);
+    let endpoint = if metadata {
+        "/api/v1/orderBookDetails"
+    } else {
+        "/api/v1/orderBookOrders"
+    };
+    let router = Router::new().route(
+        endpoint,
+        get(move || {
+            let count = Arc::clone(&count);
+            async move {
+                count.fetch_add(1, Ordering::SeqCst);
+                let body = match (metadata, valid_json) {
+                    (true, true) => HTTP_ORDER_BOOK_DETAILS,
+                    (false, true) => HTTP_ORDER_BOOK_ORDERS,
+                    (_, false) => "invalid JSON",
+                };
+                (StatusCode::OK, body).into_response()
+            }
+        }),
+    );
+    let client = raw_client(spawn_server(router).await);
+    let trace = HttpRequestTrace::new();
+    let result = if metadata {
+        client
+            .get_order_book_details_once_with_trace(
+                &LighterOrderBookDetailsQuery::default(),
+                &trace,
+            )
+            .await
+            .map(|response| response.code)
+    } else {
+        client
+            .get_order_book_orders_once_with_trace(
+                &LighterOrderBookOrdersQuery {
+                    market_id: 0,
+                    limit: 25,
+                },
+                &trace,
+            )
+            .await
+            .map(|response| response.code)
+    };
+    assert_eq!(result.is_ok(), valid_json, "{result:?}");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    let timing = trace.snapshot();
+    assert_eq!(timing.status, Some(200));
+    assert_eq!(timing.transport_invocations, 1);
+    assert!(timing.body_received.is_some());
+    assert!(timing.completed.is_some());
+    assert_eq!(timing.completion, Some(HttpRequestCompletion::Returned));
 }

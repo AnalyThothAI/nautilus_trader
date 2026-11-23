@@ -30,8 +30,9 @@ use url::Url;
 use ustr::Ustr;
 
 use super::{
-    HttpClientError, HttpResponse, HttpResponseStream, HttpStatus,
+    HttpClientError, HttpRequestTrace, HttpResponse, HttpResponseStream, HttpStatus,
     stream::{check_deadline, read_chunk, response_error},
+    timing::FinishTrace,
 };
 use crate::ratelimiter::{RateLimiter, clock::MonotonicClock, quota::Quota};
 
@@ -363,6 +364,96 @@ impl HttpClient {
             .await
     }
 
+    /// Sends an HTTP request with serializable query parameters and no automatic retries.
+    ///
+    /// Applies the same rate limits and response handling as [`Self::request_with_params`].
+    /// Disables transport protocol retries, retries of canceled requests on reused connections,
+    /// and redirects for this call, regardless of the client's redirect policy. Validation or
+    /// cancellation can prevent transmission; this method does not promise that the peer received
+    /// a request.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if request preparation, transmission, or response handling fails or times out.
+    #[expect(clippy::too_many_arguments)]
+    pub async fn request_once_with_params<P: serde::Serialize>(
+        &self,
+        method: Method,
+        url: String,
+        params: Option<&P>,
+        headers: Option<HashMap<String, String>>,
+        body: Option<Vec<u8>>,
+        timeout_secs: Option<u64>,
+        keys: Option<Vec<String>>,
+    ) -> Result<HttpResponse, HttpClientError> {
+        let keys = keys.map(into_ustr_vec);
+        self.await_rate_limits(keys.as_deref()).await;
+
+        self.client
+            .send_request_internal(
+                method,
+                &url,
+                params,
+                headers,
+                body.map(RequestBody::Plain),
+                timeout_secs,
+                true,
+                None,
+            )
+            .await
+    }
+
+    /// Sends a single-attempt request and retains request-local phase evidence.
+    ///
+    /// The fresh collector records first poll, quota waits, preparation, the Hyper invocation,
+    /// response headers, body receipt and local completion. Hyper invocation is not wire evidence.
+    /// Dropping a polled future records cancellation without claiming remote cancellation. An
+    /// unpolled future records no completion. Simulation has no Hyper invocation or header evidence.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the collector was already used, or if the same preparation, transport,
+    /// timeout or response processing as [`Self::request_once_with_params`] fails.
+    #[expect(clippy::too_many_arguments)]
+    pub async fn request_once_with_params_and_trace<P: serde::Serialize>(
+        &self,
+        method: Method,
+        url: String,
+        params: Option<&P>,
+        headers: Option<HashMap<String, String>>,
+        body: Option<Vec<u8>>,
+        timeout_secs: Option<u64>,
+        keys: Option<Vec<String>>,
+        trace: &HttpRequestTrace,
+    ) -> Result<HttpResponse, HttpClientError> {
+        if !trace.begin() {
+            return Err(HttpClientError::Error(
+                "HTTP timing collector already used".into(),
+            ));
+        }
+
+        let mut finish = FinishTrace::new(trace.clone());
+        let keys = keys.map(into_ustr_vec);
+        trace.limiter_started();
+        self.await_rate_limits(keys.as_deref()).await;
+        trace.limiter_acquired();
+        let result = self
+            .client
+            .send_request_internal(
+                method,
+                &url,
+                params,
+                headers,
+                body.map(RequestBody::Plain),
+                timeout_secs,
+                true,
+                Some(trace),
+            )
+            .await;
+        finish.returned(result.is_ok());
+        result
+    }
+
     /// Sends a GET request and returns its response body as a stream.
     ///
     /// Returns raw body chunks without content decoding or adding `Accept-Encoding`.
@@ -384,6 +475,8 @@ impl HttpClient {
                 None,
                 None,
                 None,
+                None,
+                false,
                 None,
             )
             .await
@@ -593,6 +686,8 @@ impl InnerHttpClient {
             headers,
             body,
             timeout_secs,
+            false,
+            None,
         )
         .await
     }
@@ -621,6 +716,8 @@ impl InnerHttpClient {
             headers,
             body.map(RequestBody::Plain),
             timeout_secs,
+            false,
+            None,
         )
         .await
     }
@@ -630,6 +727,7 @@ impl InnerHttpClient {
     /// # Errors
     ///
     /// Returns an error if unable to send request or times out.
+    #[expect(clippy::too_many_arguments)]
     async fn send_request_internal<Q: serde::Serialize>(
         &self,
         method: Method,
@@ -638,6 +736,8 @@ impl InnerHttpClient {
         headers: Option<HashMap<String, String>>,
         body: Option<RequestBody>,
         timeout_secs: Option<u64>,
+        single_attempt: bool,
+        trace: Option<&HttpRequestTrace>,
     ) -> Result<HttpResponse, HttpClientError> {
         let mut headers = headers.unwrap_or_default();
         let has_accept_encoding = headers
@@ -651,14 +751,24 @@ impl InnerHttpClient {
 
         let is_head = method == Method::HEAD;
         let stream = self
-            .send_stream_internal(method, url, query, Some(headers), body, timeout_secs)
+            .send_stream_internal(
+                method,
+                url,
+                query,
+                Some(headers),
+                body,
+                timeout_secs,
+                single_attempt,
+                trace,
+            )
             .await?;
         let result = self
-            .consume_response(stream.response, stream.deadline, is_head)
+            .consume_response(stream.response, stream.deadline, is_head, trace)
             .await;
         result.map_err(|e| response_error(e, stream.origin.as_deref()))
     }
 
+    #[expect(clippy::too_many_arguments)]
     async fn send_stream_internal<Q: serde::Serialize>(
         &self,
         method: Method,
@@ -667,6 +777,8 @@ impl InnerHttpClient {
         headers: Option<HashMap<String, String>>,
         body: Option<RequestBody>,
         timeout_secs: Option<u64>,
+        single_attempt: bool,
+        trace: Option<&HttpRequestTrace>,
     ) -> Result<HttpResponseStream, HttpClientError> {
         let mut url =
             Url::parse(url).map_err(|e| HttpClientError::from(format!("URL parse error: {e}")))?;
@@ -743,6 +855,16 @@ impl InnerHttpClient {
             .parse()
             .map_err(|_| HttpClientError::Error("invalid HTTP request target".into()))?;
         *request.headers_mut() = header_map;
+
+        if single_attempt {
+            request.extensions_mut().insert(SingleAttempt);
+        }
+
+        if let Some(trace) = trace {
+            trace.prepared();
+            request.extensions_mut().insert(trace.clone());
+        }
+
         log::trace!(
             "Sending HTTP request: method={} extra_headers={extra_header_count} \
              query_bytes={query_len} body_bytes={body_len}",
@@ -785,6 +907,7 @@ impl InnerHttpClient {
         response: http::Response<B>,
         deadline: Option<crate::dst::time::Instant>,
         is_head: bool,
+        trace: Option<&HttpRequestTrace>,
     ) -> Result<HttpResponse, HttpClientError>
     where
         B: http_body::Body<Data = Bytes> + Unpin,
@@ -824,6 +947,10 @@ impl InnerHttpClient {
             buf.extend_from_slice(&chunk);
         }
 
+        if let Some(trace) = trace {
+            trace.body_received();
+        }
+
         log::trace!(
             "Received HTTP response: status={} headers={} body_bytes={}",
             parts.status,
@@ -861,6 +988,9 @@ impl InnerHttpClient {
         })
     }
 }
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct SingleAttempt;
 
 enum RequestBody {
     Plain(Vec<u8>),
@@ -1420,7 +1550,12 @@ mod tests {
         let client = inner_client();
         let response = http::Response::new(Full::new(Bytes::from_static(b"ready")));
         let result = client
-            .consume_response(response, Some(crate::dst::time::Instant::now()), false)
+            .consume_response(
+                response,
+                Some(crate::dst::time::Instant::now()),
+                false,
+                None,
+            )
             .await;
         assert!(
             matches!(result, Err(HttpClientError::TimeoutError(message)) if message == REQUEST_TIMEOUT_MESSAGE)
@@ -1642,7 +1777,7 @@ mod tests {
         let response = http::Response::new(Full::new(Bytes::from_static(bytes)));
 
         let response = client
-            .consume_response(response, None, false)
+            .consume_response(response, None, false, None)
             .await
             .unwrap();
 
@@ -2850,7 +2985,7 @@ pub(super) mod content_encoding_tests {
             .unwrap()
             .client;
         let deadline = expires.then(|| time::Instant::now() + Duration::from_secs(1));
-        let mut request = Box::pin(client.consume_response(response, deadline, false));
+        let mut request = Box::pin(client.consume_response(response, deadline, false, None));
 
         assert!(futures_util::poll!(request.as_mut()).is_pending());
 
@@ -2906,7 +3041,7 @@ pub(super) mod content_encoding_tests {
             .client;
 
         let response = client
-            .consume_response(response, None, false)
+            .consume_response(response, None, false, None)
             .await
             .unwrap();
 

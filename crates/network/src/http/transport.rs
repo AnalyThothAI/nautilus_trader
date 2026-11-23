@@ -46,12 +46,16 @@ use tower_http::follow_redirect::{
 use tower_service::Service;
 use url::Url;
 
-use super::{HttpClientError, HttpRedirectPolicy, connector::Connector, error::transport_error};
+use super::{
+    HttpClientError, HttpRedirectPolicy, HttpRequestTrace, client::SingleAttempt,
+    connector::Connector, error::transport_error,
+};
 use crate::tls::create_tls_config_from_certs_dir;
 
 #[derive(Clone, Debug)]
 pub(super) struct Client {
-    client: HyperClient<HttpsConnector<Connector>, Full<Bytes>>,
+    pooled: HyperClient<HttpsConnector<Connector>, Full<Bytes>>,
+    single_attempt_pool: HyperClient<HttpsConnector<Connector>, Full<Bytes>>,
     proxies: Arc<Matcher>,
 }
 
@@ -87,7 +91,8 @@ impl Client {
         tls.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
         let connector = HttpsConnector::from((connector, tls));
 
-        let client = HyperClient::builder(TokioExecutor::new())
+        let mut builder = HyperClient::builder(TokioExecutor::new());
+        builder
             .pool_timer(TokioTimer::new())
             .timer(TokioTimer::new())
             .pool_max_idle_per_host(settings.pool_max_idle_per_host)
@@ -97,9 +102,14 @@ impl Client {
             .http2_initial_stream_window_size(settings.stream_window)
             .http2_initial_connection_window_size(settings.connection_window)
             // Keep after the window sizes: setting a window size turns adaptive windows off
-            .http2_adaptive_window(settings.adaptive_window)
-            .build(connector);
-        Ok(Self { client, proxies })
+            .http2_adaptive_window(settings.adaptive_window);
+        let pooled = builder.build(connector.clone());
+        let single_attempt_pool = builder.retry_canceled_requests(false).build(connector);
+        Ok(Self {
+            pooled,
+            single_attempt_pool,
+            proxies,
+        })
     }
 
     pub(super) async fn send(
@@ -108,7 +118,11 @@ impl Client {
         redirects: HttpRedirectPolicy,
     ) -> Result<Response<Incoming>, HttpClientError> {
         let policy = Redirects {
-            policy: redirects,
+            policy: if request.extensions().get::<SingleAttempt>().is_some() {
+                HttpRedirectPolicy::Reject
+            } else {
+                redirects
+            },
             count: 0,
             previous: None,
             cross_origin: false,
@@ -142,14 +156,30 @@ impl Service<Request<Full<Bytes>>> for Client {
                 .insert(PROXY_AUTHORIZATION, auth.clone());
         }
 
-        let client = self.client.clone();
+        let trace = request.extensions().get::<HttpRequestTrace>().cloned();
+        let single_attempt = request.extensions().get::<SingleAttempt>().is_some();
+        let client = if single_attempt {
+            self.single_attempt_pool.clone()
+        } else {
+            self.pooled.clone()
+        };
         Box::pin(async move {
             let mut retries = 0;
 
             loop {
+                if let Some(trace) = &trace {
+                    trace.transport_invoked();
+                }
+
                 match client.request(request.clone()).await {
-                    Ok(response) => return Ok(response),
-                    Err(e) if retries < 2 && retryable(&e) => retries += 1,
+                    Ok(response) => {
+                        if let Some(trace) = &trace {
+                            trace.headers_received(response.status().as_u16());
+                        }
+
+                        return Ok(response);
+                    }
+                    Err(e) if !single_attempt && retries < 2 && retryable(&e) => retries += 1,
                     Err(e) => return Err(transport_error(&e)),
                 }
             }

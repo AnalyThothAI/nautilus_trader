@@ -28,8 +28,8 @@ use nautilus_model::{
 };
 use nautilus_network::{
     http::{
-        HttpClient, HttpRedirectPolicy, HttpResponse, Method, create_standard_nautilus_headers,
-        parse_retry_after,
+        HttpClient, HttpRedirectPolicy, HttpRequestTrace, HttpResponse, Method,
+        create_standard_nautilus_headers, parse_retry_after,
     },
     ratelimiter::quota::Quota,
     retry::{RetryManager, create_http_retry_manager},
@@ -287,6 +287,21 @@ impl LighterRawHttpClient {
             .await
     }
 
+    /// Calls `GET /api/v1/orderBookDetails` without automatic retries or redirects.
+    ///
+    /// Preserves the REST quota and response validation. The caller owns any subsequent attempt.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or the response is invalid.
+    pub async fn get_order_book_details_once(
+        &self,
+        query: &LighterOrderBookDetailsQuery,
+    ) -> LighterHttpResult<LighterOrderBookDetails> {
+        self.send_get_request_once(ENDPOINT_ORDER_BOOK_DETAILS, query)
+            .await
+    }
+
     /// Calls `GET /api/v1/orderBookOrders`.
     ///
     /// # Errors
@@ -297,6 +312,21 @@ impl LighterRawHttpClient {
         query: &LighterOrderBookOrdersQuery,
     ) -> LighterHttpResult<LighterOrderBookOrders> {
         self.send_get_request(ENDPOINT_ORDER_BOOK_ORDERS, Some(query))
+            .await
+    }
+
+    /// Calls `GET /api/v1/orderBookOrders` without automatic retries or redirects.
+    ///
+    /// Preserves the REST quota and response validation. The caller owns any subsequent attempt.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or the response is invalid.
+    pub async fn get_order_book_orders_once(
+        &self,
+        query: &LighterOrderBookOrdersQuery,
+    ) -> LighterHttpResult<LighterOrderBookOrders> {
+        self.send_get_request_once(ENDPOINT_ORDER_BOOK_ORDERS, query)
             .await
     }
 
@@ -484,6 +514,86 @@ impl LighterRawHttpClient {
     ) -> LighterHttpResult<LighterSendTxBatchResponse> {
         let fields = request.form_fields();
         self.send_post_form(ENDPOINT_SEND_TX_BATCH, &fields).await
+    }
+
+    /// Reads market metadata once and retains request-local phase evidence.
+    ///
+    /// The trace ends before adapter response parsing and does not prove wire transmission.
+    /// Quotas and single-attempt policy are identical to [`Self::get_order_book_details_once`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the collector was already used, the request fails, or the response is invalid.
+    pub async fn get_order_book_details_once_with_trace(
+        &self,
+        query: &LighterOrderBookDetailsQuery,
+        trace: &HttpRequestTrace,
+    ) -> LighterHttpResult<LighterOrderBookDetails> {
+        self.send_get_request_once_with_trace(ENDPOINT_ORDER_BOOK_DETAILS, query, trace)
+            .await
+    }
+
+    /// Reads resting orders once and retains request-local phase evidence.
+    ///
+    /// The trace ends before adapter response parsing and does not prove wire transmission.
+    /// Quotas and single-attempt policy are identical to [`Self::get_order_book_orders_once`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the collector was already used, the request fails, or the response is invalid.
+    pub async fn get_order_book_orders_once_with_trace(
+        &self,
+        query: &LighterOrderBookOrdersQuery,
+        trace: &HttpRequestTrace,
+    ) -> LighterHttpResult<LighterOrderBookOrders> {
+        self.send_get_request_once_with_trace(ENDPOINT_ORDER_BOOK_ORDERS, query, trace)
+            .await
+    }
+
+    async fn send_get_request_once_with_trace<T, P>(
+        &self,
+        endpoint: &str,
+        query: &P,
+        trace: &HttpRequestTrace,
+    ) -> LighterHttpResult<T>
+    where
+        T: DeserializeOwned + LighterResponseCheck,
+        P: Serialize,
+    {
+        let response = self
+            .client
+            .request_once_with_params_and_trace(
+                Method::GET,
+                self.url(endpoint),
+                Some(query),
+                None,
+                None,
+                None,
+                Some(Self::rate_limit_keys(endpoint)),
+                trace,
+            )
+            .await?;
+        Self::parse_response(&response)
+    }
+
+    async fn send_get_request_once<T, P>(&self, endpoint: &str, query: &P) -> LighterHttpResult<T>
+    where
+        T: DeserializeOwned + LighterResponseCheck,
+        P: Serialize,
+    {
+        let response = self
+            .client
+            .request_once_with_params(
+                Method::GET,
+                self.url(endpoint),
+                Some(query),
+                None,
+                None,
+                None,
+                Some(Self::rate_limit_keys(endpoint)),
+            )
+            .await?;
+        Self::parse_response(&response)
     }
 
     async fn send_get_request<T, P>(

@@ -33,9 +33,10 @@ use rstest::rstest;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::{
-    HttpClient, HttpClientError, HttpRedirectPolicy, HttpResponse,
-    client::content_encoding_tests::gzip,
+    HttpClient, HttpClientError, HttpRedirectPolicy, HttpRequestCompletion, HttpRequestTrace,
+    HttpResponse, client::content_encoding_tests::gzip,
 };
+use crate::ratelimiter::quota::Quota;
 
 #[rstest]
 #[case(301)]
@@ -895,11 +896,29 @@ async fn streamed_response_releases_partial_body(#[case] timeout: bool) {
 
 #[cfg(all(unix, not(target_os = "android"), not(target_vendor = "apple")))]
 #[rstest]
-fn platform_tls_http2_and_protocol_retries() {
+#[case::ordinary_retries(false, false, h2::Reason::REFUSED_STREAM, 2, 3, true)]
+#[case::ordinary_exhausted(false, false, h2::Reason::REFUSED_STREAM, 3, 3, false)]
+#[case::ordinary_nonretryable(false, false, h2::Reason::INTERNAL_ERROR, 1, 1, false)]
+#[case::once_refused(true, false, h2::Reason::REFUSED_STREAM, 2, 1, false)]
+#[case::once_nonretryable(true, false, h2::Reason::INTERNAL_ERROR, 1, 1, false)]
+#[case::once_success(true, false, h2::Reason::REFUSED_STREAM, 0, 1, true)]
+#[case::traced_refused(true, true, h2::Reason::REFUSED_STREAM, 2, 1, false)]
+#[case::traced_nonretryable(true, true, h2::Reason::INTERNAL_ERROR, 1, 1, false)]
+#[case::traced_success(true, true, h2::Reason::REFUSED_STREAM, 0, 1, true)]
+fn platform_tls_http2_and_protocol_retries(
+    #[case] single_attempt: bool,
+    #[case] traced: bool,
+    #[case] reason: h2::Reason,
+    #[case] refused: usize,
+    #[case] expected_requests: usize,
+    #[case] success: bool,
+) {
     use http::StatusCode;
 
     let Some(config) = tls_server_config() else {
-        run_tls_child("http::tests::platform_tls_http2_and_protocol_retries", &[]);
+        // Preserve certificate isolation for each independently named Rust test case
+        let thread = std::thread::current();
+        run_tls_child(thread.name().expect("test harness names each case"), &[]);
         return;
     };
 
@@ -908,79 +927,302 @@ fn platform_tls_http2_and_protocol_retries() {
         .build()
         .unwrap()
         .block_on(async {
-            {
-                for (reason, refused, expected_requests, success) in [
-                    (h2::Reason::REFUSED_STREAM, 2, 3, true),
-                    (h2::Reason::REFUSED_STREAM, 3, 3, false),
-                    (h2::Reason::INTERNAL_ERROR, 1, 1, false),
-                ] {
-                    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-                    let addr = listener.local_addr().unwrap();
-                    let attempts = Arc::new(AtomicUsize::new(0));
-                    let count = Arc::clone(&attempts);
-                    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::clone(&config));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let attempts = Arc::new(AtomicUsize::new(0));
+            let count = Arc::clone(&attempts);
+            let acceptor = tokio_rustls::TlsAcceptor::from(Arc::clone(&config));
 
-                    let peer = tokio::spawn(async move {
-                        let (stream, _) = listener.accept().await.unwrap();
-                        let stream = acceptor.accept(stream).await.unwrap();
-                        assert_eq!(stream.get_ref().1.alpn_protocol(), Some(b"h2".as_slice()));
-                        let mut connection = h2::server::handshake(stream).await.unwrap();
-                        while let Some(request) = connection.accept().await {
-                            let (request, mut respond) = request.unwrap();
-                            assert_eq!(request.method(), Method::POST);
-                            assert_eq!(request.uri().path(), "/order");
+            let peer = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let stream = acceptor.accept(stream).await.unwrap();
+                assert_eq!(stream.get_ref().1.alpn_protocol(), Some(b"h2".as_slice()));
+                let mut connection = h2::server::handshake(stream).await.unwrap();
+                while let Some(request) = connection.accept().await {
+                    let (request, mut respond) = request.unwrap();
+                    assert_eq!(request.method(), Method::POST);
+                    assert_eq!(request.uri().path(), "/order");
 
-                            if count.fetch_add(1, Ordering::SeqCst) < refused {
-                                respond.send_reset(reason);
-                            } else {
-                                let response = http::Response::builder()
-                                    .status(StatusCode::CREATED)
-                                    .body(())
-                                    .unwrap();
-                                respond
-                                    .send_response(response, false)
-                                    .unwrap()
-                                    .send_data(Bytes::from_static(b"accepted-73"), true)
-                                    .unwrap();
-                            }
-                        }
-                    });
-
-                    let client = HttpClient::builder()
-                        .use_system_proxy(false)
-                        .timeout_secs(3)
-                        .build()
-                        .unwrap();
-                    let result = send(
-                        &client,
-                        Method::POST,
-                        format!("https://localhost:{}/order", addr.port()),
-                        Some(b"order-83".to_vec()),
-                    )
-                    .await;
-                    assert_eq!(
-                        attempts.load(Ordering::SeqCst),
-                        expected_requests,
-                        "{result:?}"
-                    );
-
-                    if success {
-                        let response = result.unwrap();
-                        assert_eq!(response.status.as_u16(), 201);
-                        assert_eq!(response.headers, HashMap::new());
-                        assert_eq!(response.body, Bytes::from_static(b"accepted-73"));
+                    if count.fetch_add(1, Ordering::SeqCst) < refused {
+                        respond.send_reset(reason);
                     } else {
-                        assert!(
-                            matches!(result, Err(HttpClientError::TransportError(_))),
-                            "{result:?}"
-                        );
+                        let response = http::Response::builder()
+                            .status(StatusCode::CREATED)
+                            .body(())
+                            .unwrap();
+                        respond
+                            .send_response(response, false)
+                            .unwrap()
+                            .send_data(Bytes::from_static(b"accepted-73"), true)
+                            .unwrap();
                     }
-
-                    peer.abort();
-                    assert!(peer.await.unwrap_err().is_cancelled());
                 }
+            });
+
+            let client = HttpClient::builder()
+                .use_system_proxy(false)
+                .timeout_secs(3)
+                .build()
+                .unwrap();
+            let url = format!("https://localhost:{}/order", addr.port());
+            let trace = HttpRequestTrace::new();
+            let result = if traced {
+                client
+                    .request_once_with_params_and_trace::<()>(
+                        Method::POST,
+                        url,
+                        None,
+                        None,
+                        Some(b"order-83".to_vec()),
+                        None,
+                        None,
+                        &trace,
+                    )
+                    .await
+            } else if single_attempt {
+                client
+                    .request_once_with_params::<()>(
+                        Method::POST,
+                        url,
+                        None,
+                        None,
+                        Some(b"order-83".to_vec()),
+                        None,
+                        None,
+                    )
+                    .await
+            } else {
+                send(&client, Method::POST, url, Some(b"order-83".to_vec())).await
+            };
+            assert_eq!(
+                attempts.load(Ordering::SeqCst),
+                expected_requests,
+                "{result:?}"
+            );
+
+            if traced {
+                let timing = trace.snapshot();
+                assert_eq!(timing.transport_invocations, 1);
+                assert_eq!(timing.status, success.then_some(201));
+                assert_eq!(
+                    timing.completion,
+                    Some(if success {
+                        HttpRequestCompletion::Returned
+                    } else {
+                        HttpRequestCompletion::Failed
+                    })
+                );
             }
+
+            if success {
+                let response = result.unwrap();
+                assert_eq!(response.status.as_u16(), 201);
+                assert_eq!(response.headers, HashMap::new());
+                assert_eq!(response.body, Bytes::from_static(b"accepted-73"));
+            } else {
+                assert!(
+                    matches!(result, Err(HttpClientError::TransportError(_))),
+                    "{result:?}"
+                );
+            }
+
+            peer.abort();
+            assert!(peer.await.unwrap_err().is_cancelled());
         });
+}
+
+#[cfg(all(unix, not(target_os = "android"), not(target_vendor = "apple")))]
+#[rstest]
+#[case::ordinary(false, false, 3)]
+#[case::once(true, false, 1)]
+#[case::traced(true, true, 1)]
+fn platform_tls_single_attempt_does_not_retry_goaway(
+    #[case] single_attempt: bool,
+    #[case] traced: bool,
+    #[case] expected_requests: usize,
+) {
+    let Some(config) = tls_server_config() else {
+        // Preserve certificate isolation for each independently named Rust test case
+        let thread = std::thread::current();
+        run_tls_child(thread.name().expect("test harness names each case"), &[]);
+        return;
+    };
+
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let attempts = Arc::new(AtomicUsize::new(0));
+            let count = Arc::clone(&attempts);
+            let acceptor = tokio_rustls::TlsAcceptor::from(Arc::clone(&config));
+
+            let peer = tokio::spawn(async move {
+                loop {
+                    let (stream, _) = listener.accept().await.unwrap();
+                    let mut stream = acceptor.accept(stream).await.unwrap();
+                    let mut connection = h2::server::handshake(&mut stream).await.unwrap();
+                    let (request, _respond) = connection.accept().await.unwrap().unwrap();
+                    assert_eq!(request.uri().path(), "/goaway");
+                    assert!(request.body().stream_id().as_u32() > 0);
+                    count.fetch_add(1, Ordering::SeqCst);
+
+                    // h2 marks parsed headers as processed, so abrupt_shutdown would include this
+                    // stream. Send GOAWAY on the borrowed transport with last_stream_id = 0 to
+                    // state that this received request was not processed.
+                    drop(connection);
+                    let go_away = [
+                        0, 0, 8, // Eight payload bytes
+                        7, 0, // GOAWAY frame with no flags
+                        0, 0, 0, 0, // Connection-level stream identifier
+                        0, 0, 0, 0, // No request streams were processed
+                        0, 0, 0, 0, // NO_ERROR
+                    ];
+                    stream.write_all(&go_away).await.unwrap();
+                    stream.shutdown().await.unwrap();
+                }
+            });
+
+            let client = HttpClient::builder()
+                .use_system_proxy(false)
+                .timeout_secs(3)
+                .build()
+                .unwrap();
+            let url = format!("https://localhost:{}/goaway", addr.port());
+            let trace = HttpRequestTrace::new();
+            let result = if traced {
+                client
+                    .request_once_with_params_and_trace::<()>(
+                        Method::GET,
+                        url,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        &trace,
+                    )
+                    .await
+            } else if single_attempt {
+                client
+                    .request_once_with_params::<()>(Method::GET, url, None, None, None, None, None)
+                    .await
+            } else {
+                send(&client, Method::GET, url, None).await
+            };
+
+            assert!(
+                matches!(result, Err(HttpClientError::TransportError(_))),
+                "{result:?}"
+            );
+            assert_eq!(attempts.load(Ordering::SeqCst), expected_requests);
+
+            if traced {
+                let timing = trace.snapshot();
+                assert_eq!(timing.transport_invocations, 1);
+                assert!(timing.headers_received.is_none());
+                assert_eq!(timing.completion, Some(HttpRequestCompletion::Failed));
+            }
+            peer.abort();
+            assert!(peer.await.unwrap_err().is_cancelled());
+        });
+}
+
+#[rstest]
+#[case(301)]
+#[case(302)]
+#[case(303)]
+#[case(307)]
+#[case(308)]
+#[tokio::test]
+async fn single_attempt_preserves_query_and_rejects_configured_redirects(
+    #[case] status: u16,
+    #[values(false, true)] traced: bool,
+) {
+    #[derive(serde::Serialize)]
+    struct Query {
+        market_id: u64,
+    }
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let count = Arc::clone(&attempts);
+
+    let peer = tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = read_headers(&mut stream).await;
+            assert!(request.starts_with("GET /once?market_id=7 HTTP/1.1\r\n"));
+            count.fetch_add(1, Ordering::SeqCst);
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 {status} Redirect\r\nContent-Length: 4\r\nLocation: http://{addr}/once?market_id=7\r\nConnection: close\r\n\r\nstop"
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+        }
+    });
+
+    let client = HttpClient::builder()
+        .redirect_policy(HttpRedirectPolicy::Follow)
+        .header_keys(vec!["location".into()])
+        .use_system_proxy(false)
+        .timeout_secs(3)
+        .build()
+        .unwrap();
+    let query = Query { market_id: 7 };
+    let trace = HttpRequestTrace::new();
+    let response = if traced {
+        client
+            .request_once_with_params_and_trace(
+                Method::GET,
+                format!("http://{addr}/once"),
+                Some(&query),
+                None,
+                None,
+                None,
+                None,
+                &trace,
+            )
+            .await
+    } else {
+        client
+            .request_once_with_params(
+                Method::GET,
+                format!("http://{addr}/once"),
+                Some(&query),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+    }
+    .unwrap();
+
+    if traced {
+        let timing = trace.snapshot();
+        assert_eq!(timing.transport_invocations, 1);
+        assert_eq!(timing.status, Some(status));
+        assert_eq!(timing.completion, Some(HttpRequestCompletion::Returned));
+        assert!(timing.body_received.is_some());
+    }
+
+    assert_eq!(response.status.as_u16(), status);
+    assert_eq!(response.body.as_ref(), b"stop");
+    assert_eq!(
+        response.headers.get("location"),
+        Some(&format!("http://{addr}/once?market_id=7"))
+    );
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    peer.abort();
+    assert!(peer.await.unwrap_err().is_cancelled());
 }
 
 #[cfg(all(unix, not(target_os = "android"), not(target_vendor = "apple")))]
@@ -1920,4 +2162,250 @@ async fn certs_dir_presents_client_certificate_over_https(
         }
         None => assert_eq!(result.unwrap().status.as_u16(), 200),
     }
+}
+
+#[tokio::test]
+async fn single_attempt_trace_cancelled_in_limiter_never_invokes_transport() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let requests = Arc::new(AtomicUsize::new(0));
+    let count = Arc::clone(&requests);
+
+    let peer = tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            read_headers(&mut stream).await;
+            count.fetch_add(1, Ordering::SeqCst);
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .await
+                .unwrap();
+        }
+    });
+    let client = HttpClient::builder()
+        .use_system_proxy(false)
+        .default_quota(Quota::with_period(Duration::from_secs(3_600)).unwrap())
+        .timeout_secs(3)
+        .build()
+        .unwrap();
+    let url = format!("http://{addr}/quota");
+    client
+        .request_once_with_params::<()>(
+            Method::GET,
+            url.clone(),
+            None,
+            None,
+            None,
+            None,
+            Some(vec!["owner".into()]),
+        )
+        .await
+        .unwrap();
+
+    let unpolled = HttpRequestTrace::new();
+    drop(client.request_once_with_params_and_trace::<()>(
+        Method::GET,
+        url.clone(),
+        None,
+        None,
+        None,
+        None,
+        Some(vec!["owner".into()]),
+        &unpolled,
+    ));
+    assert!(unpolled.snapshot().first_polled.is_none());
+    assert!(unpolled.snapshot().completed.is_none());
+
+    let trace = HttpRequestTrace::new();
+    let mut request = Box::pin(client.request_once_with_params_and_trace::<()>(
+        Method::GET,
+        url.clone(),
+        None,
+        None,
+        None,
+        None,
+        Some(vec!["owner".into()]),
+        &trace,
+    ));
+    assert!(request.as_mut().now_or_never().is_none());
+    let pending = trace.snapshot();
+    assert!(pending.first_polled.is_some());
+    assert!(pending.limiter_started.is_some());
+    assert!(pending.limiter_acquired.is_none());
+    assert!(pending.completed.is_none());
+    drop(request);
+
+    let timing = trace.snapshot();
+    assert_eq!(timing.completion, Some(HttpRequestCompletion::Cancelled));
+    assert!(timing.completed.is_some());
+    assert!(timing.limiter_acquired.is_none());
+    assert!(timing.prepared.is_none());
+    assert!(timing.transport_invoked.is_none());
+    assert_eq!(timing.transport_invocations, 0);
+    assert!(timing.headers_received.is_none());
+    assert!(timing.body_received.is_none());
+    assert_eq!(requests.load(Ordering::SeqCst), 1);
+
+    let reused = client
+        .request_once_with_params_and_trace::<()>(
+            Method::GET,
+            url,
+            None,
+            None,
+            None,
+            None,
+            Some(vec!["owner".into()]),
+            &trace,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(reused, HttpClientError::Error(message) if message.contains("already used")));
+    assert_eq!(trace.snapshot(), timing);
+    peer.abort();
+    assert!(peer.await.unwrap_err().is_cancelled());
+}
+
+#[rstest]
+#[case::body_completed(false)]
+#[case::body_cancelled(true)]
+#[tokio::test]
+async fn single_attempt_trace_preserves_header_and_body_boundaries(#[case] cancel: bool) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (request_seen, received) = tokio::sync::oneshot::channel();
+    let (release_headers, headers_ready) = tokio::sync::oneshot::channel();
+    let (release_body, body_ready) = tokio::sync::oneshot::channel();
+
+    let peer = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        read_headers(&mut stream).await;
+        request_seen.send(()).unwrap();
+        headers_ready.await.unwrap();
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\nabc")
+            .await
+            .unwrap();
+        if body_ready.await.is_ok() {
+            stream.write_all(b"def").await.unwrap();
+        }
+    });
+    let client = HttpClient::builder()
+        .use_system_proxy(false)
+        .timeout_secs(3)
+        .build()
+        .unwrap();
+    let trace = HttpRequestTrace::new();
+    let request_trace = trace.clone();
+
+    let request = tokio::spawn(async move {
+        client
+            .request_once_with_params_and_trace::<()>(
+                Method::GET,
+                format!("http://{addr}/body"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                &request_trace,
+            )
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(3), received)
+        .await
+        .unwrap()
+        .unwrap();
+    let before_headers = trace.snapshot();
+    assert_eq!(before_headers.transport_invocations, 1);
+    assert!(before_headers.transport_invoked.is_some());
+    assert!(before_headers.headers_received.is_none());
+    assert!(before_headers.body_received.is_none());
+    release_headers.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while trace.snapshot().headers_received.is_none() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let headers = trace.snapshot();
+    assert_eq!(headers.status, Some(200));
+    assert!(headers.body_received.is_none());
+    assert!(headers.completed.is_none());
+
+    if cancel {
+        request.abort();
+        assert!(request.await.unwrap_err().is_cancelled());
+        drop(release_body);
+    } else {
+        release_body.send(()).unwrap();
+        let response = request.await.unwrap().unwrap();
+        assert_eq!(response.body.as_ref(), b"abcdef");
+    }
+    peer.await.unwrap();
+    let timing = trace.snapshot();
+    assert_eq!(timing.transport_invocations, 1);
+    assert_eq!(timing.status, Some(200));
+    assert_eq!(timing.body_received.is_none(), cancel);
+    assert_eq!(
+        timing.completion,
+        Some(if cancel {
+            HttpRequestCompletion::Cancelled
+        } else {
+            HttpRequestCompletion::Returned
+        })
+    );
+    let phases = [
+        Some(timing.created),
+        timing.first_polled,
+        timing.limiter_started,
+        timing.limiter_acquired,
+        timing.prepared,
+        timing.transport_invoked,
+        timing.headers_received,
+        timing.body_received,
+        timing.completed,
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+    assert!(
+        phases
+            .windows(2)
+            .all(|pair| pair[0].elapsed_ns <= pair[1].elapsed_ns)
+    );
+    assert!(timing.completed.is_some());
+}
+
+#[tokio::test]
+async fn single_attempt_trace_preparation_error_has_no_transport_evidence() {
+    let client = HttpClient::builder()
+        .use_system_proxy(false)
+        .build()
+        .unwrap();
+    let trace = HttpRequestTrace::new();
+    let error = client
+        .request_once_with_params_and_trace::<()>(
+            Method::GET,
+            "not a URL".into(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            &trace,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(error, HttpClientError::Error(_)));
+    let timing = trace.snapshot();
+    assert!(timing.first_polled.is_some());
+    assert!(timing.limiter_acquired.is_some());
+    assert!(timing.prepared.is_none());
+    assert_eq!(timing.transport_invocations, 0);
+    assert!(timing.transport_invoked.is_none());
+    assert!(timing.headers_received.is_none());
+    assert!(timing.body_received.is_none());
+    assert_eq!(timing.completion, Some(HttpRequestCompletion::Failed));
+    assert!(timing.completed.is_some());
 }

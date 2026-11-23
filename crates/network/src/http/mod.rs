@@ -18,7 +18,8 @@
 //! # Architecture
 //!
 //! [`HttpClient`] applies quota policy before delegating requests to [`InnerHttpClient`]. The inner
-//! client owns one reusable Hyper client, preserving its connection pool across requests and clones.
+//! client preserves reusable Hyper connection pools across requests and clones. Calls that disable
+//! retries use a separate pool whose canceled-request retry policy is disabled.
 //!
 //! # Rate limiting and requests
 //!
@@ -49,6 +50,19 @@
 //! remote HTTP/2 `GOAWAY(NO_ERROR)` or `REFUSED_STREAM` errors. Other transport failures and HTTP
 //! status codes do not trigger retries. Adapters can apply [`crate::retry::RetryManager`] when the
 //! operation and venue error are safe to retry.
+//!
+//! [`HttpClient::request_once_with_params`] opts out of all these transport retries and redirects
+//! for one call while retaining the same quota and response policies. It makes at most one protocol
+//! attempt; an error or cancellation before transmission can result in no request reaching the peer.
+//! Adapters using this method must also avoid wrapping that call in their own retry loop.
+//!
+//! # Request-local phase evidence
+//!
+//! [`HttpClient::request_once_with_params_and_trace`] retains a single-use [`HttpRequestTrace`]
+//! across cancellation. It separates first poll, native quota wait, preparation, the Hyper
+//! invocation, headers, encoded body receipt and local completion. Hyper invocation does not prove
+//! socket writes or peer receipt. The evidence contains no URLs, headers, payloads or connection
+//! observations; each elapsed timestamp belongs only to that collector's monotonic scope.
 //!
 //! # Connection and response policy
 //!
@@ -85,6 +99,7 @@ pub mod error;
 pub mod types;
 
 mod stream;
+mod timing;
 
 #[cfg(not(all(feature = "simulation", madsim)))]
 mod connector;
@@ -105,6 +120,7 @@ pub use http::{
 };
 use nautilus_core::consts::NAUTILUS_USER_AGENT;
 pub use stream::HttpResponseStream;
+pub use timing::{HttpPhaseTime, HttpRequestCompletion, HttpRequestTiming, HttpRequestTrace};
 pub use types::{HttpMethod, HttpResponse, HttpStatus, parse_retry_after};
 pub use url::Url;
 
