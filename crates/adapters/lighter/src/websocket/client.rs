@@ -25,11 +25,14 @@ use std::{
     time::Duration,
 };
 
-use arc_swap::ArcSwap;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use dashmap::{DashMap, mapref::entry::Entry};
 #[cfg(test)]
 use nautilus_common::live::get_runtime;
-use nautilus_core::string::secret::{SecretString, redact_option};
+use nautilus_core::{
+    string::secret::{SecretString, redact_option},
+    time::get_atomic_clock_realtime,
+};
 #[cfg(test)]
 use nautilus_live::book::DEFAULT_BOOK_SNAPSHOT_TIMEOUT_SECS;
 use nautilus_live::{
@@ -44,9 +47,11 @@ use nautilus_network::{
     ConnectionUrl, SocketStateSink,
     http::create_standard_nautilus_headers,
     mode::ConnectionMode,
+    transport::Message as TransportMessage,
     websocket::{
-        InitialConnectRetryPolicy, SubscriptionState, TransportBackend, WebSocketClient,
-        WebSocketConfig, channel_epoch_message_handler,
+        EpochMessageHandler, InitialConnectRetryPolicy, SubscriptionState, TransportBackend,
+        WebSocketClient, WebSocketConfig, WebSocketObservationTime, WebSocketRoutePolicy,
+        WebSocketSendStage, WebSocketTelemetry,
     },
 };
 use parking_lot::Mutex;
@@ -116,6 +121,9 @@ pub struct LighterWebSocketClient {
     proxy_url: Option<SecretString>,
     socket_sink: Option<SocketStateSink>,
     socket_control: Option<SocketControl>,
+    route_policy: Option<WebSocketRoutePolicy>,
+    telemetry: Option<WebSocketTelemetry>,
+    active_telemetry: Arc<ArcSwapOption<WebSocketTelemetry>>,
 }
 
 #[derive(Debug)]
@@ -243,8 +251,54 @@ impl Clone for LighterWebSocketClient {
             proxy_url: self.proxy_url.clone(),
             socket_sink: self.socket_sink.clone(),
             socket_control: self.socket_control.clone(),
+            route_policy: self.route_policy.clone(),
+            telemetry: self.telemetry.clone(),
+            active_telemetry: Arc::clone(&self.active_telemetry),
         }
     }
+}
+
+pub(crate) fn is_transaction_response(value: &serde_json::Value) -> bool {
+    matches!(
+        value.get("type").and_then(|value| value.as_str()),
+        Some("jsonapi/sendtx" | "jsonapi/sendtxbatch" | "error")
+    ) || value
+        .get("id")
+        .and_then(|value| value.as_str())
+        .is_some_and(|id| id.starts_with("tx-batch:"))
+}
+
+fn transaction_hash(value: &str) -> Option<&str> {
+    let hash = value.strip_prefix("0x").unwrap_or(value);
+    (hash.len() == 80 && hash.bytes().all(|byte| byte.is_ascii_hexdigit())).then_some(hash)
+}
+
+pub(crate) fn observe_response_ids(
+    value: &serde_json::Value,
+    mut observe: impl FnMut(&str),
+) -> bool {
+    let kind = value.get("type").and_then(|value| value.as_str());
+    let id = value.get("id").and_then(|value| value.as_str());
+    if kind == Some("jsonapi/sendtxbatch") || id.is_some_and(|id| id.starts_with("tx-batch:")) {
+        if let Some(id) = id
+            && id
+                .strip_prefix("tx-batch:")
+                .and_then(transaction_hash)
+                .is_some()
+        {
+            observe(id);
+            return true;
+        }
+    } else if kind == Some("jsonapi/sendtx")
+        && let Some(hash) = value
+            .get("tx_hash")
+            .and_then(|value| value.as_str())
+            .and_then(transaction_hash)
+    {
+        observe(hash);
+        return true;
+    }
+    false
 }
 
 impl LighterWebSocketClient {
@@ -302,6 +356,9 @@ impl LighterWebSocketClient {
             proxy_url: proxy_url.map(SecretString::from),
             socket_sink: None,
             socket_control: None,
+            route_policy: None,
+            telemetry: None,
+            active_telemetry: Arc::new(ArcSwapOption::empty()),
         }
     }
 
@@ -317,6 +374,26 @@ impl LighterWebSocketClient {
     pub fn with_socket_control(mut self, control: SocketControl) -> Self {
         self.socket_control = Some(control);
         self
+    }
+
+    /// Configures bounded transport evidence and optional public-only route evaluation.
+    #[must_use]
+    pub fn with_connection_quality(
+        mut self,
+        telemetry: Option<WebSocketTelemetry>,
+        route_policy: Option<WebSocketRoutePolicy>,
+    ) -> Self {
+        self.telemetry = telemetry;
+        self.route_policy = route_policy;
+        self
+    }
+
+    /// Returns the last installed transport's diagnostic identity, shared by all client clones.
+    /// Capturing this handle before an awaited stage keeps both endpoints in the same generation.
+    pub(crate) fn active_telemetry(&self) -> Option<WebSocketTelemetry> {
+        self.active_telemetry
+            .load_full()
+            .map(|telemetry| (*telemetry).clone())
     }
 
     /// Returns the resolved WebSocket URL.
@@ -465,7 +542,75 @@ impl LighterWebSocketClient {
         self.initial_connect_cancellation
             .store(Arc::new(cancellation_token.clone()));
 
-        let (message_handler, raw_rx) = channel_epoch_message_handler();
+        let state_sink = self
+            .socket_control
+            .as_ref()
+            .map(SocketControl::sink)
+            .or_else(|| self.socket_sink.clone());
+        let (owner_id, transport_generation) = self
+            .socket_control
+            .as_ref()
+            .map_or((0, generation), SocketControl::identity);
+        let (raw_tx, raw_rx) = tokio::sync::mpsc::unbounded_channel();
+        let telemetry = self
+            .telemetry
+            .as_ref()
+            .map(|telemetry| telemetry.with_identity(owner_id, transport_generation));
+        let reader_telemetry = telemetry.clone();
+        let message_handler: EpochMessageHandler = Arc::new(move |epoch, message| {
+            let observed = reader_telemetry
+                .as_ref()
+                .map(WebSocketTelemetry::capture_time);
+            let received_ns = observed.map_or_else(
+                || get_atomic_clock_realtime().get_time_ns().as_u64(),
+                |observed| observed.ts_init,
+            );
+            let raw_monotonic_ns = observed.and_then(|observed| observed.monotonic_ns);
+            if let (Some(telemetry), TransportMessage::Text(text)) = (&reader_telemetry, &message) {
+                // Only small sendTx control responses are parsed for diagnostic correlation
+                if text.len() <= 16_384
+                    && (text.windows(14).any(|v| v == b"jsonapi/sendtx")
+                        || text.windows(9).any(|v| v == b"tx-batch:")
+                        || text.windows(7).any(|v| v == b"\"error\""))
+                    && let Ok(value) = serde_json::from_slice::<serde_json::Value>(text)
+                {
+                    let matched = observe_response_ids(&value, |id| {
+                        telemetry.record_send_at_time(
+                            epoch,
+                            id,
+                            WebSocketSendStage::RawResponseReceived,
+                            WebSocketObservationTime {
+                                ts_init: received_ns,
+                                monotonic_ns: raw_monotonic_ns,
+                            },
+                        );
+                    });
+
+                    if !matched && is_transaction_response(&value) {
+                        telemetry.record_unmatched_response_at_time(
+                            epoch,
+                            WebSocketSendStage::RawResponseReceived,
+                            WebSocketObservationTime {
+                                ts_init: received_ns,
+                                monotonic_ns: raw_monotonic_ns,
+                            },
+                        );
+                    }
+                }
+            }
+
+            match tokio_tungstenite::tungstenite::Message::try_from(message) {
+                Ok(message) => {
+                    if raw_tx
+                        .send((epoch, received_ns, raw_monotonic_ns, message))
+                        .is_err()
+                    {
+                        log::debug!("Lighter raw message receiver has closed");
+                    }
+                }
+                Err(e) => log::debug!("Lighter transport message conversion failed: {e}"),
+            }
+        });
         let headers = create_standard_nautilus_headers();
 
         let cfg = WebSocketConfig {
@@ -497,12 +642,9 @@ impl LighterWebSocketClient {
             .rate_limiter(ws_message_rate_limiter(self.url.expose()))
             .initial_connect_retry_policy(Self::initial_connect_retry_policy())
             .cancellation_token(cancellation_token.clone())
-            .maybe_state_sink(
-                self.socket_control
-                    .as_ref()
-                    .map(SocketControl::sink)
-                    .or_else(|| self.socket_sink.clone()),
-            )
+            .maybe_telemetry(telemetry.clone())
+            .maybe_route_policy(self.route_policy.clone())
+            .maybe_state_sink(state_sink)
             .connect();
         let client =
             match tokio::time::timeout(Duration::from_secs(self.ws_timeout_secs), connect).await {
@@ -564,6 +706,7 @@ impl LighterWebSocketClient {
             self.subscriptions.clear();
             self.subscription_args.clear();
             *sender = cmd_tx.clone();
+            self.active_telemetry.store(telemetry.map(Arc::new));
             self.connection_epoch.store(connection_epoch_atomic);
             self.connection_mode.store(connection_mode_atomic);
             // Release the sender first so cache writes cannot miss both the snapshot and dispatch
@@ -1129,12 +1272,32 @@ impl LighterWebSocketClient {
         tx_info: Box<serde_json::value::RawValue>,
         connection_epoch: u64,
     ) -> Result<(), LighterWsError> {
+        self.send_tx_on_connection_observed(tx_type, tx_info, connection_epoch, None)
+            .await
+    }
+
+    pub(crate) async fn send_tx_on_connection_observed(
+        &self,
+        tx_type: u8,
+        tx_info: Box<serde_json::value::RawValue>,
+        connection_epoch: u64,
+        request_id: Option<&str>,
+    ) -> Result<(), LighterWsError> {
+        if let (Some(telemetry), Some(request_id)) = (self.active_telemetry(), request_id) {
+            telemetry.record_send(
+                connection_epoch,
+                request_id,
+                WebSocketSendStage::AdapterEnqueueStarted,
+            );
+        }
+        let request_id = self.telemetry.as_ref().and(request_id).map(str::to_owned);
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
         self.send_cmd(HandlerCommand::SendTx {
             tx_type,
             tx_info,
             connection_epoch,
             response_tx,
+            request_id,
         })
         .await?;
 
@@ -1150,11 +1313,20 @@ impl LighterWebSocketClient {
         data: super::messages::LighterWsSendTxBatch,
         connection_epoch: u64,
     ) -> Result<(), LighterWsError> {
+        if let Some(telemetry) = self.active_telemetry() {
+            telemetry.record_send(
+                connection_epoch,
+                &data.id,
+                WebSocketSendStage::AdapterEnqueueStarted,
+            );
+        }
+        let request_id = self.telemetry.as_ref().map(|_| data.id.clone());
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
         self.send_cmd(HandlerCommand::SendTxBatch {
             data,
             connection_epoch,
             response_tx,
+            request_id,
         })
         .await?;
 

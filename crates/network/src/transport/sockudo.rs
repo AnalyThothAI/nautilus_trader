@@ -83,6 +83,20 @@ pub(crate) async fn client_handshake_with_headers<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    client_handshake_with_headers_observed(stream, host, path, extra_headers)
+        .await
+        .map(|(handshake, _)| handshake)
+}
+
+pub(crate) async fn client_handshake_with_headers_observed<S>(
+    stream: &mut S,
+    host: &str,
+    path: &str,
+    extra_headers: &[(String, String)],
+) -> Result<(HandshakeResult, Option<String>), TransportError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let key = handshake::generate_key();
@@ -137,18 +151,30 @@ where
             let res_protocol = res.protocol.map(String::from);
             let res_extensions = res.extensions.map(String::from);
 
+            let edge_label = std::str::from_utf8(&buf[..consumed])
+                .ok()
+                .and_then(|headers| {
+                    headers
+                        .split("\r\n")
+                        .filter_map(|line| line.split_once(':'))
+                        .find(|(name, _)| name.eq_ignore_ascii_case("x-amz-cf-pop"))
+                        .and_then(|(_, value)| crate::websocket::quality::edge_label(value.trim()))
+                });
             let leftover = if consumed < buf.len() {
                 Some(buf.split_off(consumed).freeze())
             } else {
                 None
             };
 
-            return Ok(HandshakeResult {
-                path: path.to_string(),
-                protocol: res_protocol,
-                extensions: res_extensions,
-                leftover,
-            });
+            return Ok((
+                HandshakeResult {
+                    path: path.to_string(),
+                    protocol: res_protocol,
+                    extensions: res_extensions,
+                    leftover,
+                },
+                edge_label,
+            ));
         }
     }
 }

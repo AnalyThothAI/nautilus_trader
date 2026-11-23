@@ -212,7 +212,9 @@ impl LighterDataClient {
                 .map(|value| value.expose_secret().to_owned()),
         );
 
-        ws_client.with_socket_control(socket_factory.control(DATA_STREAMS_ENDPOINT))
+        ws_client
+            .with_socket_control(socket_factory.control(DATA_STREAMS_ENDPOINT))
+            .with_connection_quality(config.ws_telemetry.clone(), config.ws_route_policy.clone())
     }
 
     fn take_ws_client(&mut self) -> LighterWebSocketClient {
@@ -478,7 +480,7 @@ impl LighterDataClient {
                             // reports; the execution client subscribes to its
                             // own clone of the WebSocket and routes them.
                             Some(
-                                NautilusWsMessage::ExecutionReports(_)
+                                NautilusWsMessage::ExecutionReports { .. }
                                 | NautilusWsMessage::PositionSnapshot { .. }
                                 | NautilusWsMessage::PositionUpdate { .. }
                                 | NautilusWsMessage::AccountState(_)

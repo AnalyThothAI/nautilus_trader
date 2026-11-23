@@ -90,7 +90,10 @@ use nautilus_model::{
     reports::{ExecutionMassStatus, FillReport, OrderStatusReport, PositionStatusReport},
     types::{AccountBalance, MarginBalance, Quantity},
 };
-use nautilus_network::error::SendError;
+use nautilus_network::{
+    error::SendError,
+    websocket::{WebSocketObservationTime, WebSocketSendStage},
+};
 use parking_lot::Mutex;
 use rust_decimal::Decimal;
 use serde::Deserialize;
@@ -138,7 +141,7 @@ use crate::{
         tx::{
             ApproveIntegratorTxInfo, CancelAllOrdersTxInfo, CancelOrderTxInfo,
             CreateGroupedOrdersTxInfo, CreateOrderTxInfo, L2TxAttributes, ModifyOrderTxInfo,
-            OrderInfo, TxContext, TxInfoJson, UpdateLeverageTxInfo, sign_tx,
+            OrderInfo, SignedTx, TxContext, TxInfoJson, UpdateLeverageTxInfo, sign_tx,
         },
     },
     websocket::{
@@ -155,8 +158,9 @@ use crate::{
             quantity_to_ticks, tx_hash_matches,
         },
         messages::{
-            AccountStream, ExecutionReport as LighterExecutionReport, LighterWsChannel,
-            LighterWsTx, NautilusWsMessage, SendTxRejectionSource, TX_BATCH_ID_PREFIX,
+            AccountStream, ExecutionFrameReceipt, ExecutionReport as LighterExecutionReport,
+            LighterWsChannel, LighterWsTx, NautilusWsMessage, SendTxRejectionSource,
+            TX_BATCH_ID_PREFIX,
         },
         parse::{
             LighterCommissionError, OpenFrameContext, ParsedOrderEvent, is_order_triggered,
@@ -575,7 +579,9 @@ impl LighterExecutionClient {
                 .map(|value| value.expose_secret().to_owned()),
         );
 
-        ws_client.with_socket_control(socket_factory.control(USER_STREAMS_ENDPOINT))
+        ws_client
+            .with_socket_control(socket_factory.control(USER_STREAMS_ENDPOINT))
+            .with_connection_quality(config.ws_telemetry.clone(), config.ws_route_policy.clone())
     }
 
     fn take_ws_client(&mut self) -> LighterWebSocketClient {
@@ -618,7 +624,9 @@ impl LighterExecutionClient {
         let dispatch = self.dispatch.clone();
         let emitter = self.emitter.clone();
 
+        let evidence_ws_client = self.ws_client.clone();
         let handler = TypedHandler::from(move |event: &OrderEventAny| {
+            observe_native_order_applied(event, &core, &dispatch, &evidence_ws_client);
             let OrderEventAny::Filled(fill) = event else {
                 return;
             };
@@ -1188,11 +1196,18 @@ impl LighterExecutionClient {
             skip_nonce: 0,
         };
 
-        let signed = sign_tx(
-            &tx,
-            self.config.chain_id(),
-            &credential.private_key()?,
-            fresh_k(),
+        let signed = observe_tx_signing(
+            &self.ws_client,
+            send_reservation.connection_epoch,
+            [],
+            || {
+                sign_tx(
+                    &tx,
+                    self.config.chain_id(),
+                    &credential.private_key()?,
+                    fresh_k(),
+                )
+            },
         )?;
 
         let tx_info = TxInfoJson::approve_integrator(&tx, &signed, "");
@@ -1375,7 +1390,7 @@ impl LighterExecutionClient {
                     }
                     msg_opt = ws_client.next_event() => {
                         match msg_opt {
-                            Some(NautilusWsMessage::ExecutionReports(reports)) => {
+                            Some(NautilusWsMessage::ExecutionReports { reports, receipt }) => {
                                 let mut order_count = 0_usize;
                                 let mut fill_count = 0_usize;
                                 let trader_id = emitter.trader_id();
@@ -1387,6 +1402,7 @@ impl LighterExecutionClient {
                                     match report {
                                         LighterExecutionReport::Order(order) => {
                                             order_count += 1;
+                                            observe_order_receipt(&order, receipt, &dispatch, &registry_for_loop, &ws_client);
                                             dispatch_lighter_order(
                                                 &order,
                                                 &dispatch,
@@ -2530,8 +2546,7 @@ impl LighterExecutionClient {
         let tx_rate_limiter = self.tx_rate_limiter.clone();
 
         self.spawn_task("modify_order", async move {
-            send_reservation.wait_for_turn().await;
-            await_tx_quota(&tx_rate_limiter).await;
+            await_tx_send_ready(&ws_client, &send_reservation, &tx_rate_limiter, &tx_hash).await;
 
             let pending = PendingSendTx {
                 batch_id: None,
@@ -2553,7 +2568,7 @@ impl LighterExecutionClient {
             spawn_acked_order_probe(&pending, probe_context);
 
             if let Err(e) = ws_client
-                .send_tx_on_connection(LighterTxType::ModifyOrder as u8, tx_info, connection_epoch)
+                .send_tx_on_connection_observed(LighterTxType::ModifyOrder as u8, tx_info, connection_epoch, Some(&pending.tx_hash))
                 .await
             {
                 let failure = classify_lighter_ws_command_failure("modify_order", &e);
@@ -2829,12 +2844,14 @@ impl LighterExecutionClient {
             skip_nonce: 0,
         };
 
-        let signed = sign_tx(
-            &tx,
-            self.config.chain_id(),
-            &credential.private_key()?,
-            fresh_k(),
-        )?;
+        let signed = observe_tx_signing(&self.ws_client, connection_epoch, [], || {
+            sign_tx(
+                &tx,
+                self.config.chain_id(),
+                &credential.private_key()?,
+                fresh_k(),
+            )
+        })?;
 
         let tx_info_str = TxInfoJson::update_leverage(&tx, &signed);
         let tx_info = serde_json::value::RawValue::from_string(tx_info_str)
@@ -2851,8 +2868,7 @@ impl LighterExecutionClient {
         let tx_rate_limiter = self.tx_rate_limiter.clone();
 
         self.spawn_task("update_leverage", async move {
-            send_reservation.wait_for_turn().await;
-            await_tx_quota(&tx_rate_limiter).await;
+            await_tx_send_ready(&ws_client, &send_reservation, &tx_rate_limiter, &captured_tx_hash).await;
             dispatch.enqueue_pending_sendtx(PendingSendTx {
                 batch_id: None,
                 connection_epoch,
@@ -2860,14 +2876,15 @@ impl LighterExecutionClient {
                 submitted_at: clock.get_time_ns(),
                 nonce: captured_nonce,
                 api_key_index: captured_api_key_index,
-                tx_hash: captured_tx_hash,
+                tx_hash: captured_tx_hash.clone(),
             });
 
             if let Err(e) = ws_client
-                .send_tx_on_connection(
+                .send_tx_on_connection_observed(
                     LighterTxType::UpdateLeverage as u8,
                     tx_info,
                     connection_epoch,
+                    Some(&captured_tx_hash),
                 )
                 .await
             {
@@ -3281,6 +3298,83 @@ struct TxSendKey {
     api_key_index: u8,
 }
 
+/// Captures only diagnostic identity/timestamps; signing still happens exactly once.
+fn observe_tx_signing(
+    ws_client: &LighterWebSocketClient,
+    connection_epoch: u64,
+    origin_ids: impl IntoIterator<Item = ClientOrderId>,
+    sign: impl FnOnce() -> anyhow::Result<SignedTx>,
+) -> anyhow::Result<SignedTx> {
+    let Some(telemetry) = ws_client.active_telemetry() else {
+        return sign();
+    };
+    let origin_ids: Vec<_> = origin_ids.into_iter().collect();
+    let started = telemetry.capture_time();
+    for origin_id in &origin_ids {
+        telemetry.record_send_at_time(
+            connection_epoch,
+            origin_id.as_str(),
+            WebSocketSendStage::SigningStarted,
+            started,
+        );
+    }
+    let result = sign();
+    match &result {
+        Ok(signed) => {
+            let tx_hash = signed.tx_hash_hex();
+
+            if origin_ids.is_empty() {
+                telemetry.record_send_at_time(
+                    connection_epoch,
+                    &tx_hash,
+                    WebSocketSendStage::SigningStarted,
+                    started,
+                );
+            }
+
+            for origin_id in &origin_ids {
+                telemetry.record_correlation(connection_epoch, origin_id.as_str(), &tx_hash);
+            }
+            telemetry.record_send(
+                connection_epoch,
+                &tx_hash,
+                WebSocketSendStage::SigningFinished,
+            );
+        }
+        Err(_) => {
+            for origin_id in &origin_ids {
+                telemetry.record_send(
+                    connection_epoch,
+                    origin_id.as_str(),
+                    WebSocketSendStage::SigningFailed,
+                );
+            }
+        }
+    }
+    result
+}
+
+/// Measures the existing sequencer and quota separately without changing cancellation semantics.
+async fn await_tx_send_ready(
+    ws_client: &LighterWebSocketClient,
+    reservation: &TxSendReservation,
+    limiter: &Arc<LighterTxRateLimiter>,
+    request_id: &str,
+) {
+    let telemetry = ws_client.active_telemetry();
+    let record = |stage| {
+        if let Some(telemetry) = &telemetry {
+            telemetry.record_send(reservation.connection_epoch, request_id, stage);
+        }
+    };
+    record(WebSocketSendStage::NonceWaitStarted);
+    reservation.wait_for_turn().await;
+    record(WebSocketSendStage::NonceReady);
+    record(WebSocketSendStage::QuotaWaitStarted);
+    await_tx_quota(limiter).await;
+    record(WebSocketSendStage::QuotaReady);
+}
+
 #[derive(Debug)]
 struct TxSendReservation {
     sequencer: TxSendSequencer,
@@ -3494,8 +3588,7 @@ impl FanoutDispatchContext {
             .spawn(async move {
                 {
                     let ready = async {
-                        send_reservation.wait_for_turn().await;
-                        await_tx_quota(&tx_rate_limiter).await;
+                        await_tx_send_ready(&ws_client, &send_reservation, &tx_rate_limiter, &dispatched_hash).await;
                     };
 
                     tokio::pin!(ready);
@@ -3526,8 +3619,8 @@ impl FanoutDispatchContext {
                 });
 
                 rollback_guard.disarm();
-                let response = ws_client.send_tx_on_connection(
-                    LighterTxType::CancelAllOrders as u8, tx_info, connection_epoch,
+                let response = ws_client.send_tx_on_connection_observed(
+                    LighterTxType::CancelAllOrders as u8, tx_info, connection_epoch, Some(&dispatched_hash),
                 ).await;
 
                 if let Err(e) = &response {
@@ -3873,11 +3966,18 @@ impl FanoutDispatchContext {
             attributes: plan.attributes,
         };
 
-        let signed = sign_tx(
-            &tx,
-            self.chain_id,
-            &self.credential.private_key()?,
-            fresh_k(),
+        let signed = observe_tx_signing(
+            &self.ws_client,
+            send_reservation.connection_epoch,
+            [cloid],
+            || {
+                sign_tx(
+                    &tx,
+                    self.chain_id,
+                    &self.credential.private_key()?,
+                    fresh_k(),
+                )
+            },
         )?;
 
         let tx_info =
@@ -3932,11 +4032,18 @@ impl FanoutDispatchContext {
             attributes: plan.orders[0].attributes,
         };
 
-        let signed = sign_tx(
-            &tx,
-            self.chain_id,
-            &self.credential.private_key()?,
-            fresh_k(),
+        let signed = observe_tx_signing(
+            &self.ws_client,
+            reserved.send_reservation.connection_epoch,
+            plan.orders.iter().map(|leg| leg.order.client_order_id()),
+            || {
+                sign_tx(
+                    &tx,
+                    self.chain_id,
+                    &self.credential.private_key()?,
+                    fresh_k(),
+                )
+            },
         )?;
         let tx_info = serde_json::value::RawValue::from_string(TxInfoJson::create_grouped_orders(
             &tx, &signed,
@@ -3979,8 +4086,13 @@ impl FanoutDispatchContext {
 
         self.emitter.emit_order_submitted(&order);
         log::debug!("Lighter submit_order: queueing CreateOrder tx for {client_order_id}");
-        send_reservation.wait_for_turn().await;
-        await_tx_quota(&self.tx_rate_limiter).await;
+        await_tx_send_ready(
+            &self.ws_client,
+            &send_reservation,
+            &self.tx_rate_limiter,
+            &tx_hash,
+        )
+        .await;
         self.dispatch.enqueue_pending_sendtx(PendingSendTx {
             batch_id: None,
             connection_epoch,
@@ -3991,12 +4103,17 @@ impl FanoutDispatchContext {
             submitted_at: self.clock.get_time_ns(),
             nonce,
             api_key_index,
-            tx_hash,
+            tx_hash: tx_hash.clone(),
         });
 
         if let Err(e) = self
             .ws_client
-            .send_tx_on_connection(LighterTxType::CreateOrder as u8, tx_info, connection_epoch)
+            .send_tx_on_connection_observed(
+                LighterTxType::CreateOrder as u8,
+                tx_info,
+                connection_epoch,
+                Some(&tx_hash),
+            )
             .await
         {
             let failure = classify_lighter_ws_command_failure("submit_order", &e);
@@ -4054,11 +4171,18 @@ impl FanoutDispatchContext {
             attributes: integrator_attributes(self.integrator_account_index),
         };
 
-        let signed = sign_tx(
-            &tx,
-            self.chain_id,
-            &self.credential.private_key()?,
-            fresh_k(),
+        let signed = observe_tx_signing(
+            &self.ws_client,
+            send_reservation.connection_epoch,
+            [plan.client_order_id],
+            || {
+                sign_tx(
+                    &tx,
+                    self.chain_id,
+                    &self.credential.private_key()?,
+                    fresh_k(),
+                )
+            },
         )?;
 
         let tx_info_str = TxInfoJson::modify_order(&tx, &signed);
@@ -4105,11 +4229,18 @@ impl FanoutDispatchContext {
             skip_nonce: 0,
         };
 
-        let signed = sign_tx(
-            &tx,
-            self.chain_id,
-            &self.credential.private_key()?,
-            fresh_k(),
+        let signed = observe_tx_signing(
+            &self.ws_client,
+            send_reservation.connection_epoch,
+            [plan.client_order_id],
+            || {
+                sign_tx(
+                    &tx,
+                    self.chain_id,
+                    &self.credential.private_key()?,
+                    fresh_k(),
+                )
+            },
         )?;
 
         let tx_info =
@@ -4138,15 +4269,21 @@ impl FanoutDispatchContext {
         emit_cancel_rejected: bool,
     ) {
         let connection_epoch = prepared.send_reservation.connection_epoch;
-        prepared.send_reservation.wait_for_turn().await;
-        await_tx_quota(&self.tx_rate_limiter).await;
+        await_tx_send_ready(
+            &self.ws_client,
+            &prepared.send_reservation,
+            &self.tx_rate_limiter,
+            &prepared.tx_hash,
+        )
+        .await;
         self.enqueue_cancel_order(&prepared, emit_cancel_rejected);
         let result = self
             .ws_client
-            .send_tx_on_connection(
+            .send_tx_on_connection_observed(
                 LighterTxType::CancelOrder as u8,
                 prepared.tx_info.clone(),
                 connection_epoch,
+                Some(&prepared.tx_hash),
             )
             .await;
 
@@ -4208,8 +4345,18 @@ impl FanoutDispatchContext {
     async fn send_batch_group(&self, mut group: Vec<PreparedBatchTx>) -> String {
         let connection_epoch = group[0].send_reservation.connection_epoch;
         let id = format!("{TX_BATCH_ID_PREFIX}{}", group[0].pending.tx_hash);
-        group[0].send_reservation.wait_for_turn().await;
-        await_tx_quota(&self.tx_rate_limiter).await;
+        if let Some(telemetry) = self.ws_client.active_telemetry() {
+            for prepared in &group {
+                telemetry.record_correlation(connection_epoch, &prepared.pending.tx_hash, &id);
+            }
+        }
+        await_tx_send_ready(
+            &self.ws_client,
+            &group[0].send_reservation,
+            &self.tx_rate_limiter,
+            &id,
+        )
+        .await;
 
         let data = crate::websocket::messages::LighterWsSendTxBatch {
             id: id.clone(),
@@ -9596,6 +9743,123 @@ fn decimal_from_ticks(ticks: u32, decimals: u8) -> Decimal {
     Decimal::from(ticks) / Decimal::from(10_i64.pow(u32::from(decimals)))
 }
 
+/// Correlates a raw frame only through the adapter's existing native order identity.
+/// These stages precede dispatch and deliberately do not claim terminal publication.
+fn observe_order_receipt(
+    order: &LighterOrder,
+    receipt: Option<ExecutionFrameReceipt>,
+    dispatch: &WsDispatchState,
+    registry: &MarketRegistry,
+    ws_client: &LighterWebSocketClient,
+) {
+    let (Some(receipt), Some(telemetry)) = (receipt, ws_client.active_telemetry()) else {
+        return;
+    };
+    let venue_order_id = VenueOrderId::new(order.order_id.as_str());
+    let Some(cloid) =
+        dispatch.resolve_live_order_cloid(order.client_order_id.as_str(), venue_order_id)
+    else {
+        return;
+    };
+    let Some(identity) = dispatch.order_identity(&cloid) else {
+        return;
+    };
+
+    if registry.instrument_id(order.market_index) != Some(identity.instrument_id) {
+        return;
+    }
+    telemetry.record_send_at_time(
+        receipt.connection_epoch,
+        cloid.as_str(),
+        WebSocketSendStage::RawOrderReceived,
+        WebSocketObservationTime {
+            ts_init: receipt.raw_received_ns,
+            monotonic_ns: receipt.raw_monotonic_ns,
+        },
+    );
+    telemetry.record_send_at_time(
+        receipt.connection_epoch,
+        cloid.as_str(),
+        WebSocketSendStage::AdapterOrderDecoded,
+        WebSocketObservationTime {
+            ts_init: receipt.decoded_ns,
+            monotonic_ns: receipt.decoded_monotonic_ns,
+        },
+    );
+    telemetry.record_send(
+        receipt.connection_epoch,
+        cloid.as_str(),
+        WebSocketSendStage::NativeOrderDispatchStarted,
+    );
+}
+
+fn native_order_event_id(event: &OrderEventAny) -> UUID4 {
+    match event {
+        OrderEventAny::Initialized(event) => event.event_id,
+        OrderEventAny::Denied(event) => event.event_id,
+        OrderEventAny::Emulated(event) => event.event_id,
+        OrderEventAny::Released(event) => event.event_id,
+        OrderEventAny::Submitted(event) => event.event_id,
+        OrderEventAny::Accepted(event) => event.event_id,
+        OrderEventAny::Rejected(event) => event.event_id,
+        OrderEventAny::Canceled(event) => event.event_id,
+        OrderEventAny::Expired(event) => event.event_id,
+        OrderEventAny::Triggered(event) => event.event_id,
+        OrderEventAny::PendingUpdate(event) => event.event_id,
+        OrderEventAny::PendingCancel(event) => event.event_id,
+        OrderEventAny::ModifyDenied(event) => event.event_id,
+        OrderEventAny::ModifyRejected(event) => event.event_id,
+        OrderEventAny::CancelDenied(event) => event.event_id,
+        OrderEventAny::CancelRejected(event) => event.event_id,
+        OrderEventAny::Updated(event) => event.event_id,
+        OrderEventAny::Filled(event) => event.event_id,
+        OrderEventAny::FillVoided(event) => event.event_id,
+    }
+}
+
+/// Observes the existing order-event bus after engine application, including deferred terminals.
+/// The event ID joins the canonical native ledger. The socket epoch here is observation context,
+/// not a claim about the connection which originally caused this event.
+fn observe_native_order_applied(
+    event: &OrderEventAny,
+    core: &ExecutionClientCore,
+    dispatch: &WsDispatchState,
+    ws_client: &LighterWebSocketClient,
+) {
+    let Some(telemetry) = ws_client.active_telemetry() else {
+        return;
+    };
+
+    if event.trader_id() != core.trader_id || event.account_id() != Some(core.account_id) {
+        return;
+    }
+    let cloid = event.client_order_id();
+    let Some(identity) = dispatch.order_identity(&cloid) else {
+        return;
+    };
+
+    if identity.strategy_id != event.strategy_id()
+        || identity.instrument_id != event.instrument_id()
+    {
+        return;
+    }
+    let cache = core.cache();
+    let Some(order) = cache.order(&cloid) else {
+        return;
+    };
+    // An event rejected by the engine must never be labeled applied.
+    if native_order_event_id(order.last_event()) != native_order_event_id(event) {
+        return;
+    }
+    telemetry.record_native_order_applied(
+        ws_client.connection_epoch(),
+        cloid.as_str(),
+        &native_order_event_id(event).to_string(),
+        &format!("{:?}", event.event_type()),
+        order.is_closed(),
+    );
+}
+
 /// Route a venue `account_orders` payload through the tracked-event path
 /// when the cloid is known, otherwise fall back to the existing
 /// [`OrderStatusReport`] flow used for externally-managed orders.
@@ -11427,6 +11691,8 @@ mod tests {
             transport_backend: Default::default(),
             use_gtd,
             scheduled_cancel_timeout_secs: None,
+            ws_telemetry: None,
+            ws_route_policy: None,
         }
     }
 

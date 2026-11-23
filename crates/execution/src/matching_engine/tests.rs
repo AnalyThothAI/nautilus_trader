@@ -2640,6 +2640,92 @@ fn custom_book_engine(
     (engine, events)
 }
 
+#[rstest]
+#[case::two_sided("1400.00", "1401.00", "90.000", "80.000")]
+#[case::empty_bid("0.00", "1401.00", "0.000", "80.000")]
+#[case::empty_ask("1400.00", "0.00", "90.000", "0.000")]
+#[case::empty_book("0.00", "0.00", "0.000", "0.000")]
+fn test_l2_quotes_preserve_depth_but_process_gtd_receipt_deadlines(
+    #[case] bid: &str,
+    #[case] ask: &str,
+    #[case] bid_size: &str,
+    #[case] ask_size: &str,
+) {
+    let (mut engine, events) = custom_book_engine(BookType::L2_MBP, false, false);
+    engine.config.support_gtd_orders = true;
+    let instrument_id = engine.instrument.id();
+    let mut order = post_match_gtd_limit_order();
+    let order_id = order.client_order_id();
+    process_cached_order(&mut engine, &mut order, AccountId::from("SIM-001"));
+    engine.process_trade_tick(&TradeTick::new(
+        instrument_id,
+        Price::from("1502.00"),
+        Quantity::from("0.500"),
+        AggressorSide::Buy,
+        TradeId::from("L2-QUOTE-TIMELINE"),
+        2.into(),
+        3.into(),
+    ));
+    let book_state = (
+        engine.book.best_bid_price(),
+        engine.book.best_bid_size(),
+        engine.book.best_ask_price(),
+        engine.book.best_ask_size(),
+        engine.book.sequence,
+        engine.book.ts_last,
+    );
+    let quote = QuoteTick::new(
+        instrument_id,
+        Price::from(bid),
+        Price::from(ask),
+        Quantity::from(bid_size),
+        Quantity::from(ask_size),
+        4.into(),
+        9.into(),
+    );
+    engine.process_quote_tick(&quote);
+
+    assert_eq!(
+        engine.cache.borrow().order(&order_id).unwrap().status(),
+        OrderStatus::Accepted
+    );
+    assert!(engine.core.order_exists(order_id));
+
+    // Only receipt advances past expiry. The quote's event timestamp and prices stay unchanged.
+    let after_expiry = QuoteTick {
+        ts_init: 11.into(),
+        ..quote
+    };
+    engine.process_quote_tick(&after_expiry);
+
+    assert_eq!(
+        engine.cache.borrow().order(&order_id).unwrap().status(),
+        OrderStatus::Expired
+    );
+    assert!(!engine.core.order_exists(order_id));
+    assert_eq!(
+        events
+            .borrow()
+            .iter()
+            .map(OrderEventAny::event_type)
+            .collect::<Vec<_>>(),
+        [OrderEventType::Accepted, OrderEventType::Expired]
+    );
+    assert_eq!(
+        (
+            engine.book.best_bid_price(),
+            engine.book.best_bid_size(),
+            engine.book.best_ask_price(),
+            engine.book.best_ask_size(),
+            engine.book.sequence,
+            engine.book.ts_last,
+        ),
+        book_state
+    );
+    assert_eq!(book_state.0, Some(Price::from("1499.00")));
+    assert_eq!(book_state.2, Some(Price::from("1501.00")));
+}
+
 struct TestBookFillModel {
     book: OrderBook,
 }
@@ -5013,6 +5099,7 @@ fn test_readded_l2_level_has_fresh_liquidity(#[values(false, true)] batched: boo
             ts.into(),
         )
     });
+
     if batched {
         engine
             .process_order_book_deltas(&OrderBookDeltas::new(id, deltas.to_vec()))
@@ -5074,6 +5161,7 @@ fn test_unconsumed_trade_ids_leave_their_liquidity_once(
     } else {
         (2, 2)
     };
+
     for &(trade_id, size) in prints {
         engine.process_trade_tick(&TradeTick::new(
             id,

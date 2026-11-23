@@ -35,7 +35,13 @@ use http_body_util::Full;
 use hyper::body::Incoming;
 use hyper_rustls::HttpsConnector;
 use hyper_util::{
-    client::{legacy::Client as HyperClient, proxy::matcher::Matcher},
+    client::{
+        legacy::{
+            Client as HyperClient,
+            connect::{CaptureConnection, HttpInfo, capture_connection},
+        },
+        proxy::matcher::Matcher,
+    },
     rt::{TokioExecutor, TokioTimer},
 };
 use parking_lot::Mutex;
@@ -46,12 +52,20 @@ use tower_http::follow_redirect::{
 use tower_service::Service;
 use url::Url;
 
-use super::{HttpClientError, HttpRedirectPolicy, connector::Connector, error::transport_error};
+use super::{
+    HttpClientError, HttpRedirectPolicy, HttpRequestTrace,
+    connector::{Connector, TimedConnector},
+    error::transport_error,
+    timing::{ConnectionProbe, SingleAttempt},
+};
 use crate::tls::create_tls_config_from_certs_dir;
 
 #[derive(Clone, Debug)]
 pub(super) struct Client {
-    client: HyperClient<HttpsConnector<Connector>, Full<Bytes>>,
+    pooled: HyperClient<TimedConnector, Full<Bytes>>,
+    // Hyper's canceled-request retry is a client property, so single-attempt requests use a
+    // separate pool with that retry disabled. Both pools share this transport implementation.
+    single_attempt_pool: HyperClient<TimedConnector, Full<Bytes>>,
     proxies: Arc<Matcher>,
 }
 
@@ -82,12 +96,19 @@ impl Client {
                 .with_no_client_auth()
         };
 
-        let connector = Connector::new(tls.clone(), proxy, use_system_proxy, user_agent)?;
+        let connector = Connector::new(
+            tls.clone(),
+            proxy,
+            use_system_proxy,
+            user_agent,
+            settings.connection_timing,
+        )?;
         let proxies = Arc::clone(&connector.proxies);
         tls.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
-        let connector = HttpsConnector::from((connector, tls));
+        let connector = TimedConnector(HttpsConnector::from((connector, tls)));
 
-        let client = HyperClient::builder(TokioExecutor::new())
+        let mut builder = HyperClient::builder(TokioExecutor::new());
+        builder
             .pool_timer(TokioTimer::new())
             .timer(TokioTimer::new())
             .pool_max_idle_per_host(settings.pool_max_idle_per_host)
@@ -97,9 +118,15 @@ impl Client {
             .http2_initial_stream_window_size(settings.stream_window)
             .http2_initial_connection_window_size(settings.connection_window)
             // Keep after the window sizes: setting a window size turns adaptive windows off
-            .http2_adaptive_window(settings.adaptive_window)
-            .build(connector);
-        Ok(Self { client, proxies })
+            .http2_adaptive_window(settings.adaptive_window);
+        let pooled = builder.build(connector.clone());
+        builder.retry_canceled_requests(false);
+        let single_attempt_pool = builder.build(connector);
+        Ok(Self {
+            pooled,
+            single_attempt_pool,
+            proxies,
+        })
     }
 
     pub(super) async fn send(
@@ -107,10 +134,16 @@ impl Client {
         request: Request<Full<Bytes>>,
         redirects: HttpRedirectPolicy,
     ) -> Result<Response<Incoming>, HttpClientError> {
+        let single_attempt = request.extensions().get::<SingleAttempt>().is_some();
         let policy = Redirects {
-            policy: redirects,
+            policy: if single_attempt {
+                HttpRedirectPolicy::Reject
+            } else {
+                redirects
+            },
             count: 0,
             previous: None,
+            trace: request.extensions().get::<HttpRequestTrace>().cloned(),
             cross_origin: false,
             has_body: false,
         };
@@ -142,14 +175,57 @@ impl Service<Request<Full<Bytes>>> for Client {
                 .insert(PROXY_AUTHORIZATION, auth.clone());
         }
 
-        let client = self.client.clone();
+        let single_attempt = request.extensions().get::<SingleAttempt>().is_some();
+        let client = if single_attempt {
+            &self.single_attempt_pool
+        } else {
+            &self.pooled
+        }
+        .clone();
+        let trace = request.extensions().get::<HttpRequestTrace>().cloned();
         Box::pin(async move {
             let mut retries = 0;
 
             loop {
-                match client.request(request.clone()).await {
+                let index = trace.as_ref().map(HttpRequestTrace::attempt);
+                let mut outgoing = request.clone();
+                let result = if let (Some(trace), Some(index)) = (&trace, index) {
+                    let mut captured = capture_connection(&mut outgoing);
+                    let pending = client.request(outgoing);
+                    tokio::pin!(pending);
+                    let result = tokio::select! {
+                        biased;
+                        // An available response must not wait for diagnostic connection polling.
+                        result = &mut pending => result,
+                        () = async { drop(captured.wait_for_connection_metadata().await); } => {
+                            observe_connection(trace, index, &captured);
+                            pending.await
+                        }
+                    };
+                    // Hyper can replace an unstarted pooled connection internally
+                    observe_connection(trace, index, &captured);
+                    result
+                } else {
+                    client.request(outgoing).await
+                };
+
+                if let (Some(trace), Some(index)) = (&trace, index) {
+                    trace.attempt_finished(
+                        index,
+                        result
+                            .as_ref()
+                            .ok()
+                            .map(|response| response.status().as_u16()),
+                        result
+                            .as_ref()
+                            .err()
+                            .is_some_and(|e| !single_attempt && retries < 2 && retryable(e)),
+                    );
+                }
+
+                match result {
                     Ok(response) => return Ok(response),
-                    Err(e) if retries < 2 && retryable(&e) => retries += 1,
+                    Err(e) if !single_attempt && retries < 2 && retryable(&e) => retries += 1,
                     Err(e) => return Err(transport_error(&e)),
                 }
             }
@@ -157,8 +233,28 @@ impl Service<Request<Full<Bytes>>> for Client {
     }
 }
 
+fn observe_connection(trace: &HttpRequestTrace, index: usize, captured: &CaptureConnection) {
+    let metadata = captured.connection_metadata();
+    let Some(connected) = metadata.as_ref() else {
+        return;
+    };
+    let mut extras = http::Extensions::new();
+    connected.get_extras(&mut extras);
+    if let Some(probe) = extras.get::<ConnectionProbe>() {
+        let info = extras.get::<HttpInfo>();
+        trace.connection(
+            index,
+            probe.clone(),
+            connected.is_negotiated_h2(),
+            info.map(HttpInfo::local_addr),
+            info.map(HttpInfo::remote_addr),
+        );
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(super) struct Settings {
+    pub(super) connection_timing: bool,
     pub(super) pool_max_idle_per_host: usize,
     pub(super) pool_idle_timeout: Duration,
     pub(super) keep_alive_interval: Option<Duration>,
@@ -172,6 +268,7 @@ struct Redirects {
     policy: HttpRedirectPolicy,
     count: usize,
     previous: Option<Url>,
+    trace: Option<HttpRequestTrace>,
     cross_origin: bool,
     has_body: bool,
 }
@@ -223,6 +320,10 @@ impl Policy<Full<Bytes>, HttpClientError> for Redirects {
     }
 
     fn on_request(&mut self, request: &mut Request<Full<Bytes>>) {
+        // Carry only our content-free collector across redirects
+        if let Some(trace) = &self.trace {
+            request.extensions_mut().insert(trace.clone());
+        }
         self.has_body = !request.body().is_end_stream();
 
         let Some(previous) = &self.previous else {
@@ -299,6 +400,7 @@ mod tests {
     fn cross_origin_redirect_retains_only_allowed_headers() {
         let mut policy = Redirects {
             policy: HttpRedirectPolicy::Follow,
+            trace: None,
             count: 1,
             previous: Some(Url::parse("https://source.example/start?signature=SECRET").unwrap()),
             cross_origin: true,

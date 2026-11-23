@@ -81,6 +81,7 @@ pub mod client;
 pub mod config;
 pub mod consts;
 pub mod proxy;
+pub mod quality;
 pub mod subscription;
 pub mod types;
 
@@ -93,6 +94,11 @@ pub use client::{
 };
 pub use config::{InitialConnectRetryPolicy, TransportBackend, WebSocketConfig};
 pub use consts::{AUTHENTICATION_TIMEOUT_SECS, TEXT_PING, TEXT_PONG};
+pub use quality::{
+    WebSocketConnectionDetails, WebSocketObservation, WebSocketObservationEvent,
+    WebSocketObservationTime, WebSocketRoutePolicy, WebSocketRouteResult, WebSocketSendStage,
+    WebSocketTelemetry,
+};
 pub use subscription::{SubscriptionSnapshot, SubscriptionState, split_topic};
 pub use types::{
     CloseHandler, EpochMessageHandler, EpochPingHandler, MessageHandler, MessageReader,

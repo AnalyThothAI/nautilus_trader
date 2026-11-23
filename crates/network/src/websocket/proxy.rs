@@ -108,6 +108,14 @@ trait ProxiedIo: AsyncRead + AsyncWrite + Send + Unpin {}
 impl<T: AsyncRead + AsyncWrite + Send + Unpin> ProxiedIo for T {}
 
 impl ProxiedStream {
+    pub(crate) fn peer_addr(&self) -> io::Result<std::net::SocketAddr> {
+        match self {
+            Self::Plain(stream) => stream.peer_addr(),
+            Self::PlainOverTlsProxy(stream) | Self::Tls(stream) => stream.get_ref().0.peer_addr(),
+            Self::TlsOverTlsProxy(stream) => stream.get_ref().0.get_ref().0.peer_addr(),
+        }
+    }
+
     fn inner_mut(&mut self) -> &mut dyn ProxiedIo {
         match self {
             Self::Plain(s) => s,

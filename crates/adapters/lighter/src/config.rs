@@ -33,7 +33,9 @@ use nautilus_model::{
     identifiers::{AccountId, Venue},
     types::Currency,
 };
-use nautilus_network::websocket::{TransportBackend, proxy::ProxyUrl};
+use nautilus_network::websocket::{
+    TransportBackend, WebSocketRoutePolicy, WebSocketTelemetry, proxy::ProxyUrl,
+};
 use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::common::{
@@ -110,6 +112,11 @@ pub struct LighterDataClientConfig {
     /// WebSocket transport backend.
     #[builder(default)]
     pub transport_backend: TransportBackend,
+    /// Optional public-data route evaluation policy. Disabled by default; never bypasses a proxy.
+    pub ws_route_policy: Option<WebSocketRoutePolicy>,
+    /// Runtime-only bounded transport evidence collector.
+    #[serde(skip)]
+    pub ws_telemetry: Option<WebSocketTelemetry>,
 }
 
 #[cfg(feature = "python")]
@@ -285,6 +292,14 @@ pub struct LighterExecutionClientConfig {
     /// WebSocket transport backend.
     #[builder(default)]
     pub transport_backend: TransportBackend,
+    /// Optional public candidate evaluation using the existing execution transport controller.
+    /// Disabled by default. Candidates never authenticate or submit transactions; installation
+    /// performs the normal reconnect, account resubscription and nonce recovery. Improved Ping
+    /// round trips do not establish improved transaction latency, which requires natural sends.
+    pub ws_route_policy: Option<WebSocketRoutePolicy>,
+    /// Runtime-only bounded transport evidence collector.
+    #[serde(skip)]
+    pub ws_telemetry: Option<WebSocketTelemetry>,
     /// Whether to use Lighter-native GTD orders.
     ///
     /// The current Lighter venue validation requires a `GoodTillTime` expiry of at least five
@@ -871,6 +886,8 @@ mod tests {
             transport_backend: TransportBackend::default(),
             use_gtd: true,
             scheduled_cancel_timeout_secs: None,
+            ws_telemetry: None,
+            ws_route_policy: None,
         };
 
         let dbg_out = format!("{config:?}");
@@ -893,6 +910,25 @@ mod tests {
         let config: LighterExecutionClientConfig = toml::from_str("use_gtd = false").unwrap();
 
         assert!(!config.use_gtd);
+    }
+
+    #[rstest]
+    fn execution_route_optimization_remains_opt_in() {
+        assert!(
+            LighterExecutionClientConfig::default()
+                .ws_route_policy
+                .is_none()
+        );
+        let legacy: LighterExecutionClientConfig =
+            serde_json::from_value(serde_json::json!({})).unwrap();
+
+        assert!(legacy.ws_route_policy.is_none());
+        let explicit: LighterExecutionClientConfig = serde_json::from_value(serde_json::json!({
+            "ws_route_policy": WebSocketRoutePolicy::default(),
+        }))
+        .unwrap();
+
+        assert!(explicit.ws_route_policy.is_some());
     }
 
     #[rstest]

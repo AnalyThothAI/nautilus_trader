@@ -132,9 +132,7 @@ fn bench_quotes(c: &mut Criterion) {
                 unreachable!()
             };
             let instrument = instruments.get(&ETH_MARKET_INDEX).unwrap();
-            let quote = parse_ws_quote_tick(&ticker, instrument, timestamp, ts_init)
-                .unwrap()
-                .unwrap();
+            let quote = parse_ws_quote_tick(&ticker, instrument, timestamp, ts_init).unwrap();
             black_box(quote);
         });
     });

@@ -49,6 +49,17 @@ use crate::{
 
 pub(crate) const TX_BATCH_ID_PREFIX: &str = "tx-batch:";
 
+/// Local receive and typed-decode observations for one account-order frame.
+/// These timestamps do not replace a report's venue event or initialization time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExecutionFrameReceipt {
+    pub connection_epoch: u64,
+    pub raw_received_ns: u64,
+    pub raw_monotonic_ns: Option<u64>,
+    pub decoded_ns: u64,
+    pub decoded_monotonic_ns: Option<u64>,
+}
+
 /// Inbound message produced by the Lighter feed handler and consumed by the
 /// data and execution clients.
 ///
@@ -67,7 +78,10 @@ pub enum NautilusWsMessage {
     MarkPrice(MarkPriceUpdate),
     IndexPrice(IndexPriceUpdate),
     FundingRate(FundingRateUpdate),
-    ExecutionReports(Vec<ExecutionReport>),
+    ExecutionReports {
+        reports: Vec<ExecutionReport>,
+        receipt: Option<ExecutionFrameReceipt>,
+    },
     PositionSnapshot {
         reports: Vec<PositionStatusReport>,
         skipped_market_ids: Vec<i64>,

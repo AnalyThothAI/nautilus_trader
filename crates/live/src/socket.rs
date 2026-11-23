@@ -534,6 +534,18 @@ impl SocketControl {
         SocketControlFactory::with_registry(client_id, venue, registry).control(endpoint)
     }
 
+    /// Returns the existing registry owner and logical endpoint transport generation.
+    ///
+    /// Call after obtaining the state sink. Owner zero identifies an unregistered standalone
+    /// client; generation zero identifies a control which does not own an active sink.
+    #[must_use]
+    pub fn identity(&self) -> (u64, u64) {
+        (
+            self.owner.as_ref().map_or(0, |owner| owner.0.owner_id),
+            self.generation.load(Ordering::Acquire),
+        )
+    }
+
     /// Returns a sink which publishes transport state changes as system events.
     #[must_use]
     pub fn sink(&self) -> SocketStateSink {

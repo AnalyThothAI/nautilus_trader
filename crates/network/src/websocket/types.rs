@@ -29,8 +29,11 @@ use std::{fmt::Debug, sync::Arc};
 use futures_util::stream::{SplitSink, SplitStream};
 
 use crate::{
+    dst,
     error::SendError,
+    mode::ConnectionMode,
     transport::{BoxedWsTransport, CloseFrame, Message},
+    websocket::quality::{WebSocketSendStage, WebSocketTelemetry},
 };
 
 /// Sink half of the active WebSocket transport.
@@ -123,10 +126,64 @@ pub fn channel_epoch_message_handler() -> (
     (handler, rx)
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct SendTrace {
+    pub telemetry: WebSocketTelemetry,
+    pub connection_epoch: u64,
+    pub request_id: String,
+}
+
+impl SendTrace {
+    pub(crate) fn record(&self, stage: WebSocketSendStage) {
+        self.telemetry
+            .record_send(self.connection_epoch, &self.request_id, stage);
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ReplacementGuard {
+    pub expected_epoch: u64,
+    pub expires_at: dst::time::Instant,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ReplacementRejected {
+    StaleEpoch,
+    Expired,
+    ConnectionStopped,
+}
+
+impl ReplacementGuard {
+    pub(crate) fn check(
+        &self,
+        epoch: u64,
+        mode: ConnectionMode,
+    ) -> Result<(), ReplacementRejected> {
+        if epoch != self.expected_epoch {
+            return Err(ReplacementRejected::StaleEpoch);
+        }
+
+        if !mode.is_reconnect() {
+            return Err(ReplacementRejected::ConnectionStopped);
+        }
+
+        if dst::time::Instant::now() >= self.expires_at {
+            return Err(ReplacementRejected::Expired);
+        }
+        Ok(())
+    }
+}
+
 /// A command processed by the WebSocket writer task.
 pub(crate) enum WriterCommand {
     /// Replaces the writer after reconnection.
     Update(MessageWriter, tokio::sync::oneshot::Sender<u64>),
+    /// Installs a validated replacement only while its owning epoch and proof remain current.
+    UpdateIfCurrent {
+        writer: MessageWriter,
+        guard: ReplacementGuard,
+        response_tx: tokio::sync::oneshot::Sender<Result<u64, ReplacementRejected>>,
+    },
     /// Sends a message to the server.
     Send(Message),
     /// Sends a connection keepalive. Never replayed on a replacement connection.
@@ -136,6 +193,7 @@ pub(crate) enum WriterCommand {
         message: Message,
         connection_epoch: u64,
         response_tx: tokio::sync::oneshot::Sender<Result<(), SendError>>,
+        trace: Option<SendTrace>,
     },
     /// Sends a pong if the active connection still owns the ping that caused it.
     SendPongOnConnection {
@@ -148,6 +206,9 @@ impl Debug for WriterCommand {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Update(_, _) => f.debug_tuple("Update").field(&"<writer>").finish(),
+            Self::UpdateIfCurrent { .. } => {
+                f.debug_tuple("UpdateIfCurrent").field(&"<writer>").finish()
+            }
             Self::Send(msg) => f.debug_tuple("Send").field(msg).finish(),
             Self::Heartbeat(msg) => f.debug_tuple("Heartbeat").field(msg).finish(),
             Self::SendOnConnection { message, .. } => {

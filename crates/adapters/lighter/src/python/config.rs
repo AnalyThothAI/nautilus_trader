@@ -84,6 +84,8 @@ impl LighterDataClientConfig {
             proxy_url,
             http_timeout_secs: http_timeout_secs.unwrap_or(defaults.http_timeout_secs),
             ws_timeout_secs: ws_timeout_secs.unwrap_or(defaults.ws_timeout_secs),
+            ws_route_policy: None,
+            ws_telemetry: None,
             update_instruments_interval_mins: update_instruments_interval_mins
                 .unwrap_or(defaults.update_instruments_interval_mins),
             book_snapshot_timeout_secs: book_snapshot_timeout_secs
@@ -171,6 +173,8 @@ impl LighterExecutionClientConfig {
             proxy_url,
             http_timeout_secs: http_timeout_secs.unwrap_or(defaults.http_timeout_secs),
             ws_timeout_secs: ws_timeout_secs.unwrap_or(defaults.ws_timeout_secs),
+            ws_route_policy: None,
+            ws_telemetry: None,
             market_order_slippage_bps,
             rest_quota_per_min,
             sendtx_quota_per_min,

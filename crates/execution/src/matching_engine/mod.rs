@@ -35,7 +35,6 @@ use std::{
     rc::Rc,
 };
 
-use ahash::AHashSet;
 use indexmap::{IndexMap, IndexSet};
 use jiff::SignedDuration;
 use nautilus_common::{
@@ -169,7 +168,7 @@ pub struct OrderMatchingEngine {
     bid_touch: TouchObservation,
     ask_touch: TouchObservation,
     last_l2_depth_init: Option<UnixNanos>,
-    unconsumed_trade_ids: AHashSet<TradeId>,
+    unconsumed_trade_ids: IndexSet<TradeId>,
     queue_pending: IndexMap<ClientOrderId, PriceRaw>,
     queue_ahead_orders: IndexMap<ClientOrderId, IndexMap<OrderId, QuantityRaw>>,
     queue_ahead_total: IndexMap<ClientOrderId, (PriceRaw, QuantityRaw)>,
@@ -273,7 +272,7 @@ impl OrderMatchingEngine {
             bid_touch: TouchObservation::default(),
             ask_touch: TouchObservation::default(),
             last_l2_depth_init: None,
-            unconsumed_trade_ids: AHashSet::new(),
+            unconsumed_trade_ids: IndexSet::new(),
             queue_pending: IndexMap::new(),
             queue_ahead_orders: IndexMap::new(),
             queue_ahead_total: IndexMap::new(),
@@ -329,8 +328,8 @@ impl OrderMatchingEngine {
     /// the liquidity it took already consumed. Such a print still updates the last price and
     /// drives trade execution; a simulated fill of that liquidity consumes it as usual. The set
     /// replaces any previous one and survives [`Self::reset`], like the config.
-    pub fn set_unconsumed_trade_ids(&mut self, trade_ids: AHashSet<TradeId>) {
-        self.unconsumed_trade_ids = trade_ids;
+    pub fn set_unconsumed_trade_ids(&mut self, trade_ids: impl IntoIterator<Item = TradeId>) {
+        self.unconsumed_trade_ids = trade_ids.into_iter().collect();
     }
 
     fn dispatch_order_event(&self, event: OrderEventAny) {
@@ -600,6 +599,7 @@ impl OrderMatchingEngine {
                 AggressorSide::Sell => &self.bid_touch,
                 AggressorSide::NoAggressor => return,
             };
+
             if self.book_type != BookType::L2_MBP
                 || !touch.predates(trade_price_raw, trade_ts_event)
             {
@@ -1821,6 +1821,7 @@ impl OrderMatchingEngine {
         let ask = self.book.best_ask_price();
         let mut bid_change = None;
         let mut ask_change = None;
+
         for delta in deltas {
             // Deleting a displayed level ends that liquidity's lifetime. Its replacement
             // may have exactly the same size as the previous, already consumed level.
@@ -1844,6 +1845,7 @@ impl OrderMatchingEngine {
             {
                 bid_change = Some(delta.ts_event.max(bid_change.unwrap_or_default()));
             }
+
             if either
                 || (delta.order.side == Some(OrderSide::Sell) && ask == Some(delta.order.price))
             {

@@ -47,7 +47,7 @@ use nautilus_network::{
     RECONNECTED,
     error::SendError,
     retry::{RetryManager, create_websocket_retry_manager},
-    websocket::{SubscriptionState, WebSocketClient},
+    websocket::{SubscriptionState, WebSocketClient, WebSocketSendStage},
 };
 use tokio_tungstenite::tungstenite::Message;
 use tokio_util::sync::CancellationToken;
@@ -58,8 +58,8 @@ use super::{
     account_state::LighterAccountStateReconciler,
     error::LighterWsError,
     messages::{
-        AccountStream, ExecutionReport, LighterAsset, LighterPosition, LighterUserStats,
-        LighterWsCandle, LighterWsChannel, LighterWsChannelKind, LighterWsFrame,
+        AccountStream, ExecutionFrameReceipt, ExecutionReport, LighterAsset, LighterPosition,
+        LighterUserStats, LighterWsCandle, LighterWsChannel, LighterWsChannelKind, LighterWsFrame,
         LighterWsOrderBook, LighterWsRequest, LighterWsTx, NautilusWsMessage,
         SendTxRejectionSource, TX_BATCH_ID_PREFIX,
     },
@@ -163,11 +163,13 @@ pub enum HandlerCommand {
         tx_type: u8,
         tx_info: Box<serde_json::value::RawValue>,
         connection_epoch: u64,
+        request_id: Option<String>,
         response_tx: tokio::sync::oneshot::Sender<Result<(), LighterWsError>>,
     },
     SendTxBatch {
         data: super::messages::LighterWsSendTxBatch,
         connection_epoch: u64,
+        request_id: Option<String>,
         response_tx: tokio::sync::oneshot::Sender<Result<(), LighterWsError>>,
     },
 }
@@ -248,7 +250,7 @@ pub(super) struct FeedHandler {
     inner: Option<Arc<WebSocketClient>>,
     cmd_rx: tokio::sync::mpsc::UnboundedReceiver<HandlerCommand>,
     cmd_tx: Option<tokio::sync::mpsc::UnboundedSender<HandlerCommand>>,
-    raw_rx: tokio::sync::mpsc::UnboundedReceiver<(u64, Message)>,
+    raw_rx: tokio::sync::mpsc::UnboundedReceiver<(u64, u64, Option<u64>, Message)>,
     out_tx: tokio::sync::mpsc::UnboundedSender<NautilusWsMessage>,
     subscriptions: SubscriptionState,
     retry_manager: RetryManager<LighterWsError>,
@@ -259,7 +261,10 @@ pub(super) struct FeedHandler {
     subscription_retries: FuturesUnordered<SubscriptionRetry>,
     ignored_completions: AHashMap<Ustr, CompletionKind>,
     next_subscription_generation: u64,
+    connection_epoch: u64,
     instruments: AHashMap<i64, InstrumentAny>,
+    /// One watermark per known market on this connection, never a second quote cache.
+    ticker_watermarks: AHashMap<i64, TickerWatermark>,
     book: BookSyncTracker,
     book_snapshot_timeout: Duration,
     last_candles: AHashMap<(i64, LighterCandleResolution), LighterWsCandle>,
@@ -304,12 +309,19 @@ enum CompletionKind {
     AlreadySubscribed,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct TickerWatermark {
+    timestamp_ms: u64,
+    committed_us: u64,
+    nonce: i64,
+}
+
 impl FeedHandler {
     #[cfg(test)]
     pub(super) fn new(
         signal: Arc<AtomicBool>,
         cmd_rx: tokio::sync::mpsc::UnboundedReceiver<HandlerCommand>,
-        raw_rx: tokio::sync::mpsc::UnboundedReceiver<(u64, Message)>,
+        raw_rx: tokio::sync::mpsc::UnboundedReceiver<(u64, u64, Option<u64>, Message)>,
         out_tx: tokio::sync::mpsc::UnboundedSender<NautilusWsMessage>,
         subscriptions: SubscriptionState,
     ) -> Self {
@@ -327,7 +339,7 @@ impl FeedHandler {
     pub(super) fn new_with_settlement_currency(
         signal: Arc<AtomicBool>,
         cmd_rx: tokio::sync::mpsc::UnboundedReceiver<HandlerCommand>,
-        raw_rx: tokio::sync::mpsc::UnboundedReceiver<(u64, Message)>,
+        raw_rx: tokio::sync::mpsc::UnboundedReceiver<(u64, u64, Option<u64>, Message)>,
         out_tx: tokio::sync::mpsc::UnboundedSender<NautilusWsMessage>,
         subscriptions: SubscriptionState,
         settlement_currency: Currency,
@@ -350,7 +362,9 @@ impl FeedHandler {
             subscription_retries: FuturesUnordered::new(),
             ignored_completions: AHashMap::new(),
             next_subscription_generation: 1,
+            connection_epoch: 0,
             instruments: AHashMap::new(),
+            ticker_watermarks: AHashMap::new(),
             book: BookSyncTracker::default(),
             book_snapshot_timeout,
             last_candles: AHashMap::new(),
@@ -418,10 +432,11 @@ impl FeedHandler {
         &self,
         payload: String,
         connection_epoch: u64,
+        request_id: Option<String>,
     ) -> Result<(), LighterWsError> {
         if let Some(client) = &self.inner {
             match client
-                .send_text_on_connection(payload, None, connection_epoch)
+                .send_text_on_connection_observed(payload, None, connection_epoch, request_id)
                 .await
             {
                 Err(SendError::BrokenPipe(message)) => {
@@ -486,6 +501,7 @@ impl FeedHandler {
         tx_type: u8,
         tx_info: Box<serde_json::value::RawValue>,
         connection_epoch: u64,
+        request_id: Option<String>,
     ) -> Result<(), LighterWsError> {
         let request = LighterWsRequest::SendTx {
             data: super::messages::LighterWsSendTx { tx_type, tx_info },
@@ -498,7 +514,7 @@ impl FeedHandler {
                     payload.len(),
                 );
 
-                match self.send_once(payload, connection_epoch).await {
+                match self.send_once(payload, connection_epoch, request_id).await {
                     Ok(()) => Ok(()),
                     Err(e) => {
                         log::debug!("Error dispatching Lighter sendTx (tx_type={tx_type}): {e}");
@@ -534,6 +550,13 @@ impl FeedHandler {
     }
 
     pub(super) async fn next(&mut self) -> Option<NautilusWsMessage> {
+        if let Some(client) = &self.inner
+            && client.connection_epoch() != self.connection_epoch
+        {
+            // Parsed frames can also remain queued while the controller replaces the transport
+            self.pending_messages.clear();
+        }
+
         if let Some(msg) = self.pending_messages.pop_front() {
             return Some(msg);
         }
@@ -599,6 +622,8 @@ impl FeedHandler {
                         }
                         HandlerCommand::InitializeInstruments(instruments) => {
                             self.instruments.clear();
+                            self.ticker_watermarks.clear();
+
                             for (market_index, inst) in instruments {
                                 self.instruments.insert(market_index, inst);
                             }
@@ -636,9 +661,9 @@ impl FeedHandler {
                         HandlerCommand::SetExecutionContext { account_id, account_index } => {
                             self.exec_account = Some((account_id, account_index));
                         }
-                        HandlerCommand::SendTxBatch { data, connection_epoch, response_tx } => {
+                        HandlerCommand::SendTxBatch { data, connection_epoch, request_id, response_tx } => {
                             let result = match serde_json::to_string(&LighterWsRequest::SendTxBatch { data }) {
-                                Ok(payload) => self.send_once(payload, connection_epoch).await,
+                                Ok(payload) => self.send_once(payload, connection_epoch, request_id).await,
                                 Err(e) => Err(LighterWsError::Client(format!("failed to serialize Lighter sendTxBatch: {e}"))),
                             };
                             let _ = response_tx.send(result);
@@ -647,10 +672,11 @@ impl FeedHandler {
                             tx_type,
                             tx_info,
                             connection_epoch,
+                            request_id,
                             response_tx,
                         } => {
                             let result = self
-                                .dispatch_send_tx(tx_type, tx_info, connection_epoch)
+                                .dispatch_send_tx(tx_type, tx_info, connection_epoch, request_id)
                                 .await;
 
                             if response_tx.send(result).is_err() {
@@ -664,12 +690,31 @@ impl FeedHandler {
                 {
                     self.queue_subscription_retry(topic, generation);
                 }
-                Some((connection_epoch, raw_msg)) = self.raw_rx.recv() => {
+                Some((connection_epoch, raw_received_ns, raw_monotonic_ns, raw_msg)) = self.raw_rx.recv() => {
+                    // The reader fence cannot retract frames already queued before replacement
+                    let current_epoch = self.inner.as_ref().map_or(
+                        self.connection_epoch,
+                        |client| client.connection_epoch(),
+                    );
+
+                    if connection_epoch < current_epoch
+                        || (self.inner.is_some() && connection_epoch != current_epoch)
+                    {
+                        log::debug!("Discarding Lighter frame from retired connection epoch {connection_epoch}, current={current_epoch}");
+                        continue;
+                    }
+
+                    if connection_epoch != self.connection_epoch {
+                        self.ticker_watermarks.clear();
+                        self.connection_epoch = connection_epoch;
+                    }
+
                     match raw_msg {
                         Message::Text(text) => {
                             if text == RECONNECTED {
                                 log::debug!("Received Lighter WebSocket RECONNECTED sentinel");
                                 self.book.reset_on_reconnect();
+                                self.ticker_watermarks.clear();
                                 // Resubscribe replays a fresh `subscribed/candle`; pre-disconnect cache is stale.
                                 self.last_candles.clear();
                                 // The new socket starts with zero inflight and restore_subscriptions
@@ -701,10 +746,35 @@ impl FeedHandler {
                                 {
                                     continue;
                                 }
-                                let messages = self
-                                    .handle_frame(frame, ts_init)
+                                let account_orders = matches!(
+                                    &frame,
+                                    LighterWsFrame::AccountOrders { .. }
+                                        | LighterWsFrame::AccountAllOrders { .. }
+                                );
+                                let messages = self.handle_frame(frame, ts_init);
+                                let frame_receipt = account_orders.then(|| {
+                                    let (decoded_ns, decoded_monotonic_ns) = self.inner.as_ref()
+                                        .and_then(|client| client.observation_time())
+                                        .map_or_else(
+                                            || (self.clock.get_time_ns().as_u64(), None),
+                                            |time| (time.ts_init, time.monotonic_ns),
+                                        );
+                                    ExecutionFrameReceipt {
+                                        connection_epoch,
+                                        raw_received_ns,
+                                        raw_monotonic_ns,
+                                        decoded_ns,
+                                        decoded_monotonic_ns,
+                                    }
+                                });
+                                let messages = messages
                                     .into_iter()
-                                    .map(|msg| msg.with_connection_epoch(connection_epoch))
+                                    .map(|mut msg| {
+                                        if let NautilusWsMessage::ExecutionReports { receipt, .. } = &mut msg {
+                                            *receipt = frame_receipt;
+                                        }
+                                        msg.with_connection_epoch(connection_epoch)
+                                    })
                                     .collect();
 
                                 if let Some(first) = self.dispatch_results(messages) {
@@ -1124,6 +1194,23 @@ impl FeedHandler {
         &mut self,
         value: &serde_json::Value,
     ) -> (bool, Option<NautilusWsMessage>) {
+        if let Some(client) = &self.inner {
+            let matched = super::client::observe_response_ids(value, |id| {
+                client.record_send_observation(
+                    self.connection_epoch,
+                    id,
+                    WebSocketSendStage::AdapterResponseDecoded,
+                );
+            });
+
+            if !matched && super::client::is_transaction_response(value) {
+                client.record_unmatched_response(
+                    self.connection_epoch,
+                    WebSocketSendStage::AdapterResponseDecoded,
+                );
+            }
+        }
+
         if value.get("type").and_then(|v| v.as_str()) == Some("jsonapi/sendtxbatch")
             || value
                 .get("id")
@@ -1383,14 +1470,16 @@ impl FeedHandler {
                 channel,
                 ticker,
                 timestamp,
-                ..
+                nonce,
+                last_updated_at,
             }
             | LighterWsFrame::Ticker {
                 channel,
                 ticker,
                 timestamp,
-                ..
-            } => self.handle_ticker(channel, &ticker, timestamp, ts_init),
+                nonce,
+                last_updated_at,
+            } => self.handle_ticker(channel, &ticker, timestamp, nonce, last_updated_at, ts_init),
             LighterWsFrame::TradeSnapshot {
                 trades,
                 liquidation_trades,
@@ -1825,10 +1914,12 @@ impl FeedHandler {
     }
 
     fn handle_ticker(
-        &self,
+        &mut self,
         channel: Ustr,
         ticker: &super::messages::LighterTicker,
         timestamp: u64,
+        nonce: i64,
+        last_updated_at: u64,
         ts_init: UnixNanos,
     ) -> Vec<NautilusWsMessage> {
         // Resolve the instrument from the channel's `ticker:N` market index,
@@ -1846,13 +1937,59 @@ impl FeedHandler {
             return Vec::new();
         };
 
-        match parse_ws_quote_tick(ticker, instrument, timestamp, ts_init) {
-            Ok(Some(quote)) => vec![NautilusWsMessage::Quote(quote)],
-            Ok(None) => {
-                log::debug!(
-                    "Skipping Lighter ticker for market_index={market_index}: one-sided book",
+        // The ticker's committer timestamp orders this channel only. Nonce gaps and equal
+        // timestamps are not proof of missing or duplicate states, and ts_event stays in ms.
+        let committed_us = if ticker.last_updated_at != 0 {
+            ticker.last_updated_at
+        } else {
+            last_updated_at
+        };
+        let previous = self.ticker_watermarks.get(&market_index).copied();
+
+        if let Some(previous) = previous {
+            let stale = if committed_us != 0 && previous.committed_us != 0 {
+                committed_us < previous.committed_us
+            } else {
+                timestamp < previous.timestamp_ms
+            };
+
+            if stale {
+                log::warn!(
+                    "Discarding older Lighter ticker: market_index={market_index}, connection_epoch={}, nonce={nonce}, committed_us={committed_us}, previous_committed_us={}, timestamp_ms={timestamp}",
+                    self.connection_epoch,
+                    previous.committed_us
                 );
-                Vec::new()
+                return Vec::new();
+            }
+
+            if nonce < previous.nonce {
+                log::warn!(
+                    "Lighter ticker nonce decreased without an older timestamp: market_index={market_index}, connection_epoch={}, nonce={nonce}, previous_nonce={}",
+                    self.connection_epoch,
+                    previous.nonce
+                );
+            }
+        }
+
+        match parse_ws_quote_tick(ticker, instrument, timestamp, ts_init) {
+            Ok(quote) => {
+                self.ticker_watermarks.insert(
+                    market_index,
+                    TickerWatermark {
+                        timestamp_ms: previous
+                            .map_or(timestamp, |prior| prior.timestamp_ms.max(timestamp)),
+                        committed_us: previous
+                            .map_or(committed_us, |prior| prior.committed_us.max(committed_us)),
+                        nonce,
+                    },
+                );
+
+                log::trace!(
+                    "Lighter ticker observation: market_index={market_index}, connection_epoch={}, nonce={nonce}, frame_updated_us={last_updated_at}, ticker_updated_us={}, timestamp_ms={timestamp}, ts_init={ts_init}",
+                    self.connection_epoch,
+                    ticker.last_updated_at
+                );
+                vec![NautilusWsMessage::Quote(quote)]
             }
             Err(e) => {
                 log::error!("Error parsing Lighter ticker frame: {e}");
@@ -2060,7 +2197,10 @@ impl FeedHandler {
         if reports.is_empty() {
             Vec::new()
         } else {
-            vec![NautilusWsMessage::ExecutionReports(reports)]
+            vec![NautilusWsMessage::ExecutionReports {
+                reports,
+                receipt: None,
+            }]
         }
     }
 
@@ -2098,7 +2238,10 @@ impl FeedHandler {
         if reports.is_empty() {
             Vec::new()
         } else {
-            vec![NautilusWsMessage::ExecutionReports(reports)]
+            vec![NautilusWsMessage::ExecutionReports {
+                reports,
+                receipt: None,
+            }]
         }
     }
 
@@ -2400,10 +2543,12 @@ mod tests {
 
     use futures_util::FutureExt;
     use log::{Level, LevelFilter, Log, Metadata, Record};
+    use nautilus_common::cache::Cache;
     use nautilus_model::{
-        enums::{AccountType, BookAction, RecordFlag},
+        enums::{AccountType, BookAction, BookType, RecordFlag},
         identifiers::{InstrumentId, Symbol, Venue},
         instruments::{CryptoPerpetual, CurrencyPair},
+        orderbook::OrderBook,
         types::{Currency, Money, Price, Quantity},
     };
     use parking_lot::Mutex;
@@ -2481,6 +2626,7 @@ mod tests {
     const WS_SPOT_MARKET_STATS_UPDATE_ALL: &str =
         include_str!("../../test_data/ws_spot_market_stats_update_all.json");
     const WS_CANDLE_SUBSCRIBED: &str = include_str!("../../test_data/ws_candle_subscribed.json");
+    const WS_TICKER_UPDATE: &str = include_str!("../../test_data/ws_ticker_update.json");
     const WS_SPOT_STATS_SUBSCRIBED_BAD_BODY: &str =
         include_str!("../../test_data/ws_spot_market_stats_subscribed_single_bad_body.json");
     const WS_BOOK_SUBSCRIBED_BAD_BODY: &str =
@@ -2543,13 +2689,208 @@ mod tests {
     fn make_handler_with_account() -> FeedHandler {
         let signal = Arc::new(AtomicBool::new(false));
         let (_cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel::<HandlerCommand>();
-        let (_raw_tx, raw_rx) = tokio::sync::mpsc::unbounded_channel::<(u64, Message)>();
+        let (_raw_tx, raw_rx) =
+            tokio::sync::mpsc::unbounded_channel::<(u64, u64, Option<u64>, Message)>();
         let (out_tx, _out_rx) = tokio::sync::mpsc::unbounded_channel::<NautilusWsMessage>();
         let mut handler =
             FeedHandler::new(signal, cmd_rx, raw_rx, out_tx, SubscriptionState::new(':'));
         handler.instruments.insert(0, stub_eth_perp_instrument());
         handler.exec_account = Some((AccountId::from("LIGHTER-1234"), 1234));
         handler
+    }
+
+    fn ticker_frame(
+        market_index: i64,
+        nonce: i64,
+        committed_us: u64,
+        timestamp_ms: u64,
+    ) -> LighterWsFrame {
+        let mut value: serde_json::Value = serde_json::from_str(WS_TICKER_UPDATE).unwrap();
+        value["channel"] = format!("ticker:{market_index}").into();
+        value["nonce"] = nonce.into();
+        value["last_updated_at"] = committed_us.into();
+        value["ticker"]["last_updated_at"] = committed_us.into();
+        value["timestamp"] = timestamp_ms.into();
+        serde_json::from_value(value).unwrap()
+    }
+
+    #[rstest]
+    #[case::nonce_gap(50, 1_001)]
+    #[case::equal_metadata(10, 1_000)]
+    fn ticker_keeps_same_millisecond_changes_and_nonce_gaps(
+        #[case] nonce: i64,
+        #[case] committed_us: u64,
+    ) {
+        let mut handler = make_handler_with_account();
+        let first = handler.handle_frame(ticker_frame(0, 10, 1_000, 123), UnixNanos::from(1));
+        let mut changed = ticker_frame(0, nonce, committed_us, 123);
+
+        if let LighterWsFrame::Ticker { ticker, .. } = &mut changed {
+            ticker.b.price = Decimal::new(206431, 2);
+            ticker.a.size = Decimal::new(12345, 4);
+        }
+
+        let second = handler.handle_frame(changed, UnixNanos::from(2));
+        let NautilusWsMessage::Quote(first) = &first[0] else {
+            panic!("expected first quote");
+        };
+        let NautilusWsMessage::Quote(second) = &second[0] else {
+            panic!("expected changed quote");
+        };
+
+        assert_eq!(first.ts_event, second.ts_event);
+        assert_eq!(first.bid_price, Price::from("2064.30"));
+        assert_eq!(second.bid_price, Price::from("2064.31"));
+        assert_eq!(second.ask_size, Quantity::from("1.2345"));
+        assert_eq!(second.ts_init, UnixNanos::from(2));
+    }
+
+    #[rstest]
+    fn ticker_rejects_older_committer_state_per_market_only() {
+        let mut handler = make_handler_with_account();
+        handler.instruments.insert(1, stub_eth_spot_instrument());
+        let first = handler.handle_frame(ticker_frame(0, 10, 1_000, 123), UnixNanos::from(1));
+        // A later delivery timestamp does not make the old committed state current
+        let stale = handler.handle_frame(ticker_frame(0, 9, 999, 124), UnixNanos::from(2));
+        let other = handler.handle_frame(ticker_frame(1, 1, 999, 122), UnixNanos::from(3));
+        let equal = handler.handle_frame(ticker_frame(0, 10, 1_000, 123), UnixNanos::from(4));
+
+        assert_eq!(first.len(), 1);
+        assert!(stale.is_empty());
+        assert_eq!(other.len(), 1);
+        assert_eq!(equal.len(), 1);
+        assert_eq!(handler.ticker_watermarks.len(), 2);
+        assert_eq!(handler.ticker_watermarks[&0].committed_us, 1_000);
+    }
+
+    #[rstest]
+    fn ticker_does_not_invent_a_nonce_or_missing_timestamp_contract() {
+        let mut handler = make_handler_with_account();
+        let first = handler.handle_frame(ticker_frame(0, 50, 1_000, 123), UnixNanos::from(1));
+        let lower_nonce = handler.handle_frame(ticker_frame(0, 1, 1_001, 123), UnixNanos::from(2));
+        let no_committer = handler.handle_frame(ticker_frame(0, 2, 0, 124), UnixNanos::from(3));
+        let older_ms = handler.handle_frame(ticker_frame(0, 3, 0, 122), UnixNanos::from(4));
+
+        assert_eq!(first.len(), 1);
+        assert_eq!(lower_nonce.len(), 1);
+        assert_eq!(no_committer.len(), 1);
+        assert!(older_ms.is_empty());
+        assert_eq!(handler.ticker_watermarks[&0].committed_us, 1_001);
+    }
+
+    #[rstest]
+    fn ticker_publishes_the_empty_side_as_one_complete_quote() {
+        let mut handler = make_handler_with_account();
+        let first = handler.handle_frame(ticker_frame(0, 10, 1_000, 123), UnixNanos::from(1));
+        let mut empty = ticker_frame(0, 11, 1_001, 124);
+
+        if let LighterWsFrame::Ticker { ticker, .. } = &mut empty {
+            ticker.b.price = Decimal::ZERO;
+            ticker.b.size = Decimal::ZERO;
+        }
+
+        let second = handler.handle_frame(empty, UnixNanos::from(2));
+        let late_old = handler.handle_frame(ticker_frame(0, 10, 1_000, 125), UnixNanos::from(3));
+        let NautilusWsMessage::Quote(first) = &first[0] else {
+            panic!("expected initial quote");
+        };
+        let NautilusWsMessage::Quote(second) = &second[0] else {
+            panic!("expected one-sided quote");
+        };
+        let mut cache = Cache::default();
+        let mut book = OrderBook::new(first.instrument_id, BookType::L1_MBP);
+        cache.add_quote(*first).unwrap();
+        book.update_quote_tick(first).unwrap();
+        cache.add_quote(*second).unwrap();
+        book.update_quote_tick(second).unwrap();
+
+        assert_eq!(second.instrument_id, first.instrument_id);
+        assert_eq!(second.bid_price, Price::from("0.00"));
+        assert_eq!(second.bid_size, Quantity::from("0.0000"));
+        assert_eq!(second.ask_price, first.ask_price);
+        assert_eq!(second.ask_size, first.ask_size);
+        assert_eq!(second.ts_event, UnixNanos::from(124_000_000));
+        assert_eq!(second.ts_init, UnixNanos::from(2));
+        assert_eq!(cache.quote(&first.instrument_id), Some(second));
+        assert!(late_old.is_empty());
+        assert!(book.best_bid_price().is_none());
+        assert_eq!(book.best_ask_price(), Some(first.ask_price));
+    }
+
+    #[tokio::test]
+    async fn ticker_reconnect_retires_queued_epochs_and_resets_watermarks() {
+        let signal = Arc::new(AtomicBool::new(false));
+        let (_cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (raw_tx, raw_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (out_tx, _out_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut handler =
+            FeedHandler::new(signal, cmd_rx, raw_rx, out_tx, SubscriptionState::new(':'));
+        handler.instruments.insert(0, stub_eth_perp_instrument());
+
+        raw_tx
+            .send((
+                9,
+                0,
+                None,
+                Message::Text(
+                    serde_json::to_string(&ticker_frame(0, 50, 1_000, 123))
+                        .unwrap()
+                        .into(),
+                ),
+            ))
+            .unwrap();
+
+        let initial = handler.next().await;
+        raw_tx
+            .send((10, 0, None, Message::Text(RECONNECTED.into())))
+            .unwrap();
+        let reconnected = handler.next().await;
+        raw_tx
+            .send((9, 0, None, Message::Text(RECONNECTED.into())))
+            .unwrap();
+        raw_tx
+            .send((
+                9,
+                0,
+                None,
+                Message::Text(
+                    serde_json::to_string(&ticker_frame(0, 90, 2_000, 125))
+                        .unwrap()
+                        .into(),
+                ),
+            ))
+            .unwrap();
+        raw_tx
+            .send((
+                10,
+                0,
+                None,
+                Message::Text(
+                    serde_json::to_string(&ticker_frame(0, 1, 100, 124))
+                        .unwrap()
+                        .into(),
+                ),
+            ))
+            .unwrap();
+        let resumed = tokio::time::timeout(Duration::from_secs(1), handler.next())
+            .await
+            .unwrap();
+
+        assert!(matches!(initial, Some(NautilusWsMessage::Quote(_))));
+        assert!(matches!(
+            reconnected,
+            Some(NautilusWsMessage::Reconnected {
+                connection_epoch: 10
+            })
+        ));
+        let Some(NautilusWsMessage::Quote(resumed)) = resumed else {
+            panic!("expected the new connection's lower-nonce quote");
+        };
+
+        assert_eq!(resumed.ts_event, UnixNanos::from(124_000_000));
+        assert_eq!(handler.connection_epoch, 10);
+        assert_eq!(handler.ticker_watermarks[&0].committed_us, 100);
+        assert_eq!(handler.ticker_watermarks[&0].nonce, 1);
     }
 
     // A recovery past its retry budget keeps running, so a late snapshot still restores the book
@@ -3202,7 +3543,7 @@ mod tests {
         let recovery = handler.book.recovery.entry(0).or_default().claim().unwrap();
         handler.book.expected.insert(0, (3, 9));
         raw_tx
-            .send((10, Message::Text(RECONNECTED.into())))
+            .send((10, 0, None, Message::Text(RECONNECTED.into())))
             .unwrap();
         assert!(matches!(
             handler.next().await,
@@ -3386,6 +3727,65 @@ mod tests {
     }
 
     #[rstest]
+    #[case::market_orders("update/account_orders", "account_orders:0:1234")]
+    #[case::all_orders("update/account_all_orders", "account_all_orders:1234")]
+    #[tokio::test]
+    async fn account_order_receipt_stays_with_its_frame_and_rejects_retired_epochs(
+        #[case] kind: &str,
+        #[case] channel: &str,
+    ) {
+        let signal = Arc::new(AtomicBool::new(false));
+        let (_cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (raw_tx, raw_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (out_tx, _out_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut handler =
+            FeedHandler::new(signal, cmd_rx, raw_rx, out_tx, SubscriptionState::new(':'));
+        handler.instruments.insert(0, stub_eth_perp_instrument());
+        handler.exec_account = Some((AccountId::from("LIGHTER-1234"), 1234));
+        handler.connection_epoch = 10;
+        let mut frame: serde_json::Value = serde_json::from_str(WS_ACCOUNT_ORDERS_UPDATE).unwrap();
+        frame["type"] = serde_json::json!(kind);
+        frame["channel"] = serde_json::json!(channel);
+        let payload = serde_json::to_string(&frame).unwrap();
+        let before_decode = handler.clock.get_time_ns().as_u64();
+        raw_tx
+            .send((9, 100, Some(1_000), Message::Text(payload.clone().into())))
+            .unwrap();
+        raw_tx
+            .send((10, 200, Some(2_000), Message::Text(payload.into())))
+            .unwrap();
+
+        let next = tokio::time::timeout(Duration::from_secs(2), handler.next())
+            .await
+            .expect("account order frame was not processed");
+        let Some(NautilusWsMessage::ExecutionReports {
+            reports,
+            receipt: Some(receipt),
+        }) = next
+        else {
+            panic!("expected account order reports with receipt metadata");
+        };
+
+        assert_eq!(receipt.connection_epoch, 10);
+        assert_eq!(receipt.raw_received_ns, 200);
+        assert_eq!(receipt.raw_monotonic_ns, Some(2_000));
+        assert!(receipt.decoded_ns >= before_decode);
+        assert_eq!(receipt.decoded_monotonic_ns, None);
+        assert_eq!(reports.len(), 1);
+        let super::ExecutionReport::Order(order) = &reports[0] else {
+            panic!("expected original account order");
+        };
+        assert_eq!(order.order_id, "281476929510110");
+        assert_eq!(order.client_order_id, "42");
+        assert!(matches!(
+            handler.next().await,
+            Some(NautilusWsMessage::AccountStreamFirstFrame(
+                AccountStream::Orders
+            ))
+        ));
+    }
+
+    #[rstest]
     fn handle_frame_routes_account_orders_to_execution_reports() {
         let mut handler = make_handler_with_account();
         let frame: super::LighterWsFrame = serde_json::from_str(WS_ACCOUNT_ORDERS_UPDATE).unwrap();
@@ -3394,7 +3794,10 @@ mod tests {
 
         assert_eq!(messages.len(), 1);
         match &messages[0] {
-            NautilusWsMessage::ExecutionReports(reports) => {
+            NautilusWsMessage::ExecutionReports {
+                reports,
+                receipt: None,
+            } => {
                 assert_eq!(reports.len(), 1);
                 match &reports[0] {
                     super::ExecutionReport::Order(order) => {
@@ -3418,7 +3821,10 @@ mod tests {
 
         assert_eq!(messages.len(), 1);
         match &messages[0] {
-            NautilusWsMessage::ExecutionReports(reports) => {
+            NautilusWsMessage::ExecutionReports {
+                reports,
+                receipt: None,
+            } => {
                 assert_eq!(reports.len(), 1);
                 match &reports[0] {
                     super::ExecutionReport::Fill(fill) => {
@@ -4129,7 +4535,8 @@ mod tests {
     fn handle_frame_account_orders_without_context_falls_back_to_raw() {
         let signal = Arc::new(AtomicBool::new(false));
         let (_cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel::<HandlerCommand>();
-        let (_raw_tx, raw_rx) = tokio::sync::mpsc::unbounded_channel::<(u64, Message)>();
+        let (_raw_tx, raw_rx) =
+            tokio::sync::mpsc::unbounded_channel::<(u64, u64, Option<u64>, Message)>();
         let (out_tx, _out_rx) = tokio::sync::mpsc::unbounded_channel::<NautilusWsMessage>();
         let mut handler =
             FeedHandler::new(signal, cmd_rx, raw_rx, out_tx, SubscriptionState::new(':'));
@@ -4158,7 +4565,8 @@ mod tests {
         // before instrument bootstrap completes).
         let signal = Arc::new(AtomicBool::new(false));
         let (_cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel::<HandlerCommand>();
-        let (_raw_tx, raw_rx) = tokio::sync::mpsc::unbounded_channel::<(u64, Message)>();
+        let (_raw_tx, raw_rx) =
+            tokio::sync::mpsc::unbounded_channel::<(u64, u64, Option<u64>, Message)>();
         let (out_tx, _out_rx) = tokio::sync::mpsc::unbounded_channel::<NautilusWsMessage>();
         let mut handler =
             FeedHandler::new(signal, cmd_rx, raw_rx, out_tx, SubscriptionState::new(':'));
@@ -4257,7 +4665,10 @@ mod tests {
 
         assert_eq!(messages.len(), 1);
         match &messages[0] {
-            NautilusWsMessage::ExecutionReports(reports) => {
+            NautilusWsMessage::ExecutionReports {
+                reports,
+                receipt: None,
+            } => {
                 assert_eq!(reports.len(), 1);
                 match &reports[0] {
                     super::ExecutionReport::Order(order) => {
@@ -4320,7 +4731,8 @@ mod tests {
     fn handle_frame_account_all_trades_snapshot_falls_back_to_raw_without_context() {
         let signal = Arc::new(AtomicBool::new(false));
         let (_cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel::<HandlerCommand>();
-        let (_raw_tx, raw_rx) = tokio::sync::mpsc::unbounded_channel::<(u64, Message)>();
+        let (_raw_tx, raw_rx) =
+            tokio::sync::mpsc::unbounded_channel::<(u64, u64, Option<u64>, Message)>();
         let (out_tx, _out_rx) = tokio::sync::mpsc::unbounded_channel::<NautilusWsMessage>();
         let mut handler =
             FeedHandler::new(signal, cmd_rx, raw_rx, out_tx, SubscriptionState::new(':'));
@@ -4411,7 +4823,8 @@ mod tests {
     fn handle_frame_spot_market_stats_emits_index_update() {
         let signal = Arc::new(AtomicBool::new(false));
         let (_cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel::<HandlerCommand>();
-        let (_raw_tx, raw_rx) = tokio::sync::mpsc::unbounded_channel::<(u64, Message)>();
+        let (_raw_tx, raw_rx) =
+            tokio::sync::mpsc::unbounded_channel::<(u64, u64, Option<u64>, Message)>();
         let (out_tx, _out_rx) = tokio::sync::mpsc::unbounded_channel::<NautilusWsMessage>();
         let mut handler =
             FeedHandler::new(signal, cmd_rx, raw_rx, out_tx, SubscriptionState::new(':'));
@@ -4435,7 +4848,8 @@ mod tests {
     fn handle_frame_spot_market_stats_all_emits_index_update() {
         let signal = Arc::new(AtomicBool::new(false));
         let (_cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel::<HandlerCommand>();
-        let (_raw_tx, raw_rx) = tokio::sync::mpsc::unbounded_channel::<(u64, Message)>();
+        let (_raw_tx, raw_rx) =
+            tokio::sync::mpsc::unbounded_channel::<(u64, u64, Option<u64>, Message)>();
         let (out_tx, _out_rx) = tokio::sync::mpsc::unbounded_channel::<NautilusWsMessage>();
         let mut handler =
             FeedHandler::new(signal, cmd_rx, raw_rx, out_tx, SubscriptionState::new(':'));
@@ -4561,7 +4975,8 @@ mod tests {
     async fn send_tx_command_returns_handler_send_error_without_active_client() {
         let signal = Arc::new(AtomicBool::new(false));
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel::<HandlerCommand>();
-        let (raw_tx, raw_rx) = tokio::sync::mpsc::unbounded_channel::<(u64, Message)>();
+        let (raw_tx, raw_rx) =
+            tokio::sync::mpsc::unbounded_channel::<(u64, u64, Option<u64>, Message)>();
         let (out_tx, _out_rx) = tokio::sync::mpsc::unbounded_channel::<NautilusWsMessage>();
         let mut handler =
             FeedHandler::new(signal, cmd_rx, raw_rx, out_tx, SubscriptionState::new(':'));
@@ -4575,6 +4990,7 @@ mod tests {
                 )
                 .unwrap(),
                 connection_epoch: 0,
+                request_id: None,
                 response_tx,
             })
             .unwrap();
@@ -4597,7 +5013,8 @@ mod tests {
     async fn resubscribe_order_book_command_skips_when_reference_removed() {
         let signal = Arc::new(AtomicBool::new(false));
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel::<HandlerCommand>();
-        let (raw_tx, raw_rx) = tokio::sync::mpsc::unbounded_channel::<(u64, Message)>();
+        let (raw_tx, raw_rx) =
+            tokio::sync::mpsc::unbounded_channel::<(u64, u64, Option<u64>, Message)>();
         let (out_tx, _out_rx) = tokio::sync::mpsc::unbounded_channel::<NautilusWsMessage>();
         let subscriptions = SubscriptionState::new(':');
         let topic = LighterWsChannel::OrderBook(0).topic_key();
@@ -4633,7 +5050,8 @@ mod tests {
     async fn resubscribe_order_book_queues_when_inflight_is_at_cap() {
         let signal = Arc::new(AtomicBool::new(false));
         let (_cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel::<HandlerCommand>();
-        let (_raw_tx, raw_rx) = tokio::sync::mpsc::unbounded_channel::<(u64, Message)>();
+        let (_raw_tx, raw_rx) =
+            tokio::sync::mpsc::unbounded_channel::<(u64, u64, Option<u64>, Message)>();
         let (out_tx, _out_rx) = tokio::sync::mpsc::unbounded_channel::<NautilusWsMessage>();
         let subscriptions = SubscriptionState::new(':');
         let topic = LighterWsChannel::OrderBook(0).topic_key();
@@ -4908,7 +5326,8 @@ mod tests {
     async fn subscribe_command_parks_in_pending_subs_when_inflight_at_cap() {
         let signal = Arc::new(AtomicBool::new(false));
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel::<HandlerCommand>();
-        let (raw_tx, raw_rx) = tokio::sync::mpsc::unbounded_channel::<(u64, Message)>();
+        let (raw_tx, raw_rx) =
+            tokio::sync::mpsc::unbounded_channel::<(u64, u64, Option<u64>, Message)>();
         let (out_tx, _out_rx) = tokio::sync::mpsc::unbounded_channel::<NautilusWsMessage>();
         let mut handler =
             FeedHandler::new(signal, cmd_rx, raw_rx, out_tx, SubscriptionState::new(':'));
@@ -4944,7 +5363,8 @@ mod tests {
     async fn unsubscribe_drops_queued_subscribe_while_gate_full() {
         let signal = Arc::new(AtomicBool::new(false));
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel::<HandlerCommand>();
-        let (raw_tx, raw_rx) = tokio::sync::mpsc::unbounded_channel::<(u64, Message)>();
+        let (raw_tx, raw_rx) =
+            tokio::sync::mpsc::unbounded_channel::<(u64, u64, Option<u64>, Message)>();
         let (out_tx, _out_rx) = tokio::sync::mpsc::unbounded_channel::<NautilusWsMessage>();
         let mut handler =
             FeedHandler::new(signal, cmd_rx, raw_rx, out_tx, SubscriptionState::new(':'));
@@ -4980,7 +5400,8 @@ mod tests {
     async fn reconnect_requeues_attempt_with_new_generation() {
         let signal = Arc::new(AtomicBool::new(false));
         let (_cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel::<HandlerCommand>();
-        let (raw_tx, raw_rx) = tokio::sync::mpsc::unbounded_channel::<(u64, Message)>();
+        let (raw_tx, raw_rx) =
+            tokio::sync::mpsc::unbounded_channel::<(u64, u64, Option<u64>, Message)>();
         let (out_tx, _out_rx) = tokio::sync::mpsc::unbounded_channel::<NautilusWsMessage>();
         let mut handler =
             FeedHandler::new(signal, cmd_rx, raw_rx, out_tx, SubscriptionState::new(':'));
@@ -4990,7 +5411,7 @@ mod tests {
         let old_generation = handler.pending_subs[0].1;
 
         raw_tx
-            .send((7, Message::Text(RECONNECTED.to_string().into())))
+            .send((7, 0, None, Message::Text(RECONNECTED.to_string().into())))
             .expect("queue reconnect sentinel");
 
         let next = tokio::time::timeout(Duration::from_secs(2), handler.next())
@@ -5013,7 +5434,8 @@ mod tests {
     async fn pump_releases_inflight_slot_and_schedules_send_failure_retry() {
         let signal = Arc::new(AtomicBool::new(false));
         let (_cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel::<HandlerCommand>();
-        let (_raw_tx, raw_rx) = tokio::sync::mpsc::unbounded_channel::<(u64, Message)>();
+        let (_raw_tx, raw_rx) =
+            tokio::sync::mpsc::unbounded_channel::<(u64, u64, Option<u64>, Message)>();
         let (out_tx, _out_rx) = tokio::sync::mpsc::unbounded_channel::<NautilusWsMessage>();
         let mut handler =
             FeedHandler::new(signal, cmd_rx, raw_rx, out_tx, SubscriptionState::new(':'));
@@ -5538,7 +5960,8 @@ mod tests {
     async fn typed_subscribed_frame_completes_subscription_generation() {
         let signal = Arc::new(AtomicBool::new(false));
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel::<HandlerCommand>();
-        let (raw_tx, raw_rx) = tokio::sync::mpsc::unbounded_channel::<(u64, Message)>();
+        let (raw_tx, raw_rx) =
+            tokio::sync::mpsc::unbounded_channel::<(u64, u64, Option<u64>, Message)>();
         let (out_tx, _out_rx) = tokio::sync::mpsc::unbounded_channel::<NautilusWsMessage>();
         let mut handler =
             FeedHandler::new(signal, cmd_rx, raw_rx, out_tx, SubscriptionState::new(':'));
@@ -5554,7 +5977,7 @@ mod tests {
         );
 
         raw_tx
-            .send((7, Message::Text(WS_CANDLE_SUBSCRIBED.into())))
+            .send((7, 0, None, Message::Text(WS_CANDLE_SUBSCRIBED.into())))
             .expect("typed subscribed frame");
         drop(raw_tx);
         drop(cmd_tx);
@@ -5574,7 +5997,8 @@ mod tests {
     async fn unparsable_subscribed_frame_still_completes_subscription() {
         let signal = Arc::new(AtomicBool::new(false));
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel::<HandlerCommand>();
-        let (raw_tx, raw_rx) = tokio::sync::mpsc::unbounded_channel::<(u64, Message)>();
+        let (raw_tx, raw_rx) =
+            tokio::sync::mpsc::unbounded_channel::<(u64, u64, Option<u64>, Message)>();
         let (out_tx, _out_rx) = tokio::sync::mpsc::unbounded_channel::<NautilusWsMessage>();
         let mut handler =
             FeedHandler::new(signal, cmd_rx, raw_rx, out_tx, SubscriptionState::new(':'));
@@ -5586,7 +6010,12 @@ mod tests {
         );
 
         raw_tx
-            .send((7, Message::Text(WS_SPOT_STATS_SUBSCRIBED_BAD_BODY.into())))
+            .send((
+                7,
+                0,
+                None,
+                Message::Text(WS_SPOT_STATS_SUBSCRIBED_BAD_BODY.into()),
+            ))
             .expect("unparsable subscribed frame");
         drop(raw_tx);
         drop(cmd_tx);
@@ -5609,7 +6038,8 @@ mod tests {
     async fn unparsable_book_subscribed_frame_still_completes_subscription() {
         let signal = Arc::new(AtomicBool::new(false));
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel::<HandlerCommand>();
-        let (raw_tx, raw_rx) = tokio::sync::mpsc::unbounded_channel::<(u64, Message)>();
+        let (raw_tx, raw_rx) =
+            tokio::sync::mpsc::unbounded_channel::<(u64, u64, Option<u64>, Message)>();
         let (out_tx, _out_rx) = tokio::sync::mpsc::unbounded_channel::<NautilusWsMessage>();
         let mut handler =
             FeedHandler::new(signal, cmd_rx, raw_rx, out_tx, SubscriptionState::new(':'));
@@ -5623,7 +6053,12 @@ mod tests {
         // Epoch 0 matches the generation entry seeded by the helper, so the
         // book-specific snapshot matching accepts this confirmation.
         raw_tx
-            .send((0, Message::Text(WS_BOOK_SUBSCRIBED_BAD_BODY.into())))
+            .send((
+                0,
+                0,
+                None,
+                Message::Text(WS_BOOK_SUBSCRIBED_BAD_BODY.into()),
+            ))
             .expect("unparsable book subscribed frame");
         drop(raw_tx);
         drop(cmd_tx);

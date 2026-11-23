@@ -101,7 +101,12 @@ use nautilus_model::{
     reports::{FillReport, OrderStatusReport, PositionStatusReport},
     types::{AccountBalance, Currency, Money, Price, Quantity},
 };
-use nautilus_network::ratelimiter::{RateLimiter, quota::Quota};
+use nautilus_network::{
+    ratelimiter::{RateLimiter, quota::Quota},
+    websocket::{
+        WebSocketObservation, WebSocketObservationEvent, WebSocketSendStage, WebSocketTelemetry,
+    },
+};
 use rstest::rstest;
 use rust_decimal::Decimal;
 use serde_json::{Value, json};
@@ -188,6 +193,17 @@ fn account_id() -> AccountId {
     AccountId::from("LIGHTER-001")
 }
 
+/// A route probe on a real mock socket. No production connection or nonce state is injected.
+#[derive(Default)]
+struct PlannedRouteFixture {
+    connections: AtomicUsize,
+    old_flow_frames: AtomicUsize,
+    candidate_probe_started: tokio::sync::Notify,
+    release_candidate_probe: tokio::sync::Notify,
+    subscriptions: tokio::sync::Mutex<Vec<(usize, String)>>,
+    send_connections: tokio::sync::Mutex<Vec<usize>>,
+}
+
 /// Shared mock-server state for the exec-client integration tests.
 ///
 /// Records every inbound WS message (`subscribes`, `unsubscribes`,
@@ -201,6 +217,7 @@ fn account_id() -> AccountId {
 struct TestServerState {
     chain_id: Arc<AtomicU32>,
     connection_count: Arc<tokio::sync::Mutex<usize>>,
+    planned_route: Arc<tokio::sync::Mutex<Option<Arc<PlannedRouteFixture>>>>,
     subscribes: Arc<tokio::sync::Mutex<Vec<Value>>>,
     unsubscribes: Arc<tokio::sync::Mutex<Vec<Value>>>,
     send_txs: Arc<tokio::sync::Mutex<Vec<Value>>>,
@@ -268,6 +285,7 @@ impl Default for TestServerState {
         Self {
             chain_id: Arc::new(AtomicU32::new(LIGHTER_TESTNET_CHAIN_ID)),
             connection_count: Arc::new(tokio::sync::Mutex::new(0)),
+            planned_route: Arc::new(tokio::sync::Mutex::new(None)),
             subscribes: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             unsubscribes: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             send_txs: Arc::new(tokio::sync::Mutex::new(Vec::new())),
@@ -737,6 +755,12 @@ fn account_subscribed_frame(channel: &str) -> Option<Value> {
 }
 
 async fn handle_socket(socket: WebSocket, state: Arc<TestServerState>) {
+    let planned_route = state.planned_route.lock().await.clone();
+    let connection = planned_route.as_ref().map_or(0, |route| {
+        route.connections.fetch_add(1, Ordering::AcqRel) + 1
+    });
+    let mut subscribed = false;
+    let mut first_candidate_ping = true;
     {
         let mut count = state.connection_count.lock().await;
         *count += 1;
@@ -750,6 +774,8 @@ async fn handle_socket(socket: WebSocket, state: Arc<TestServerState>) {
         .await;
 
     let mut inbox = state.inbox_tx.subscribe();
+    let mut flow = tokio::time::interval(Duration::from_millis(100));
+    flow.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
         tokio::select! {
@@ -769,6 +795,23 @@ async fn handle_socket(socket: WebSocket, state: Arc<TestServerState>) {
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => {}
                 }
             }
+            // Keep the installed account stream active while its transport RTT is slow.
+            // Unsubscribed candidates receive no account data.
+            _ = flow.tick(), if planned_route.is_some() && subscribed => {
+                let entry = account_all_orders_open_entry(
+                    900_452, "281476929599452", "900452", TEST_ORDER_NONCE,
+                );
+                let update = json!({"type":"update/account_all_orders",
+                    "channel":format!("account_all_orders:{TEST_ACCOUNT_INDEX}"), "orders":{"0":[entry]}});
+
+                if sink.send(Message::Text(update.to_string().into())).await.is_err() {
+                    break;
+                }
+
+                if connection == 1 {
+                    planned_route.as_ref().unwrap().old_flow_frames.fetch_add(1, Ordering::Release);
+                }
+            }
             // Inbound from the client.
             next = stream.next() => {
                 let Some(Ok(message)) = next else { break };
@@ -780,8 +823,21 @@ async fn handle_socket(socket: WebSocket, state: Arc<TestServerState>) {
                 let kind = value.get("type").and_then(Value::as_str).unwrap_or("");
                 let should_close = state.close_after_next_frame.swap(false, Ordering::Relaxed);
 
+                if let Some(route) = &planned_route {
+                    match kind {
+                        "jsonapi/sendtx" | "jsonapi/sendtxbatch" => route.send_connections.lock().await.push(connection),
+                        _ => {},
+                    }
+                }
+
                 match kind {
                     "subscribe" => {
+                        subscribed = true;
+
+                        if let Some(route) = &planned_route {
+                            route.subscriptions.lock().await.push((connection,
+                                value["channel"].as_str().unwrap_or("").to_owned()));
+                        }
                         state.subscribes.lock().await.push(value.clone());
 
                         let channel = value
@@ -886,8 +942,20 @@ async fn handle_socket(socket: WebSocket, state: Arc<TestServerState>) {
                     break;
                 }
             }
-            Message::Ping(payload) if sink.send(Message::Pong(payload.clone())).await.is_err() => {
-                break;
+            Message::Ping(payload) => {
+                if let Some(route) = &planned_route {
+                    if connection == 1 {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    } else if first_candidate_ping {
+                        first_candidate_ping = false;
+                        route.candidate_probe_started.notify_one();
+                        route.release_candidate_probe.notified().await;
+                    }
+                }
+
+                if sink.send(Message::Pong(payload)).await.is_err() {
+                    break;
+                }
             }
             Message::Close(_) => break,
             _ => {}
@@ -1047,6 +1115,8 @@ fn build_config(addr: SocketAddr) -> LighterExecutionClientConfig {
         transport_backend: Default::default(),
         use_gtd: true,
         scheduled_cancel_timeout_secs: None,
+        ws_telemetry: None,
+        ws_route_policy: None,
     }
 }
 
@@ -13378,4 +13448,654 @@ async fn test_scheduled_cancel_timeout_preserves_order_nonce_on_wire() {
     client.disconnect().await.unwrap();
     assert!(client.pending_tasks_all_finished());
     assert_eq!(state.send_txs().await, frames);
+}
+
+async fn collect_execution_telemetry(
+    telemetry: &WebSocketTelemetry,
+    mut complete: impl FnMut(&[WebSocketObservation]) -> bool,
+) -> Vec<WebSocketObservation> {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        let mut observations = Vec::new();
+        loop {
+            observations.extend(telemetry.drain());
+            if complete(&observations) {
+                return observations;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("execution telemetry did not reach the expected stage")
+}
+
+fn execution_telemetry_stage<'a>(
+    observations: &'a [WebSocketObservation],
+    request: &str,
+    expected: WebSocketSendStage,
+) -> &'a WebSocketObservation {
+    observations
+        .iter()
+        .find(|observation| {
+            matches!(&observation.event,
+                WebSocketObservationEvent::Send { request_id, stage }
+                    if request_id == request && *stage == expected)
+        })
+        .unwrap_or_else(|| panic!("missing {expected:?} for {request}"))
+}
+
+#[rstest]
+#[case::account_orders(false)]
+#[case::account_all_orders(true)]
+#[tokio::test]
+async fn execution_telemetry_correlates_send_receipt_and_native_application(
+    #[case] all_orders: bool,
+) {
+    // The real execution engine publishes the event after updating its native cache.
+    set_message_bus(Rc::new(RefCell::new(MessageBus::new(
+        trader_id(),
+        UUID4::new(),
+        None,
+        None,
+    ))));
+    let (addr, state) = start_server().await;
+    let telemetry = WebSocketTelemetry::new();
+    let mut config = build_config(addr);
+    config.ws_telemetry = Some(telemetry.clone());
+    let (mut client, mut rx, cache) = build_client_with(config);
+    client.connect().await.unwrap();
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
+    let mut engine = ExecutionEngine::new(clock, cache.clone(), None);
+    let _ = telemetry.drain();
+    *state.next_send_tx_ack.lock().await = Some(Value::Null);
+
+    let order = make_limit_order(
+        "O-EXECUTION-TELEMETRY",
+        OrderSide::Buy,
+        Quantity::from("0.0050"),
+        Price::from("2361.31"),
+        TimeInForce::Gtc,
+        false,
+        false,
+    );
+    let cloid = order.client_order_id();
+    cache_order(&cache, order.clone());
+    client.submit_order(submit_command(&order)).unwrap();
+    let submitted = next_order_event(&mut rx, Duration::from_secs(2))
+        .await
+        .unwrap();
+    assert!(matches!(submitted, OrderEventAny::Submitted(_)));
+    engine.process(&submitted);
+    await_send_tx_count(&state, 1).await;
+    let frames = state.send_txs().await;
+    let info = send_tx_info(&frames[0]);
+    let tx_hash = order_tx_hash(send_tx_type(&frames[0]), &info, LIGHTER_TESTNET_CHAIN_ID);
+    state.push_frame(&json!({"type":"jsonapi/sendtx", "code":200, "tx_hash":tx_hash.clone()}));
+
+    let index = info["ClientOrderIndex"].as_i64().unwrap();
+    let mut entry = account_all_orders_open_entry(
+        index,
+        "281476929510452",
+        &index.to_string(),
+        TEST_ORDER_NONCE,
+    );
+    let order_frame = |entry: &Value| {
+        if all_orders {
+            json!({"type":"update/account_all_orders",
+                "channel":format!("account_all_orders:{TEST_ACCOUNT_INDEX}"),
+                "orders":{"0":[entry]}})
+        } else {
+            json!({"type":"update/account_orders", "account":TEST_ACCOUNT_INDEX,
+                "channel":format!("account_orders:0:{TEST_ACCOUNT_INDEX}"),
+                "nonce":1, "orders":{"0":[entry]}})
+        }
+    };
+    state.push_frame(&order_frame(&entry));
+    let accepted = next_order_event(&mut rx, Duration::from_secs(2))
+        .await
+        .unwrap();
+    let OrderEventAny::Accepted(accepted_event) = &accepted else {
+        panic!("expected OrderAccepted, was {accepted:?}");
+    };
+    let accepted_uuid = accepted_event.event_id;
+    let accepted_id = accepted_uuid.to_string();
+    let mut observations = collect_execution_telemetry(&telemetry, |events| {
+        [
+            WebSocketSendStage::FlushReturned,
+            WebSocketSendStage::AdapterResponseDecoded,
+        ]
+        .iter()
+        .all(|expected| {
+            events.iter().any(|observation| {
+                matches!(&observation.event, WebSocketObservationEvent::Send { request_id, stage }
+                    if request_id == &tx_hash && stage == expected)
+            })
+        })
+    })
+    .await;
+    assert_eq!(
+        cache.borrow().order(&cloid).unwrap().status(),
+        OrderStatus::Submitted
+    );
+    assert!(!observations.iter().any(|observation| {
+        matches!(&observation.event, WebSocketObservationEvent::NativeOrderApplied { event_id, .. }
+            if event_id == &accepted_id)
+    }), "adapter delivery must not be labeled native application");
+    engine.process(&accepted);
+    observations.extend(telemetry.drain());
+    assert!(matches!(cache.borrow().order(&cloid).unwrap().last_event(),
+        OrderEventAny::Accepted(event) if event.event_id == accepted_uuid));
+
+    entry["status"] = json!("canceled");
+    entry["remaining_base_amount"] = json!("0.0000");
+    state.push_frame(&order_frame(&entry));
+    let canceled = next_order_event(&mut rx, Duration::from_secs(2))
+        .await
+        .unwrap();
+    let OrderEventAny::Canceled(canceled_event) = &canceled else {
+        panic!("expected OrderCanceled, was {canceled:?}");
+    };
+    let canceled_id = canceled_event.event_id.to_string();
+    engine.process(&canceled);
+    observations.extend(telemetry.drain());
+    assert_eq!(
+        cache.borrow().order(&cloid).unwrap().status(),
+        OrderStatus::Canceled
+    );
+
+    let signing = execution_telemetry_stage(
+        &observations,
+        cloid.as_str(),
+        WebSocketSendStage::SigningStarted,
+    );
+    let mut previous = signing
+        .monotonic_ns
+        .expect("signing must use the collector clock");
+    assert!(signing.ts_init > 0);
+
+    for stage in [
+        WebSocketSendStage::SigningFinished,
+        WebSocketSendStage::NonceWaitStarted,
+        WebSocketSendStage::NonceReady,
+        WebSocketSendStage::QuotaWaitStarted,
+        WebSocketSendStage::QuotaReady,
+        WebSocketSendStage::Enqueued,
+        WebSocketSendStage::WriterStarted,
+    ] {
+        let observed = execution_telemetry_stage(&observations, &tx_hash, stage);
+        let monotonic_ns = observed
+            .monotonic_ns
+            .expect("send stage must use the collector clock");
+        assert!(
+            monotonic_ns >= previous,
+            "{stage:?} regressed on the collector clock"
+        );
+        assert!(observed.ts_init > 0);
+        assert_eq!(
+            (
+                observed.owner_id,
+                observed.generation,
+                observed.connection_epoch
+            ),
+            (
+                signing.owner_id,
+                signing.generation,
+                signing.connection_epoch
+            )
+        );
+        previous = monotonic_ns;
+    }
+    assert!(
+        signing.generation > 0,
+        "telemetry must use the naturally connected client generation"
+    );
+    let flush =
+        execution_telemetry_stage(&observations, &tx_hash, WebSocketSendStage::FlushReturned);
+    let raw = execution_telemetry_stage(
+        &observations,
+        &tx_hash,
+        WebSocketSendStage::RawResponseReceived,
+    );
+    let decoded = execution_telemetry_stage(
+        &observations,
+        &tx_hash,
+        WebSocketSendStage::AdapterResponseDecoded,
+    );
+    assert!(flush.monotonic_ns.unwrap() >= previous);
+    assert!(raw.monotonic_ns.unwrap() >= previous);
+    assert!(decoded.monotonic_ns.unwrap() >= raw.monotonic_ns.unwrap());
+    // A response can beat the sender's flush return: no ordering is asserted between them.
+    let order_raw = execution_telemetry_stage(
+        &observations,
+        cloid.as_str(),
+        WebSocketSendStage::RawOrderReceived,
+    );
+    let order_decoded = execution_telemetry_stage(
+        &observations,
+        cloid.as_str(),
+        WebSocketSendStage::AdapterOrderDecoded,
+    );
+    let dispatch = execution_telemetry_stage(
+        &observations,
+        cloid.as_str(),
+        WebSocketSendStage::NativeOrderDispatchStarted,
+    );
+    assert!(order_decoded.monotonic_ns.unwrap() >= order_raw.monotonic_ns.unwrap());
+    assert!(dispatch.monotonic_ns.unwrap() >= order_decoded.monotonic_ns.unwrap());
+    for observed in [flush, raw, decoded, order_raw, order_decoded, dispatch] {
+        assert_eq!(
+            (
+                observed.owner_id,
+                observed.generation,
+                observed.connection_epoch
+            ),
+            (
+                signing.owner_id,
+                signing.generation,
+                signing.connection_epoch
+            )
+        );
+    }
+    assert!(observations.iter().any(|observation| {
+        matches!(&observation.event, WebSocketObservationEvent::Correlation { origin_id, request_id }
+            if origin_id == cloid.as_str() && request_id == &tx_hash)
+    }));
+
+    for (id, terminal) in [(&accepted_id, false), (&canceled_id, true)] {
+        let applied: Vec<_> = observations.iter().filter(|observation| {
+            matches!(&observation.event, WebSocketObservationEvent::NativeOrderApplied {
+                client_order_id, event_id, terminal: actual_terminal, ..
+            } if client_order_id == cloid.as_str() && event_id == id && *actual_terminal == terminal)
+        }).collect();
+        assert_eq!(
+            applied.len(),
+            1,
+            "native event {id} must have one truthful application marker"
+        );
+        assert!(applied[0].monotonic_ns.unwrap() >= dispatch.monotonic_ns.unwrap());
+    }
+    assert_eq!(telemetry.dropped(), 0);
+    client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[tokio::test]
+async fn execution_telemetry_keeps_bare_ack_unmatched() {
+    set_message_bus(Rc::new(RefCell::new(MessageBus::new(
+        trader_id(),
+        UUID4::new(),
+        None,
+        None,
+    ))));
+    let (addr, state) = start_server().await;
+    let telemetry = WebSocketTelemetry::new();
+    let mut config = build_config(addr);
+    config.ws_telemetry = Some(telemetry.clone());
+    let (mut client, mut rx, cache) = build_client_with(config);
+    client.connect().await.unwrap();
+    let _ = telemetry.drain();
+    let order = make_limit_order(
+        "O-UNMATCHED-ACK",
+        OrderSide::Buy,
+        Quantity::from("0.0050"),
+        Price::from("2361.31"),
+        TimeInForce::Gtc,
+        false,
+        false,
+    );
+    cache_order(&cache, order.clone());
+    client.submit_order(submit_command(&order)).unwrap();
+    assert!(matches!(
+        next_order_event(&mut rx, Duration::from_secs(2)).await,
+        Some(OrderEventAny::Submitted(_))
+    ));
+    await_send_tx_count(&state, 1).await;
+    // This mock's default acknowledgement has only type and code, with no transaction hash.
+    let observations = collect_execution_telemetry(&telemetry, |events| {
+        events.iter().any(|observation| {
+            matches!(
+                &observation.event,
+                WebSocketObservationEvent::UnmatchedResponse {
+                    stage: WebSocketSendStage::AdapterResponseDecoded
+                }
+            )
+        })
+    })
+    .await;
+    assert!(observations.iter().any(|observation| matches!(
+        &observation.event,
+        WebSocketObservationEvent::UnmatchedResponse {
+            stage: WebSocketSendStage::RawResponseReceived
+        }
+    )));
+    assert!(
+        !observations.iter().any(|observation| matches!(
+            &observation.event,
+            WebSocketObservationEvent::Send {
+                stage: WebSocketSendStage::RawResponseReceived
+                    | WebSocketSendStage::AdapterResponseDecoded,
+                ..
+            }
+        )),
+        "an unidentified response must not be assigned to the only pending request"
+    );
+    assert!(
+        !observations.iter().any(|observation| matches!(
+            &observation.event,
+            WebSocketObservationEvent::NativeOrderApplied { .. }
+        )),
+        "an unprocessed native order event must not be labeled applied"
+    );
+    assert_eq!(telemetry.dropped(), 0);
+    client.disconnect().await.unwrap();
+}
+
+#[tokio::test]
+async fn planned_route_replacement_preserves_unknown_create_and_nonce_gate() {
+    use nautilus_network::websocket::{WebSocketRoutePolicy, WebSocketRouteResult};
+
+    use crate::common::consts::HEARTBEAT_INTERVAL;
+
+    set_message_bus(Rc::new(RefCell::new(MessageBus::new(
+        trader_id(),
+        UUID4::new(),
+        None,
+        None,
+    ))));
+    let (addr, state) = start_server().await;
+    let route = Arc::new(PlannedRouteFixture::default());
+    *state.planned_route.lock().await = Some(route.clone());
+    let telemetry = WebSocketTelemetry::new();
+    let mut config = build_config(addr);
+    config.ws_telemetry = Some(telemetry.clone());
+    config.ws_route_policy = Some(WebSocketRoutePolicy {
+        minimum_dwell_secs: 1,
+        maximum_replacements_per_hour: 1,
+        candidate_timeout_ms: 10_000,
+        ..WebSocketRoutePolicy::default()
+    });
+    let (mut client, mut rx, cache) = build_client_with(config);
+    client.connect().await.unwrap();
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
+    let mut engine = ExecutionEngine::new(clock, cache.clone(), None);
+    let mut observations = telemetry.drain();
+    let old_epoch = observations
+        .iter()
+        .find_map(|observation| {
+            matches!(
+                observation.event,
+                WebSocketObservationEvent::Connected { .. }
+            )
+            .then_some(observation.connection_epoch)
+        })
+        .expect("real initial transport observation");
+
+    // Advance only idle heartbeat scheduling, before any create is submitted. Resume real time
+    // for each actual socket ping/Pong, so the old RTT is measured rather than injected. This is
+    // the same pause/advance/resume boundary used by the scheduled-cancel integration fixture.
+    for target in 1..=3 {
+        let count = observations
+            .iter()
+            .filter(|observation| {
+                observation.connection_epoch == old_epoch
+                    && matches!(
+                        observation.event,
+                        WebSocketObservationEvent::RoundTrip { .. }
+                    )
+            })
+            .count();
+        if count < target {
+            tokio::time::pause();
+            tokio::time::advance(HEARTBEAT_INTERVAL).await;
+            tokio::time::resume();
+            observations.extend(
+                collect_execution_telemetry(&telemetry, |events| {
+                    events.iter().any(|observation| {
+                        observation.connection_epoch == old_epoch
+                            && matches!(
+                                observation.event,
+                                WebSocketObservationEvent::RoundTrip { .. }
+                            )
+                    })
+                })
+                .await,
+            );
+        }
+    }
+    tokio::time::timeout(
+        Duration::from_secs(3),
+        route.candidate_probe_started.notified(),
+    )
+    .await
+    .expect("quality policy dialed and probed a candidate");
+    assert_eq!(route.connections.load(Ordering::Acquire), 2);
+    assert!(route.old_flow_frames.load(Ordering::Acquire) > 0);
+    // Discard earlier reports and require a fresh native execution report while the candidate
+    // probe is blocked. This observes the account frame through the real adapter/consumer path.
+    while rx.try_recv().is_ok() {}
+
+    next_event_matching(&mut rx, Duration::from_secs(2), |event| {
+        matches!(event, ExecutionEvent::Report(ExecutionReport::Order(report))
+            if report.venue_order_id == VenueOrderId::from("281476929599452"))
+    })
+    .await
+    .expect("old account stream remains active during candidate validation");
+    assert!(
+        route
+            .subscriptions
+            .lock()
+            .await
+            .iter()
+            .all(|(connection, _)| *connection == 1),
+        "the candidate must remain unsubscribed until it is installed"
+    );
+    assert!(
+        !observations.iter().any(|observation| matches!(
+            observation.event,
+            WebSocketObservationEvent::RouteEvaluation {
+                result: WebSocketRouteResult::Installed,
+                ..
+            }
+        )),
+        "the first candidate probe is still blocked"
+    );
+    let old_rtts: Vec<_> = observations
+        .iter()
+        .filter_map(|observation| match observation.event {
+            WebSocketObservationEvent::RoundTrip { round_trip_ns, .. }
+                if observation.connection_epoch == old_epoch =>
+            {
+                Some(round_trip_ns)
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(
+        old_rtts.len() >= 3
+            && old_rtts
+                .iter()
+                .rev()
+                .take(3)
+                .all(|rtt| (50_000_000..=1_000_000_000).contains(rtt))
+    );
+
+    // The current socket still writes a real create while candidate validation is suspended.
+    // Drop its ACK and block the normal order lookup until the recovery evidence is ready.
+    *state.next_send_tx_ack.lock().await = Some(Value::Null);
+    state
+        .account_orders_response_blocked
+        .store(true, Ordering::Release);
+    let original = make_limit_order(
+        "O-PLANNED-ROUTE-UNKNOWN",
+        OrderSide::Buy,
+        Quantity::from("0.0050"),
+        Price::from("2361.31"),
+        TimeInForce::Ioc,
+        false,
+        false,
+    );
+    let original_id = original.client_order_id();
+    cache_order(&cache, original.clone());
+    client.submit_order(submit_command(&original)).unwrap();
+    let submitted = next_order_event(&mut rx, Duration::from_secs(2))
+        .await
+        .unwrap();
+    assert!(
+        matches!(submitted, OrderEventAny::Submitted(ref event) if event.client_order_id == original_id)
+    );
+    engine.process(&submitted);
+    await_send_tx_count(&state, 1).await;
+    assert_eq!(*route.send_connections.lock().await, vec![1]);
+    let frame = state.send_txs().await[0].clone();
+    let info = send_tx_info(&frame);
+    let nonce = info["Nonce"].as_i64().unwrap();
+    let index = info["ClientOrderIndex"].as_i64().unwrap();
+    let tx_hash = order_tx_hash(send_tx_type(&frame), &info, LIGHTER_TESTNET_CHAIN_ID);
+    state.next_nonce.store(nonce + 1, Ordering::Release);
+    state.tx_responses.lock().await.push_back(json!({
+        "status": 2, "event_info": json!({"ae": ""}).to_string(),
+    }));
+    let mut venue_order = http_order_fixture(
+        "281476929510552",
+        &index.to_string(),
+        "canceled-not-enough-liquidity",
+        "0.0000",
+    );
+    venue_order["nonce"] = json!(nonce);
+    venue_order["remaining_base_amount"] = json!("0.0000");
+    *state.account_orders_response.lock().await =
+        Some(json!({"code": 200, "orders": [venue_order]}));
+    let mut nonce_requests = state.next_nonce_requested.subscribe();
+    let mut nonce_responses = state.next_nonce_response_ready.subscribe();
+    state
+        .next_nonce_response_delay_ms
+        .store(2_000, Ordering::Release);
+    route.release_candidate_probe.notify_one();
+    let recovered_nonce = tokio::time::timeout(Duration::from_secs(5), nonce_requests.recv())
+        .await
+        .expect("adopted transport requested nonce recovery")
+        .unwrap();
+    assert_eq!(recovered_nonce, nonce + 1);
+
+    // Connected transport is not nonce-ready. Native admission must deny this different order,
+    // without a signature or a second wire create, while the real HTTP nonce response is delayed.
+    let blocked = make_limit_order(
+        "O-PLANNED-ROUTE-NOT-READY",
+        OrderSide::Buy,
+        Quantity::from("0.0050"),
+        Price::from("2361.31"),
+        TimeInForce::Ioc,
+        false,
+        false,
+    );
+    let blocked_id = blocked.client_order_id();
+    cache_order(&cache, blocked.clone());
+    client.submit_order(submit_command(&blocked)).unwrap();
+    let denied = next_order_event(&mut rx, Duration::from_secs(1))
+        .await
+        .unwrap();
+    assert!(
+        matches!(denied, OrderEventAny::Denied(ref event)
+        if event.client_order_id == blocked_id && event.reason.to_string().contains("nonce")),
+        "a new order must fail native nonce admission, was {denied:?}"
+    );
+    engine.process(&denied);
+    assert_eq!(state.send_txs().await.len(), 1);
+    state
+        .account_orders_response_blocked
+        .store(false, Ordering::Release);
+    state.account_orders_response_release.notify_one();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(4), nonce_responses.recv())
+            .await
+            .expect("native nonce recovery completed")
+            .unwrap(),
+        nonce + 1
+    );
+
+    let mut recovered_events = Vec::new();
+
+    while let Some(event) = next_order_event(&mut rx, Duration::from_secs(6)).await {
+        assert_eq!(event.client_order_id(), original_id);
+        let terminal = matches!(event, OrderEventAny::Canceled(_));
+        engine.process(&event);
+        recovered_events.push(event);
+
+        if terminal {
+            break;
+        }
+    }
+    assert!(
+        matches!(
+            recovered_events.as_slice(),
+            [OrderEventAny::Accepted(_), OrderEventAny::Canceled(_)]
+        ),
+        "the original IOC must settle through existing transaction/order reconciliation: {recovered_events:?}"
+    );
+    assert!(state.tx_calls.load(Ordering::Acquire) > 0);
+    assert!(state.account_orders_calls.load(Ordering::Acquire) > 0);
+    assert_eq!(
+        cache.borrow().order(&original_id).unwrap().status(),
+        OrderStatus::Canceled
+    );
+    assert_eq!(
+        cache.borrow().order(&blocked_id).unwrap().status(),
+        OrderStatus::Denied
+    );
+    let terminal_id = match recovered_events.last().unwrap() {
+        OrderEventAny::Canceled(event) => event.event_id.to_string(),
+        _ => unreachable!(),
+    };
+    observations.extend(
+        collect_execution_telemetry(&telemetry, |events| {
+            events.iter().any(|observation| {
+                matches!(&observation.event,
+            WebSocketObservationEvent::NativeOrderApplied { event_id, terminal: true, .. }
+                if event_id == &terminal_id)
+            })
+        })
+        .await,
+    );
+    let installed = observations
+        .iter()
+        .find(|observation| {
+            matches!(
+                observation.event,
+                WebSocketObservationEvent::RouteEvaluation {
+                    result: WebSocketRouteResult::Installed,
+                    ..
+                }
+            )
+        })
+        .expect("the native controller installed its verified candidate");
+    assert!(installed.connection_epoch > old_epoch);
+    assert_eq!(
+        route.connections.load(Ordering::Acquire),
+        2,
+        "installation must adopt the validated socket rather than dial another one"
+    );
+    assert!(
+        route
+            .subscriptions
+            .lock()
+            .await
+            .iter()
+            .any(|(connection, _)| *connection == 2)
+    );
+    assert_eq!(*route.send_connections.lock().await, vec![1]);
+    assert_eq!(state.send_txs().await, vec![frame]);
+    assert!(state.rest_send_txs.lock().await.is_empty());
+    assert!(
+        !observations
+            .iter()
+            .any(|observation| matches!(&observation.event,
+        WebSocketObservationEvent::Send { request_id, stage: WebSocketSendStage::SigningStarted }
+            if request_id == blocked_id.as_str()))
+    );
+    assert!(!observations.iter().any(|observation| matches!(&observation.event,
+        WebSocketObservationEvent::Send { request_id, stage: WebSocketSendStage::RawResponseReceived | WebSocketSendStage::AdapterResponseDecoded }
+            if request_id == &tx_hash)), "the dropped ACK was never manufactured");
+    // Public ping quality proves only this route choice. No assertion treats it as send/fill RTT.
+    assert_eq!(telemetry.dropped(), 0);
+    client.disconnect().await.unwrap();
+    assert!(client.pending_tasks_all_finished());
 }

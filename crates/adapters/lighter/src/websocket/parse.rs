@@ -234,10 +234,9 @@ pub fn parse_ws_order_book_depth(
 
 /// Parses a Lighter ticker stream payload into a Nautilus [`QuoteTick`].
 ///
-/// Returns `Ok(None)` if either side carries an empty price/size string,
-/// which Lighter emits when one book side is currently uninhabited (no
-/// resting orders). A one-sided book cannot be expressed as a [`QuoteTick`],
-/// so the frame is skipped rather than rejected.
+/// Preserves an empty side as the wire's zero price or quantity. Publishing
+/// the complete observation replaces any previously cached two-sided quote;
+/// consumers requiring both sides must reject zero prices and quantities.
 ///
 /// # Errors
 ///
@@ -247,18 +246,7 @@ pub fn parse_ws_quote_tick(
     instrument: &InstrumentAny,
     timestamp_ms: u64,
     ts_init: UnixNanos,
-) -> anyhow::Result<Option<QuoteTick>> {
-    // Lighter sends zero (or empty string, mapped to zero by the wire deserializer)
-    // for a side that currently has no resting orders; a one-sided book cannot be
-    // expressed as a `QuoteTick`, so the frame is skipped rather than rejected.
-    if ticker.b.price.is_zero()
-        || ticker.b.size.is_zero()
-        || ticker.a.price.is_zero()
-        || ticker.a.size.is_zero()
-    {
-        return Ok(None);
-    }
-
+) -> anyhow::Result<QuoteTick> {
     let bid_price = price_from_decimal(ticker.b.price, instrument.price_precision())?;
     let ask_price = price_from_decimal(ticker.a.price, instrument.price_precision())?;
     let bid_size = quantity_from_decimal(ticker.b.size, instrument.size_precision())?;
@@ -274,7 +262,6 @@ pub fn parse_ws_quote_tick(
         ts_event,
         ts_init,
     )
-    .map(Some)
     .context("failed to construct QuoteTick from Lighter ticker")
 }
 
@@ -1582,9 +1569,8 @@ mod tests {
             last_updated_at: 1774883844921166,
         };
 
-        let quote = parse_ws_quote_tick(&ticker, &instrument, 1774883844933, UnixNanos::from(1))
-            .unwrap()
-            .expect("two-sided ticker yields a quote");
+        let quote =
+            parse_ws_quote_tick(&ticker, &instrument, 1774883844933, UnixNanos::from(1)).unwrap();
 
         assert_eq!(quote.instrument_id, instrument.id());
         assert_eq!(quote.bid_price, Price::from("2064.30"));
@@ -1595,19 +1581,27 @@ mod tests {
     }
 
     #[rstest]
-    fn test_parse_ws_quote_tick_skips_one_sided_book() {
+    #[case::empty_bid("0", "0", "2064.48", "0.4950")]
+    #[case::empty_ask("2064.30", "1.0392", "0", "0")]
+    #[case::empty_book("0", "0", "0", "0")]
+    #[case::zero_bid_size("2064.30", "0", "2064.48", "0.4950")]
+    #[case::zero_ask_size("2064.30", "1.0392", "2064.48", "0")]
+    fn test_parse_ws_quote_tick_preserves_empty_sides(
+        #[case] bid_price: &str,
+        #[case] bid_size: &str,
+        #[case] ask_price: &str,
+        #[case] ask_size: &str,
+    ) {
         let instrument = create_test_instrument();
         let ticker = LighterTicker {
             s: Ustr::from("ETH"),
             a: LighterPriceLevel {
-                price: Decimal::from_str("2064.48").unwrap(),
-                size: Decimal::from_str("0.4950").unwrap(),
+                price: Decimal::from_str(ask_price).unwrap(),
+                size: Decimal::from_str(ask_size).unwrap(),
             },
             b: LighterPriceLevel {
-                // Lighter emits empty strings when one side has no resting
-                // orders; the wire deserializer maps those to `Decimal::ZERO`.
-                price: Decimal::ZERO,
-                size: Decimal::ZERO,
+                price: Decimal::from_str(bid_price).unwrap(),
+                size: Decimal::from_str(bid_size).unwrap(),
             },
             last_updated_at: 1774883844921166,
         };
@@ -1615,7 +1609,13 @@ mod tests {
         let result =
             parse_ws_quote_tick(&ticker, &instrument, 1774883844933, UnixNanos::from(1)).unwrap();
 
-        assert!(result.is_none());
+        assert_eq!(result.instrument_id, instrument.id());
+        assert_eq!(result.bid_price.as_decimal(), ticker.b.price);
+        assert_eq!(result.ask_price.as_decimal(), ticker.a.price);
+        assert_eq!(result.bid_size.as_decimal(), ticker.b.size);
+        assert_eq!(result.ask_size.as_decimal(), ticker.a.size);
+        assert_eq!(result.ts_event, UnixNanos::from(1_774_883_844_933_000_000));
+        assert_eq!(result.ts_init, UnixNanos::from(1));
     }
 
     #[rstest]

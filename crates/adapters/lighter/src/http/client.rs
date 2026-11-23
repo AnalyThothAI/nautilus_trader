@@ -28,8 +28,8 @@ use nautilus_model::{
 };
 use nautilus_network::{
     http::{
-        HttpClient, HttpRedirectPolicy, HttpResponse, Method, create_standard_nautilus_headers,
-        parse_retry_after,
+        HttpClient, HttpRedirectPolicy, HttpRequestTrace, HttpResponse, Method,
+        create_standard_nautilus_headers, parse_retry_after,
     },
     ratelimiter::quota::Quota,
     retry::{RetryManager, create_http_retry_manager},
@@ -217,6 +217,34 @@ impl LighterRawHttpClient {
         default_quota: Quota,
         tx_rate_limiter: Option<Arc<LighterTxRateLimiter>>,
     ) -> LighterHttpResult<Self> {
+        Self::new_with_quotas_and_timing(
+            environment,
+            base_url,
+            timeout_secs,
+            proxy_url,
+            default_quota,
+            tx_rate_limiter,
+            false,
+        )
+    }
+
+    /// Creates a raw client with opt-in, content-free connection timing.
+    ///
+    /// Timing is consumed by the single-attempt traced read methods. Ordinary calls keep their
+    /// existing retry behavior; connection timing does not imply a request-specific wire time.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the underlying HTTP client cannot be created.
+    pub fn new_with_quotas_and_timing(
+        environment: LighterEnvironment,
+        base_url: Option<String>,
+        timeout_secs: u64,
+        proxy_url: Option<String>,
+        default_quota: Quota,
+        tx_rate_limiter: Option<Arc<LighterTxRateLimiter>>,
+        connection_timing: bool,
+    ) -> LighterHttpResult<Self> {
         let base_url = base_url
             .unwrap_or_else(|| lighter_http_base_url(environment).to_string())
             .trim_end_matches('/')
@@ -232,6 +260,7 @@ impl LighterRawHttpClient {
                 .default_quota(default_quota)
                 .timeout_secs(timeout_secs)
                 .maybe_proxy_url(proxy_url)
+                .connection_timing(connection_timing)
                 .build()?,
             retry_manager: create_http_retry_manager(),
             tx_rate_limiter,
@@ -298,6 +327,56 @@ impl LighterRawHttpClient {
     ) -> LighterHttpResult<LighterOrderBookOrders> {
         self.send_get_request(ENDPOINT_ORDER_BOOK_ORDERS, Some(query))
             .await
+    }
+
+    /// Reads market metadata once, with no adapter or transport retry and with timing evidence.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if transport, response status, or payload validation fails, without retrying.
+    pub async fn get_order_book_details_once_with_trace(
+        &self,
+        query: &LighterOrderBookDetailsQuery,
+        trace: &HttpRequestTrace,
+    ) -> LighterHttpResult<LighterOrderBookDetails> {
+        self.send_get_once_with_trace(ENDPOINT_ORDER_BOOK_DETAILS, query, trace)
+            .await
+    }
+
+    /// Reads touch ownership once, with no adapter or transport retry and with timing evidence.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if transport, response status, or payload validation fails, without retrying.
+    pub async fn get_order_book_orders_once_with_trace(
+        &self,
+        query: &LighterOrderBookOrdersQuery,
+        trace: &HttpRequestTrace,
+    ) -> LighterHttpResult<LighterOrderBookOrders> {
+        self.send_get_once_with_trace(ENDPOINT_ORDER_BOOK_ORDERS, query, trace)
+            .await
+    }
+
+    async fn send_get_once_with_trace<T: DeserializeOwned + LighterResponseCheck, P: Serialize>(
+        &self,
+        endpoint: &str,
+        query: &P,
+        trace: &HttpRequestTrace,
+    ) -> LighterHttpResult<T> {
+        let response = self
+            .client
+            .request_once_with_params_and_trace(
+                Method::GET,
+                self.url(endpoint),
+                Some(query),
+                None,
+                None,
+                None,
+                Some(Self::rate_limit_keys(endpoint)),
+                trace,
+            )
+            .await?;
+        Self::parse_response(&response)
     }
 
     /// Calls `GET /api/v1/recentTrades`.
