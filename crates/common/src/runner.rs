@@ -34,10 +34,39 @@ use ahash::AHashMap;
 
 use crate::{
     actor::ChainContext,
-    messages::{data::DataCommand, execution::TradingCommand},
+    messages::{DataEvent, data::DataCommand, execution::TradingCommand},
     msgbus::{self, Endpoint, MStr, MessagingSwitchboard},
     timer::{TimeEvent, TimeEventCallback, TimeEventHandler},
 };
+
+/// Routes one input to the owning native `DataEngine` endpoint.
+///
+/// Live and observed replay establish their observation scope before this shared dispatch.
+/// This function does not re-enter an engine from a subscriber or synthesize strategy callbacks.
+pub fn dispatch_data_event(event: DataEvent) {
+    match event {
+        DataEvent::Data(data) => {
+            msgbus::send_data(MessagingSwitchboard::data_engine_process_data(), data);
+        }
+        DataEvent::ResponseEnvelope(response) => {
+            msgbus::send_any(MessagingSwitchboard::data_engine_process(), &response);
+        }
+        DataEvent::RequestFailed(failure) => {
+            msgbus::send_any(MessagingSwitchboard::data_engine_process(), &failure);
+        }
+        DataEvent::Response(response) => {
+            msgbus::send_data_response(MessagingSwitchboard::data_engine_response(), response);
+        }
+        #[cfg(feature = "defi")]
+        DataEvent::DeFi(data) => {
+            msgbus::send_defi_data(MessagingSwitchboard::data_engine_process_defi_data(), data);
+        }
+        #[cfg(feature = "defi")]
+        DataEvent::PoolSnapshotResponse(response) => {
+            msgbus::send_any(MessagingSwitchboard::data_engine_process(), &response);
+        }
+    }
+}
 
 const CALLBACK_CLOSED: usize = 1 << (usize::BITS - 1);
 const CALLBACK_LEASES: usize = CALLBACK_CLOSED - 1;

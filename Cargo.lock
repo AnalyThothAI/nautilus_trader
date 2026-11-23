@@ -5643,6 +5643,7 @@ dependencies = [
  "nautilus-data",
  "nautilus-execution",
  "nautilus-indicators",
+ "nautilus-live",
  "nautilus-model",
  "nautilus-persistence",
  "nautilus-portfolio",

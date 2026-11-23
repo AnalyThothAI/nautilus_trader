@@ -79,10 +79,11 @@ use nautilus_common::{
         execution::TradingCommand,
     },
     msgbus::{self, MessagingSwitchboard},
+    observation::observe_data_event,
     runner::{
         DataCommandSender, TimeEventMessage, TimeEventSender, TradingCommandMessage,
-        TradingCommandSender, replace_data_cmd_sender, replace_exec_cmd_sender,
-        replace_time_event_sender,
+        TradingCommandSender, dispatch_data_event as dispatch_native_data_event,
+        replace_data_cmd_sender, replace_exec_cmd_sender, replace_time_event_sender,
     },
 };
 use nautilus_model::events::OrderEventAny;
@@ -543,36 +544,32 @@ impl AsyncRunner {
     /// Handles a data event by sending to the appropriate `DataEngine` endpoint.
     #[inline]
     pub fn handle_data_event(event: DataEvent) {
-        match event {
-            DataEvent::Data(data) => {
-                msgbus::send_data(MessagingSwitchboard::data_engine_process_data(), data);
+        let _observation = match observe_data_event(&event) {
+            Ok(scope) => scope,
+            Err(e) => {
+                // The run owner checks the recorder's sticky failure before sealing
+                log::error!("Observed data ingress stopped: {e:#}");
+                return;
             }
-            DataEvent::ResponseEnvelope(response) => {
-                msgbus::send_any(MessagingSwitchboard::data_engine_process(), &response);
-            }
-            DataEvent::RequestFailed(failure) => {
-                msgbus::send_any(MessagingSwitchboard::data_engine_process(), &failure);
-            }
-            DataEvent::Response(resp) => {
-                msgbus::send_data_response(MessagingSwitchboard::data_engine_response(), resp);
-            }
-            #[cfg(feature = "defi")]
-            DataEvent::DeFi(data) => {
-                msgbus::send_defi_data(MessagingSwitchboard::data_engine_process_defi_data(), data);
-            }
-            #[cfg(feature = "defi")]
-            DataEvent::PoolSnapshotResponse(response) => {
-                msgbus::send_any(MessagingSwitchboard::data_engine_process(), &response);
-            }
-            #[cfg(not(feature = "defi"))]
+        };
+        #[cfg(not(feature = "defi"))]
+        let event = match event {
+            event @ (DataEvent::Data(_)
+            | DataEvent::ResponseEnvelope(_)
+            | DataEvent::RequestFailed(_)
+            | DataEvent::Response(_)) => event,
             #[allow(
                 unreachable_patterns,
                 reason = "DeFi variants can exist without this crate's defi feature"
             )]
-            other => log::error!(
-                "Cannot handle {other} data event, nautilus-live built without its `defi` feature"
-            ),
-        }
+            other => {
+                log::error!(
+                    "Cannot handle {other} data event, nautilus-live built without its `defi` feature"
+                );
+                return;
+            }
+        };
+        dispatch_native_data_event(event);
     }
 
     /// Dispatches an internal execution command directly to the execution engine.
@@ -844,6 +841,40 @@ mod tests {
     use ustr::Ustr;
 
     use super::*;
+
+    #[tokio::test]
+    async fn recording_failure_stops_before_data_dispatch_and_next_ingress() {
+        use nautilus_common::observation::DataObservationRecorder;
+
+        actor::clear_callbacks().unwrap();
+        let mut runner = AsyncRunner::new();
+        let received = Rc::new(RefCell::new(Vec::new()));
+        let delivered = received.clone();
+        msgbus::register_data_endpoint(
+            MessagingSwitchboard::data_engine_process_data(),
+            TypedIntoHandler::from(move |data| delivered.borrow_mut().push(data)),
+        );
+        let recorder =
+            DataObservationRecorder::install(Rc::new(RefCell::new(VirtualClock::new())), |_, _| {
+                anyhow::bail!("recording write failed")
+            })
+            .unwrap();
+
+        for _ in 0..2 {
+            runner
+                .data_evt_tx
+                .send(DataEvent::Data(Data::Quote(test_quote())).into())
+                .unwrap();
+        }
+        let error = runner.run().await.unwrap_err();
+        assert!(error.to_string().contains("recording write failed"));
+        assert!(received.borrow().is_empty());
+        assert_eq!(runner.channels.data_evt_rx.len(), 1);
+        assert_eq!(recorder.last_observation(), None);
+        assert!(recorder.check_error().is_err());
+        drop(recorder);
+        actor::clear_callbacks().unwrap();
+    }
 
     #[rstest]
     fn test_runner_dispatches_typed_data_once_in_order() {

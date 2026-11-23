@@ -24,7 +24,9 @@ use ahash::AHashSet;
 use bytes::Bytes;
 #[cfg(feature = "defi")]
 use nautilus_model::defi::{
-    Pool, PoolProfiler, SharedPool, data::canonical::CanonicalAnchor, pool_analysis::PoolSnapshot,
+    Pool, PoolProfiler, SharedPool,
+    data::{Block, canonical::CanonicalAnchor},
+    pool_analysis::PoolSnapshot,
 };
 use nautilus_model::{
     accounts::AccountAny,
@@ -2038,6 +2040,23 @@ impl<'a> CacheApi<'a> {
     #[must_use]
     pub fn pool_profiler(&self, instrument_id: &InstrumentId) -> Option<PoolProfiler> {
         self.cache().pool_profiler(instrument_id).cloned()
+    }
+
+    /// Returns the original latest head and its first native consuming observation for a chain.
+    ///
+    /// This remains available when the block was consumed during native client connection, before
+    /// the actor started. Duplicate inputs for the current hash do not refresh its observation.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the cache is already mutably borrowed.
+    #[cfg(feature = "defi")]
+    #[must_use]
+    pub fn latest_observed_block(
+        &self,
+        chain_id: u32,
+    ) -> Option<(Block, crate::observation::ObservationKey)> {
+        self.cache().latest_observed_block(chain_id)
     }
 
     /// Returns the trust state of a pool managed by complete canonical batches.

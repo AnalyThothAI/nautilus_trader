@@ -57,6 +57,8 @@
 
 mod batch;
 mod iterator;
+mod observed;
 
 pub use batch::ReplayBatch;
 pub use iterator::{DataIterator, ReplayKey, ReplayPoll, ReplaySource};
+pub use observed::ObservedDataIterator;

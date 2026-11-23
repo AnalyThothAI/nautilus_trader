@@ -28,6 +28,7 @@ use nautilus_common::{
         RequestPoolSnapshot,
     },
     msgbus::{self, TypedHandler},
+    observation::current_data_observation,
 };
 use nautilus_core::UUID4;
 use nautilus_model::{
@@ -744,6 +745,18 @@ impl DataEngine {
                 self.invalidate_canonical_state(&invalidation);
             }
             DefiData::Block(block) => {
+                // Startup flushes native data before actors start. Retain the consuming identity
+                // in the native cache before publishing, without inventing an observation for
+                // ordinary historical replay or retaining a strategy-side head mirror.
+                if let Some(at) = current_data_observation()
+                    && let Err(e) = self
+                        .cache()
+                        .borrow_mut()
+                        .add_observed_block(block.clone(), at)
+                {
+                    log::error!("Observed block rejected: {e}");
+                    return;
+                }
                 let topic = defi::switchboard::get_defi_blocks_topic(block.chain());
                 msgbus::publish_defi_block(topic, &block);
             }
