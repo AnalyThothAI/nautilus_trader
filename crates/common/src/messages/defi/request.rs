@@ -14,7 +14,10 @@
 // -------------------------------------------------------------------------------------------------
 
 use nautilus_core::{Params, UUID4, UnixNanos};
-use nautilus_model::identifiers::{ClientId, InstrumentId};
+use nautilus_model::{
+    defi::data::canonical::CanonicalAnchor,
+    identifiers::{ClientId, InstrumentId},
+};
 use serde::{Deserialize, Serialize};
 
 /// Represents a request for a pool snapshot from a specific AMM pool.
@@ -25,6 +28,9 @@ pub struct RequestPoolSnapshot {
     pub request_id: UUID4,
     pub ts_init: UnixNanos,
     pub params: Option<Params>,
+    /// Explicit hash-bound canonical state required by this request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canonical_anchor: Option<CanonicalAnchor>,
 }
 
 impl RequestPoolSnapshot {
@@ -43,6 +49,14 @@ impl RequestPoolSnapshot {
             request_id,
             ts_init,
             params,
+            canonical_anchor: None,
         }
+    }
+
+    /// Attaches the explicit canonical identity of this hydration.
+    #[must_use]
+    pub fn with_canonical_anchor(mut self, anchor: CanonicalAnchor) -> Self {
+        self.canonical_anchor = Some(anchor);
+        self
     }
 }

@@ -16,14 +16,14 @@
 use std::{any::Any, fmt::Debug};
 
 use nautilus_common::{
-    config::{ConfigResult, check_unique_values},
+    config::{ConfigResult, check_unique_values, check_valid_format},
     factories::ClientConfig,
 };
 use nautilus_core::string::secret::{REDACTED, SecretString};
 use nautilus_infrastructure::sql::pg::PostgresConnectOptions;
 use nautilus_model::{
     defi::{Chain, DexType, SharedChain},
-    identifiers::AccountId,
+    identifiers::{AccountId, InstrumentId},
 };
 use nautilus_network::websocket::TransportBackend;
 use serde::{Deserialize, Serialize};
@@ -51,6 +51,24 @@ impl Default for DexPoolFilters {
     }
 }
 
+/// Required source and recovery limits for a complete canonical pool feed.
+#[derive(Debug, Clone, Serialize, Deserialize, bon::Builder)]
+#[serde(deny_unknown_fields)]
+pub struct CanonicalPoolDataConfig {
+    /// The fixed pool universe, already discovered in the native cache database.
+    pub pools: Vec<InstrumentId>,
+    /// The explicit checkpoint height from which the run starts.
+    pub start_block: u64,
+    /// Expected hash of the initial checkpoint before any persisted recovery anchor exists.
+    pub start_hash: alloy::primitives::B256,
+    /// The maximum number of parent blocks searched for a trusted common ancestor.
+    pub max_reorg_depth: u64,
+    /// The head polling interval, in milliseconds.
+    pub poll_interval_ms: u64,
+    /// Upper bound for each RPC request, in seconds.
+    pub rpc_timeout_seconds: u64,
+}
+
 /// Configuration for blockchain data clients.
 #[derive(Debug, Clone, Serialize, Deserialize, bon::Builder)]
 #[serde(deny_unknown_fields)]
@@ -63,6 +81,10 @@ impl Default for DexPoolFilters {
     pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.blockchain")
 )]
 pub struct BlockchainDataClientConfig {
+    /// Opt-in complete, hash-bound pool batches with persistent recovery fencing.
+    pub canonical_pool_data: Option<CanonicalPoolDataConfig>,
+    /// Explicit HyperSync credential; research clients supply this from their credential files.
+    pub hypersync_api_token: Option<SecretString>,
     /// The blockchain chain configuration.
     pub chain: SharedChain,
     /// List of decentralized exchange IDs to register and sync during connection.
@@ -509,7 +531,67 @@ impl BlockchainDataClientConfig {
     ///
     /// Returns an error if a selection repeats a value.
     pub fn validate(&self) -> ConfigResult<()> {
-        check_unique_values("dex_ids", &self.dex_ids)
+        check_unique_values("dex_ids", &self.dex_ids)?;
+
+        if let Some(canonical) = &self.canonical_pool_data {
+            check_valid_format(
+                "canonical_pool_data.pools",
+                !canonical.pools.is_empty(),
+                "a nonempty fixed pool universe",
+            )?;
+            check_unique_values("canonical_pool_data.pools", &canonical.pools)?;
+            check_valid_format(
+                "canonical_pool_data.start_block",
+                canonical.start_block > 0,
+                "a positive explicit checkpoint",
+            )?;
+            check_valid_format(
+                "canonical_pool_data.start_hash",
+                !canonical.start_hash.is_zero(),
+                "a nonzero trusted checkpoint hash",
+            )?;
+            check_valid_format(
+                "canonical_pool_data.max_reorg_depth",
+                canonical.max_reorg_depth > 0,
+                "a positive recovery bound",
+            )?;
+            check_valid_format(
+                "canonical_pool_data.poll_interval_ms",
+                canonical.poll_interval_ms > 0,
+                "a positive polling interval",
+            )?;
+            check_valid_format(
+                "canonical_pool_data.rpc_timeout_seconds",
+                canonical.rpc_timeout_seconds > 0,
+                "a positive per-request timeout",
+            )?;
+            check_valid_format(
+                "postgres_cache_database_config",
+                self.postgres_cache_database_config.is_some(),
+                "a persistent native database for canonical recovery",
+            )?;
+            check_valid_format(
+                "hypersync_api_token",
+                self.hypersync_api_token.is_some(),
+                "an explicit credential for trusted topology bootstrap",
+            )?;
+            check_valid_format(
+                "use_hypersync_for_live_data",
+                !self.use_hypersync_for_live_data,
+                "false for the hash-bound RPC batch source",
+            )?;
+
+            for instrument in &canonical.pools {
+                check_valid_format(
+                    "canonical_pool_data.pools",
+                    instrument.venue.parse_dex().is_ok_and(|(chain, dex)| {
+                        chain == self.chain.name && dex == DexType::UniswapV3
+                    }),
+                    "Uniswap V3 instruments on the configured chain",
+                )?;
+            }
+        }
+        Ok(())
     }
 }
 

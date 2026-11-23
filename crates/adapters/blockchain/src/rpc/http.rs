@@ -16,10 +16,14 @@
 use std::{collections::HashMap, fmt::Debug, net::Ipv4Addr, num::NonZeroU32, str::FromStr};
 
 use alloy::primitives::{Address, B256, Bytes, U256};
+use anyhow::Context;
 use bytes::Bytes as HttpBytes;
 use nautilus_common::config::check_valid_format;
 use nautilus_core::{hex, string::secret::REDACTED};
-use nautilus_model::defi::rpc::{RpcLog, RpcNodeHttpResponse};
+use nautilus_model::defi::{
+    Block,
+    rpc::{RpcLog, RpcNodeHttpResponse},
+};
 use nautilus_network::{
     http::{
         HttpClient, HttpClientError, HttpRedirectPolicy, Method, Url,
@@ -48,6 +52,7 @@ pub struct BlockchainHttpRpcClient {
     http_rpc_url: String,
     /// The HTTP client for making RPC http-based requests.
     http_client: HttpClient,
+    request_timeout_seconds: Option<u64>,
 }
 
 impl Debug for BlockchainHttpRpcClient {
@@ -94,7 +99,21 @@ impl BlockchainHttpRpcClient {
         Ok(Self {
             http_rpc_url,
             http_client,
+            request_timeout_seconds: None,
         })
+    }
+
+    /// Sets an upper bound for every request made through this client.
+    ///
+    /// Method-specific limits can shorten this bound, but cannot extend it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the supplied timeout is zero.
+    pub fn with_request_timeout_seconds(mut self, seconds: u64) -> anyhow::Result<Self> {
+        anyhow::ensure!(seconds > 0, "RPC request timeout must be positive");
+        self.request_timeout_seconds = Some(seconds);
+        Ok(self)
     }
 
     /// Generic method that sends a JSON-RPC request and returns the raw response in bytes.
@@ -117,6 +136,10 @@ impl BlockchainHttpRpcClient {
         body_bytes: Vec<u8>,
         timeout_secs: Option<u64>,
     ) -> Result<HttpBytes, HttpClientError> {
+        let timeout_secs = match (self.request_timeout_seconds, timeout_secs) {
+            (Some(configured), Some(requested)) => Some(configured.min(requested)),
+            (configured, requested) => configured.or(requested),
+        };
         let mut headers = HashMap::new();
         headers.insert("Content-Type".to_string(), "application/json".to_string());
 
@@ -313,6 +336,89 @@ impl BlockchainHttpRpcClient {
         });
 
         self.execute_rpc_call(request).await
+    }
+
+    /// Returns the full latest mined header for the independent head observer.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the node cannot provide a complete mined header.
+    pub async fn latest_block_header(&self) -> anyhow::Result<Block> {
+        self.execute_execution_rpc_call::<Block>(
+            "eth_getBlockByNumber",
+            serde_json::json!(["latest", false]),
+        )
+        .await?
+        .context("Latest canonical header was absent")
+    }
+
+    /// Returns a full canonical block header at the requested height.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the response is absent, malformed, or has a different height.
+    pub async fn block_header_by_number(&self, number: u64) -> anyhow::Result<Block> {
+        let block: Block = self
+            .execute_execution_rpc_call::<Block>(
+                "eth_getBlockByNumber",
+                serde_json::json!([format!("0x{number:x}"), false]),
+            )
+            .await?
+            .context("Canonical block header was absent")?;
+        anyhow::ensure!(block.number == number, "Canonical header height mismatch");
+        Ok(block)
+    }
+
+    /// Returns the full header identified by an immutable block hash.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the response is absent, malformed, or has a different hash.
+    pub async fn block_header_by_hash(&self, hash: B256) -> anyhow::Result<Block> {
+        let block: Block = self
+            .execute_execution_rpc_call::<Block>(
+                "eth_getBlockByHash",
+                serde_json::json!([hash, false]),
+            )
+            .await?
+            .context("Hash-bound block header was absent")?;
+        anyhow::ensure!(
+            block.hash.parse::<B256>()? == hash,
+            "Hash-bound header hash mismatch"
+        );
+        Ok(block)
+    }
+
+    /// Retrieves a complete log query for one block hash and a fixed pool universe.
+    ///
+    /// The hash selector is mutually exclusive with height selectors. Empty results remain
+    /// explicit source-completeness evidence; an RPC failure is never converted to an empty batch.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the filter is empty or the response is failed or malformed.
+    pub async fn get_logs_at_hash(
+        &self,
+        hash: B256,
+        addresses: &[Address],
+        event_signatures: &[B256],
+    ) -> anyhow::Result<Vec<RpcLog>> {
+        anyhow::ensure!(
+            !addresses.is_empty(),
+            "Canonical log query has no pool addresses"
+        );
+        anyhow::ensure!(
+            !event_signatures.is_empty(),
+            "Canonical log query has no event families"
+        );
+        self.execute_execution_rpc_call::<Vec<RpcLog>>(
+            "eth_getLogs",
+            serde_json::json!([{
+                "blockHash": hash, "address": addresses, "topics": [event_signatures],
+            }]),
+        )
+        .await?
+        .context("Canonical log query returned no result")
     }
 
     /// Executes an execution-path JSON-RPC call with a per-request timeout and sanitized errors.
@@ -850,7 +956,7 @@ impl BlockchainHttpRpcClient {
             return trace_probe_result(error.code);
         }
         anyhow::ensure!(
-            parsed.result.is_some(),
+            parsed.result.is_some_and(|result| !result.is_null()),
             "debug_traceTransaction returned no result"
         );
         Ok(())
@@ -1048,6 +1154,66 @@ pub(crate) mod tests {
     use rstest::rstest;
 
     use super::*;
+
+    #[rstest]
+    #[tokio::test]
+    async fn nullable_rpc_result_preserves_void_success_and_execution_absence() {
+        let (client, _) = client_for(
+            MockRpcState::default()
+                .with_response("anvil_setCode", r#"{"jsonrpc":"2.0","id":1,"result":null}"#),
+        )
+        .await;
+        let value: serde_json::Value = client
+            .execute_rpc_call(serde_json::json!({
+                "jsonrpc":"2.0","id":1,"method":"anvil_setCode","params":[],
+            }))
+            .await
+            .unwrap();
+        assert!(value.is_null());
+        let result: Option<String> = client
+            .execute_execution_rpc_call("anvil_setCode", serde_json::json!([]))
+            .await
+            .unwrap();
+        assert!(result.is_none());
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn nullable_rpc_missing_result_and_error_are_not_void_success() {
+        let (client, _) = client_for(MockRpcState::default()
+            .with_response("missing", r#"{"jsonrpc":"2.0","id":1}"#)
+            .with_response("failure", r#"{"jsonrpc":"2.0","id":1,"result":null,"error":{"code":-32000,"message":"refused"}}"#)
+        ).await;
+
+        for method in ["missing", "failure"] {
+            assert!(
+                client
+                    .execute_rpc_call::<serde_json::Value>(serde_json::json!({
+                        "jsonrpc":"2.0","id":1,"method":method,"params":[],
+                    }))
+                    .await
+                    .is_err()
+            );
+        }
+        let error = client
+            .execute_execution_rpc_call::<String>("failure", serde_json::json!([]))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("-32000"));
+    }
+
+    #[cfg(feature = "hypersync")]
+    #[rstest]
+    #[tokio::test]
+    async fn nullable_rpc_trace_probe_does_not_accept_null_success() {
+        let (client, _) = client_for(MockRpcState::default().with_response(
+            "debug_traceTransaction",
+            r#"{"jsonrpc":"2.0","id":1,"result":null}"#,
+        ))
+        .await;
+        let error = client.probe_call_trace().await.unwrap_err();
+        assert!(error.to_string().contains("returned no result"));
+    }
 
     #[rstest]
     #[case("not a URL")]
@@ -1786,6 +1952,53 @@ pub(crate) mod tests {
         .await;
 
         assert_eq!(client.max_priority_fee_per_gas().await.unwrap(), 10_000_000);
+    }
+
+    #[tokio::test]
+    async fn canonical_zero_event_query_uses_hash_and_complete_family_filter() {
+        let (client, state) = client_for(
+            MockRpcState::default()
+                .with_response("eth_getLogs", r#"{"jsonrpc":"2.0","id":1,"result":[]}"#),
+        )
+        .await;
+        let hash = B256::repeat_byte(3);
+        let addresses = [Address::repeat_byte(4), Address::repeat_byte(5)];
+        let signatures = [B256::repeat_byte(6), B256::repeat_byte(7)];
+        assert!(
+            client
+                .get_logs_at_hash(hash, &addresses, &signatures)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let requests = state.recorded_requests();
+        assert_eq!(
+            requests[0]["params"],
+            serde_json::json!([{
+                "blockHash":hash, "address":addresses, "topics":[signatures],
+            }])
+        );
+        assert!(requests[0]["params"][0].get("fromBlock").is_none());
+        assert!(requests[0]["params"][0].get("toBlock").is_none());
+    }
+
+    #[tokio::test]
+    async fn canonical_log_error_does_not_become_zero_event_evidence() {
+        let (client, _) = client_for(MockRpcState::default().with_response(
+            "eth_getLogs",
+            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"missing block"}}"#,
+        ))
+        .await;
+        assert!(
+            client
+                .get_logs_at_hash(
+                    B256::repeat_byte(3),
+                    &[Address::repeat_byte(4)],
+                    &[B256::repeat_byte(6)]
+                )
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

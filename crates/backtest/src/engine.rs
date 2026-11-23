@@ -50,12 +50,12 @@ use nautilus_core::{
     string::formatting::Separable, time::nanos_since_unix_epoch,
 };
 use nautilus_data::client::DataClientAdapter;
-use nautilus_execution::models::fill::FillModelHandle;
+use nautilus_execution::models::{fill::FillModelHandle, latency::LatencyModelHandle};
 use nautilus_model::{
     accounts::{Account, AccountAny},
     data::{Data, DataBatch, DataRef, HasTsInit},
     enums::{AccountType, AggregationSource, BookType},
-    identifiers::{AccountId, ClientId, InstrumentId, StrategyId, TraderId, Venue},
+    identifiers::{AccountId, ClientId, InstrumentId, StrategyId, TradeId, TraderId, Venue},
     instruments::{Instrument, InstrumentAny},
     position::Position,
 };
@@ -343,6 +343,39 @@ impl BacktestEngine {
                 "BacktestEngine::change_fill_model called for unknown venue {venue}, ignoring"
             );
         }
+    }
+
+    /// Changes the latency model for the specified venue.
+    ///
+    /// Commands already in flight keep the arrival time their previous model gave them.
+    pub fn change_latency_model(&mut self, venue: Venue, latency_model: LatencyModelHandle) {
+        if let Some(exchange) = self.venues.get_mut(&venue) {
+            exchange.borrow_mut().set_latency_model(latency_model);
+        } else {
+            log::warn!(
+                "BacktestEngine::change_latency_model called for unknown venue {venue}, ignoring"
+            );
+        }
+    }
+
+    /// Sets the trade IDs whose prints do not consume book liquidity for the given instrument.
+    ///
+    /// See [`SimulatedExchange::set_unconsumed_trade_ids`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the instrument's venue or matching engine has not been added.
+    pub fn set_unconsumed_trade_ids(
+        &mut self,
+        instrument_id: InstrumentId,
+        trade_ids: AHashSet<TradeId>,
+    ) -> anyhow::Result<()> {
+        let Some(exchange) = self.venues.get(&instrument_id.venue) else {
+            anyhow::bail!("No venue for {instrument_id}");
+        };
+        exchange
+            .borrow_mut()
+            .set_unconsumed_trade_ids(instrument_id, trade_ids)
     }
 
     /// Adds an instrument to the backtest engine for the specified venue.
@@ -5163,6 +5196,87 @@ mod tests {
         assert_ne!(best_ask_after, best_ask_before);
         assert_eq!(best_bid_after, Some(Price::from("2000.00")));
         assert_eq!(best_ask_after, Some(Price::from("2001.00")));
+    }
+
+    #[rstest]
+    fn test_set_unconsumed_trade_ids_requires_matching_engine(
+        crypto_perpetual_ethusdt: CryptoPerpetual,
+    ) {
+        let mut engine = BacktestEngine::new(BacktestEngineConfig::default()).unwrap();
+        let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt);
+        let instrument_id = instrument.id();
+        let trade_ids = || AHashSet::from([TradeId::from("T-1")]);
+        assert!(
+            engine
+                .set_unconsumed_trade_ids(instrument_id, trade_ids())
+                .is_err()
+        );
+
+        let venue_config = SimulatedVenueConfig::builder()
+            .venue(instrument_id.venue)
+            .oms_type(OmsType::Netting)
+            .account_type(AccountType::Margin)
+            .book_type(BookType::L2_MBP)
+            .starting_balances(vec![Money::from("1_000_000 USDT")])
+            .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into())
+            .build()
+            .unwrap();
+        engine.add_venue(venue_config).unwrap();
+        assert!(
+            engine
+                .set_unconsumed_trade_ids(instrument_id, trade_ids())
+                .is_err()
+        );
+
+        engine.add_instrument(&instrument).unwrap();
+        engine
+            .set_unconsumed_trade_ids(instrument_id, trade_ids())
+            .unwrap();
+    }
+
+    #[rstest]
+    fn test_change_latency_model_delays_later_commands(crypto_perpetual_ethusdt: CryptoPerpetual) {
+        let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt);
+        let mut engine = engine_with_quoted_instrument(&instrument);
+        let venue = instrument.id().venue;
+        let exchange = Rc::clone(&engine.venues[&venue]);
+        let trader_id = engine.trader_id();
+        let submit = |id: &str| {
+            let order = OrderTestBuilder::new(OrderType::Market)
+                .trader_id(trader_id)
+                .instrument_id(instrument.id())
+                .client_order_id(ClientOrderId::from(id))
+                .side(OrderSide::Buy)
+                .quantity(Quantity::from("1.000"))
+                .build();
+            TradingCommand::SubmitOrder(create_submit_order_command(&order))
+        };
+        let insert_latency = |nanos| {
+            LatencyModelHandle::new(StaticLatencyModel::new(
+                DurationNanos::default(),
+                DurationNanos::new(nanos),
+                DurationNanos::default(),
+                DurationNanos::default(),
+            ))
+        };
+
+        engine.change_latency_model(Venue::from("UNKNOWN"), insert_latency(5));
+        exchange.borrow_mut().send(submit("O-1"));
+        assert_eq!(exchange.borrow().max_inflight_command_ts(), None);
+
+        engine.change_latency_model(venue, insert_latency(7));
+        exchange.borrow_mut().send(submit("O-2"));
+        assert_eq!(
+            exchange.borrow().max_inflight_command_ts(),
+            Some(UnixNanos::from(7))
+        );
+
+        engine.change_latency_model(venue, insert_latency(9));
+        exchange.borrow_mut().send(submit("O-3"));
+        assert_eq!(
+            exchange.borrow().max_inflight_command_ts(),
+            Some(UnixNanos::from(9))
+        );
     }
 
     #[rstest]

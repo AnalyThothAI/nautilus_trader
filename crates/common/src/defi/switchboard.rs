@@ -27,6 +27,9 @@ use crate::msgbus::{MStr, MessagingSwitchboard, Topic, get_message_bus};
     reason = "topic suffix consistently identifies routing maps"
 )]
 pub(crate) struct DefiSwitchboard {
+    pub(crate) canonical_batch_topics: AHashMap<u32, MStr<Topic>>,
+    pub(crate) canonical_ready_topics: AHashMap<u32, MStr<Topic>>,
+    pub(crate) canonical_invalidated_topics: AHashMap<u32, MStr<Topic>>,
     pub(crate) block_topics: AHashMap<Blockchain, MStr<Topic>>,
     pub(crate) pool_topics: AHashMap<InstrumentId, MStr<Topic>>,
     pub(crate) pool_swap_topics: AHashMap<InstrumentId, MStr<Topic>>,
@@ -83,7 +86,55 @@ pub fn get_defi_flash_topic(instrument_id: InstrumentId) -> MStr<Topic> {
         .get_defi_pool_flash_topic(instrument_id)
 }
 
+/// Returns the canonical batch topic for this chain.
+#[must_use]
+pub fn get_defi_canonical_batch_topic(chain_id: u32) -> MStr<Topic> {
+    get_message_bus()
+        .borrow_mut()
+        .switchboard
+        .get_defi_canonical_batch_topic(chain_id)
+}
+
+/// Returns the canonical invalidated topic for this chain.
+#[must_use]
+pub fn get_defi_canonical_invalidated_topic(chain_id: u32) -> MStr<Topic> {
+    get_message_bus()
+        .borrow_mut()
+        .switchboard
+        .get_defi_canonical_invalidated_topic(chain_id)
+}
+
 impl MessagingSwitchboard {
+    /// Returns the cached topic for a complete canonical bootstrap.
+    #[must_use]
+    pub fn get_defi_canonical_ready_topic(&mut self, chain_id: u32) -> MStr<Topic> {
+        *self
+            .defi
+            .canonical_ready_topics
+            .entry(chain_id)
+            .or_insert_with(|| format!("data.defi.canonical_ready.{chain_id}").into())
+    }
+
+    /// Returns the cached canonical batch topic.
+    #[must_use]
+    pub fn get_defi_canonical_batch_topic(&mut self, chain_id: u32) -> MStr<Topic> {
+        *self
+            .defi
+            .canonical_batch_topics
+            .entry(chain_id)
+            .or_insert_with(|| format!("data.defi.canonical_batch.{chain_id}").into())
+    }
+
+    /// Returns the cached canonical invalidated topic.
+    #[must_use]
+    pub fn get_defi_canonical_invalidated_topic(&mut self, chain_id: u32) -> MStr<Topic> {
+        *self
+            .defi
+            .canonical_invalidated_topics
+            .entry(chain_id)
+            .or_insert_with(|| format!("data.defi.canonical_invalidated.{chain_id}").into())
+    }
+
     #[must_use]
     pub fn get_defi_blocks_topic(&mut self, chain: Blockchain) -> MStr<Topic> {
         *self
@@ -137,4 +188,13 @@ impl MessagingSwitchboard {
             .entry(instrument_id)
             .or_insert_with(|| format!("data.defi.pool_flash.{instrument_id}").into())
     }
+}
+
+/// Returns the topic for a complete canonical bootstrap's derived readiness notification.
+#[must_use]
+pub fn get_defi_canonical_ready_topic(chain_id: u32) -> MStr<Topic> {
+    get_message_bus()
+        .borrow_mut()
+        .switchboard
+        .get_defi_canonical_ready_topic(chain_id)
 }

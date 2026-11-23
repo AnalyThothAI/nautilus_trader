@@ -15,7 +15,7 @@
 
 use std::{collections::BTreeSet, fmt::Display, pin::Pin, sync::Arc};
 
-use alloy::primitives::{Address, U256};
+use alloy::primitives::{Address, U256, keccak256};
 use anyhow::Context;
 use futures_util::{Stream, StreamExt};
 use nautilus_model::{
@@ -24,7 +24,7 @@ use nautilus_model::{
         SharedDex, Token,
         data::{
             DexPoolData, PoolFeeCollect, PoolFeeProtocolCollect, PoolFeeProtocolUpdate, PoolFlash,
-            block::{BLOCK_SCOPED_SNAPSHOT_INDEX, BlockPosition},
+            block::BlockPosition, canonical::CanonicalAnchor,
         },
         pool_analysis::{
             position::PoolPosition,
@@ -44,6 +44,7 @@ use sqlx::{
 use crate::{
     cache::{
         PoolEventSyncState,
+        canonical::{PoolEventIdentity, parse_hash, verify_stored_hash},
         consistency::CachedBlocksConsistencyStatus,
         copy::PostgresCopyHandler,
         rows::{
@@ -51,7 +52,6 @@ use crate::{
             ExecutionTransactionHashRow, ExecutionTransactionRow, PoolRow, TokenRow,
             parse_cached_block_timestamp, transform_row_to_dex_pool_data,
         },
-        types::{U128Pg, U256Pg},
     },
     events::initialize::InitializeEvent,
     execution::{
@@ -248,11 +248,30 @@ pub(crate) struct ExecutionPayloadCheck {
     pub read_roles: Vec<String>,
 }
 
+fn snapshot_content_digest(snapshot: &PoolSnapshot) -> anyhow::Result<String> {
+    let mut positions: Vec<_> = snapshot.positions.iter().collect();
+    positions.sort_unstable_by_key(|position| {
+        (position.owner, position.tick_lower, position.tick_upper)
+    });
+    let mut ticks: Vec<_> = snapshot.ticks.iter().collect();
+    ticks.sort_unstable_by_key(|tick| tick.value);
+    Ok(keccak256(serde_json::to_vec(&(
+        &snapshot.state,
+        positions,
+        ticks,
+        &snapshot.block_position,
+        snapshot.ts_event,
+    ))?)
+    .to_string())
+}
+
 /// Database interface for persisting and retrieving blockchain entities and domain objects.
 #[derive(Debug, Clone)]
 pub struct BlockchainCacheDatabase {
     /// PostgreSQL connection pool used for database operations.
-    pool: PgPool,
+    pub(super) pool: PgPool,
+    /// Epoch captured before a canonical producer starts its external IO.
+    pub(super) canonical_epoch: Option<CanonicalAnchor>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -337,7 +356,10 @@ impl BlockchainCacheDatabase {
             .acquire_timeout(std::time::Duration::from_secs(3))
             .connect_with(pg_options)
             .await?;
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            canonical_epoch: None,
+        })
     }
 
     /// Seeds the database with a blockchain chain record.
@@ -446,50 +468,8 @@ impl BlockchainCacheDatabase {
     ///
     /// Returns an error if the database operation fails.
     pub async fn add_block(&self, chain_id: u32, block: &Block) -> anyhow::Result<()> {
-        sqlx::query(
-            "
-            INSERT INTO block (
-                chain_id, number, hash, parent_hash, miner, gas_limit, gas_used, timestamp,
-                base_fee_per_gas, blob_gas_used, excess_blob_gas,
-                l1_gas_price, l1_gas_used, l1_fee_scalar
-            ) VALUES (
-                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14
-            )
-            ON CONFLICT (chain_id, number)
-            DO UPDATE
-            SET
-                hash = $3,
-                parent_hash = $4,
-                miner = $5,
-                gas_limit = $6,
-                gas_used = $7,
-                timestamp = $8,
-                base_fee_per_gas = $9,
-                blob_gas_used = $10,
-                excess_blob_gas = $11,
-                l1_gas_price = $12,
-                l1_gas_used = $13,
-                l1_fee_scalar = $14
-        ",
-        )
-        .bind(chain_id as i32)
-        .bind(block.number as i64)
-        .bind(block.hash.as_str())
-        .bind(block.parent_hash.as_str())
-        .bind(block.miner.as_str())
-        .bind(block.gas_limit as i64)
-        .bind(block.gas_used as i64)
-        .bind(block.timestamp.to_string())
-        .bind(block.base_fee_per_gas.as_ref().map(U256::to_string))
-        .bind(block.blob_gas_used.as_ref().map(U256::to_string))
-        .bind(block.excess_blob_gas.as_ref().map(U256::to_string))
-        .bind(block.l1_gas_price.as_ref().map(U256::to_string))
-        .bind(block.l1_gas_used.map(|v| v as i64))
-        .bind(block.l1_fee_scalar.map(|v| v as i64))
-        .execute(&self.pool)
-        .await
-        .map(|_| ())
-        .map_err(|e| anyhow::anyhow!("Failed to insert into block table: {e}"))
+        self.add_blocks_batch(chain_id, std::slice::from_ref(block))
+            .await
     }
 
     /// Inserts multiple blocks in a single database operation using UNNEST for optimal performance.
@@ -520,7 +500,7 @@ impl BlockchainCacheDatabase {
         // Fill vectors from blocks
         for block in blocks {
             numbers.push(block.number as i64);
-            hashes.push(block.hash.clone());
+            hashes.push(parse_hash(&block.hash)?.to_string());
             parent_hashes.push(block.parent_hash.clone());
             miners.push(block.miner.to_string());
             gas_limits.push(block.gas_limit as i64);
@@ -535,6 +515,10 @@ impl BlockchainCacheDatabase {
         }
 
         // Execute batch insert with UNNEST
+        let mut transaction = self.begin_chain_write(chain_id).await?;
+        self.validate_block_identities(&mut transaction, chain_id, blocks)
+            .await?;
+
         sqlx::query(
             "
             INSERT INTO block (
@@ -550,7 +534,13 @@ impl BlockchainCacheDatabase {
                 $9::text[], $10::text[], $11::text[],
                 $12::text[], $13::int8[], $14::int8[]
             )
-            ON CONFLICT (chain_id, number) DO NOTHING
+            ON CONFLICT (chain_id, number) DO UPDATE SET
+                hash = EXCLUDED.hash, parent_hash = EXCLUDED.parent_hash, miner = EXCLUDED.miner,
+                gas_limit = EXCLUDED.gas_limit, gas_used = EXCLUDED.gas_used,
+                timestamp = EXCLUDED.timestamp, base_fee_per_gas = EXCLUDED.base_fee_per_gas,
+                blob_gas_used = EXCLUDED.blob_gas_used, excess_blob_gas = EXCLUDED.excess_blob_gas,
+                l1_gas_price = EXCLUDED.l1_gas_price, l1_gas_used = EXCLUDED.l1_gas_used,
+                l1_fee_scalar = EXCLUDED.l1_fee_scalar
            ",
         )
         .bind(chain_id as i32)
@@ -567,10 +557,12 @@ impl BlockchainCacheDatabase {
         .bind(&l1_gas_prices as &[Option<String>])
         .bind(&l1_gas_useds as &[Option<i64>])
         .bind(&l1_fee_scalars as &[Option<i64>])
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await
         .map(|_| ())
-        .map_err(|e| anyhow::anyhow!("Failed to batch insert into block table: {e}"))
+        .map_err(|e| anyhow::anyhow!("Failed to batch insert into block table: {e}"))?;
+        transaction.commit().await?;
+        Ok(())
     }
 
     /// Inserts block timestamps observed while streaming pool events.
@@ -591,6 +583,7 @@ impl BlockchainCacheDatabase {
             .with_context(|| format!("Chain ID {chain_id} exceeds PostgreSQL INTEGER"))?;
         let mut numbers: Vec<i64> = Vec::with_capacity(blocks.len());
         let mut hashes: Vec<String> = Vec::with_capacity(blocks.len());
+        let mut parent_hashes: Vec<String> = Vec::with_capacity(blocks.len());
         let mut timestamps: Vec<String> = Vec::with_capacity(blocks.len());
 
         for block in blocks {
@@ -600,32 +593,40 @@ impl BlockchainCacheDatabase {
                     block.number
                 )
             })?);
-            hashes.push(block.hash.clone());
+            hashes.push(parse_hash(&block.hash)?.to_string());
+            parent_hashes.push(block.parent_hash.clone());
             timestamps.push(block.timestamp.to_string());
         }
+
+        let mut transaction = self.begin_chain_write(chain_id).await?;
+        self.validate_block_identities(&mut transaction, chain_id, blocks)
+            .await?;
 
         sqlx::query(
             "
             INSERT INTO pool_event_block (
-                chain_id, number, hash, timestamp
+                chain_id, number, hash, timestamp, parent_hash
             )
             SELECT
                 $1, *
             FROM UNNEST(
-                $2::int8[], $3::text[], $4::text[]
+                $2::int8[], $3::text[], $4::text[], $5::text[]
             )
             ON CONFLICT (chain_id, number)
-            DO UPDATE SET hash = EXCLUDED.hash, timestamp = EXCLUDED.timestamp
+            DO UPDATE SET hash = EXCLUDED.hash, timestamp = EXCLUDED.timestamp, parent_hash = EXCLUDED.parent_hash
            ",
         )
         .bind(chain_id_db)
         .bind(&numbers[..])
         .bind(&hashes[..])
         .bind(&timestamps[..])
-        .execute(&self.pool)
+        .bind(&parent_hashes[..])
+        .execute(&mut *transaction)
         .await
         .map(|_| ())
-        .map_err(|e| anyhow::anyhow!("Failed to batch insert into pool_event_block table: {e}"))
+        .map_err(|e| anyhow::anyhow!("Failed to batch insert into pool_event_block table: {e}"))?;
+        transaction.commit().await?;
+        Ok(())
     }
 
     /// Adds block-hash storage to databases created before hash-bound profiler checkpoints.
@@ -634,24 +635,19 @@ impl BlockchainCacheDatabase {
     ///
     /// Returns an error if the schema update fails.
     pub async fn ensure_pool_event_block_hash_schema(&self) -> anyhow::Result<()> {
-        sqlx::query("ALTER TABLE pool_event_block ADD COLUMN IF NOT EXISTS hash TEXT")
-            .execute(&self.pool)
-            .await
-            .map(|_| ())
-            .map_err(|e| anyhow::anyhow!("Failed to add pool event block hash storage: {e}"))
+        self.ensure_canonical_schema().await
     }
 
-    /// Inserts blocks using PostgreSQL COPY BINARY for maximum performance.
+    /// Persists this legacy COPY entry point through the shared hash-verified batch transaction.
     ///
-    /// This method is significantly faster than INSERT for bulk operations as it bypasses
-    /// SQL parsing and uses PostgreSQL's native binary protocol.
+    /// Market rows and their immutable identities must commit together. The pool-owned COPY
+    /// connection cannot participate in that transaction.
     ///
     /// # Errors
     ///
     /// Returns an error if the COPY operation fails.
     pub async fn add_blocks_copy(&self, chain_id: u32, blocks: &[Block]) -> anyhow::Result<()> {
-        let copy_handler = PostgresCopyHandler::new(&self.pool);
-        copy_handler.copy_blocks(chain_id, blocks).await
+        self.add_blocks_batch(chain_id, blocks).await
     }
 
     /// Inserts tokens using PostgreSQL COPY BINARY for maximum performance.
@@ -660,8 +656,11 @@ impl BlockchainCacheDatabase {
     ///
     /// Returns an error if the COPY operation fails.
     pub async fn add_tokens_copy(&self, chain_id: u32, tokens: &[Token]) -> anyhow::Result<()> {
+        let transaction = self.begin_chain_write(chain_id).await?;
         let copy_handler = PostgresCopyHandler::new(&self.pool);
-        copy_handler.copy_tokens(chain_id, tokens).await
+        copy_handler.copy_tokens(chain_id, tokens).await?;
+        transaction.commit().await?;
+        Ok(())
     }
 
     /// Inserts pools using PostgreSQL COPY BINARY for maximum performance.
@@ -670,14 +669,17 @@ impl BlockchainCacheDatabase {
     ///
     /// Returns an error if the COPY operation fails.
     pub async fn add_pools_copy(&self, chain_id: u32, pools: &[Pool]) -> anyhow::Result<()> {
+        let transaction = self.begin_chain_write(chain_id).await?;
         let copy_handler = PostgresCopyHandler::new(&self.pool);
-        copy_handler.copy_pools(chain_id, pools).await
+        copy_handler.copy_pools(chain_id, pools).await?;
+        transaction.commit().await?;
+        Ok(())
     }
 
-    /// Inserts pool swaps using PostgreSQL COPY BINARY for maximum performance.
+    /// Persists this legacy COPY entry point through the shared hash-verified batch transaction.
     ///
-    /// This method is significantly faster than INSERT for bulk operations as it bypasses
-    /// SQL parsing and uses PostgreSQL's native binary protocol.
+    /// Market rows and their immutable identities must commit together. The pool-owned COPY
+    /// connection cannot participate in that transaction.
     ///
     /// # Errors
     ///
@@ -687,14 +689,13 @@ impl BlockchainCacheDatabase {
         chain_id: u32,
         swaps: &[PoolSwap],
     ) -> anyhow::Result<()> {
-        let copy_handler = PostgresCopyHandler::new(&self.pool);
-        copy_handler.copy_pool_swaps(chain_id, swaps).await
+        self.add_pool_swaps_batch(chain_id, swaps).await
     }
 
-    /// Inserts pool liquidity updates using PostgreSQL COPY BINARY for maximum performance.
+    /// Persists this legacy COPY entry point through the shared hash-verified batch transaction.
     ///
-    /// This method is significantly faster than INSERT for bulk operations as it bypasses
-    /// SQL parsing and uses PostgreSQL's native binary protocol.
+    /// Market rows and their immutable identities must commit together. The pool-owned COPY
+    /// connection cannot participate in that transaction.
     ///
     /// # Errors
     ///
@@ -704,16 +705,14 @@ impl BlockchainCacheDatabase {
         chain_id: u32,
         updates: &[PoolLiquidityUpdate],
     ) -> anyhow::Result<()> {
-        let copy_handler = PostgresCopyHandler::new(&self.pool);
-        copy_handler
-            .copy_pool_liquidity_updates(chain_id, updates)
+        self.add_pool_liquidity_updates_batch(chain_id, updates)
             .await
     }
 
-    /// Inserts pool fee collect events using PostgreSQL COPY BINARY for maximum performance.
+    /// Persists this legacy COPY entry point through the shared hash-verified batch transaction.
     ///
-    /// This method is significantly faster than INSERT for bulk operations as it bypasses
-    /// SQL parsing and most database validation checks.
+    /// Market rows and their immutable identities must commit together. The pool-owned COPY
+    /// connection cannot participate in that transaction.
     ///
     /// # Errors
     ///
@@ -723,8 +722,7 @@ impl BlockchainCacheDatabase {
         chain_id: u32,
         collects: &[PoolFeeCollect],
     ) -> anyhow::Result<()> {
-        let copy_handler = PostgresCopyHandler::new(&self.pool);
-        copy_handler.copy_pool_collects(chain_id, collects).await
+        self.add_pool_collects_batch(chain_id, collects).await
     }
 
     /// Retrieves block timestamps for a given chain starting from a specific block number.
@@ -767,6 +765,8 @@ impl BlockchainCacheDatabase {
     ///
     /// Returns an error if the database operation fails.
     pub async fn add_dex(&self, dex: SharedDex) -> anyhow::Result<()> {
+        let mut transaction = self.begin_chain_write(dex.chain.chain_id).await?;
+
         sqlx::query(
             "
             INSERT INTO dex (
@@ -783,10 +783,12 @@ impl BlockchainCacheDatabase {
         .bind(dex.name.to_string())
         .bind(dex.factory.to_string())
         .bind(dex.factory_creation_block as i64)
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await
         .map(|_| ())
-        .map_err(|e| anyhow::anyhow!("Failed to insert into dex table: {e}"))
+        .map_err(|e| anyhow::anyhow!("Failed to insert into dex table: {e}"))?;
+        transaction.commit().await?;
+        Ok(())
     }
 
     /// Adds or updates a liquidity pool/pair record in the database.
@@ -795,6 +797,8 @@ impl BlockchainCacheDatabase {
     ///
     /// Returns an error if the database operation fails.
     pub async fn add_pool(&self, pool: &Pool) -> anyhow::Result<()> {
+        let mut transaction = self.begin_chain_write(pool.chain.chain_id).await?;
+
         sqlx::query(
             "
             INSERT INTO pool (
@@ -833,10 +837,12 @@ impl BlockchainCacheDatabase {
         .bind(pool.initial_tick)
         .bind(pool.initial_sqrt_price_x96.as_ref().map(|p| p.to_string()))
         .bind(pool.hooks.as_ref().map(|h| h.to_string()))
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await
         .map(|_| ())
-        .map_err(|e| anyhow::anyhow!("Failed to insert into pool table: {e}"))
+        .map_err(|e| anyhow::anyhow!("Failed to insert into pool table: {e}"))?;
+        transaction.commit().await?;
+        Ok(())
     }
 
     /// Inserts multiple pools in a single database operation using UNNEST for optimal performance.
@@ -886,6 +892,14 @@ impl BlockchainCacheDatabase {
         }
 
         // Execute batch insert with UNNEST
+        let mut transaction = self.begin_chain_write(pools[0].chain.chain_id).await?;
+        anyhow::ensure!(
+            pools
+                .iter()
+                .all(|p| p.chain.chain_id == pools[0].chain.chain_id),
+            "A pool batch crosses chains"
+        );
+
         sqlx::query(
             "
             INSERT INTO pool (
@@ -917,10 +931,12 @@ impl BlockchainCacheDatabase {
         .bind(&initial_ticks[..])
         .bind(&initial_sqrt_price_x96s[..])
         .bind(&hook_addresses as &[Option<String>])
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await
         .map(|_| ())
-        .map_err(|e| anyhow::anyhow!("Failed to batch insert into pool table: {e}"))
+        .map_err(|e| anyhow::anyhow!("Failed to batch insert into pool table: {e}"))?;
+        transaction.commit().await?;
+        Ok(())
     }
 
     /// Inserts multiple pool swaps in a single database operation using UNNEST for optimal performance.
@@ -936,6 +952,10 @@ impl BlockchainCacheDatabase {
         if swaps.is_empty() {
             return Ok(());
         }
+        anyhow::ensure!(
+            swaps.iter().all(|event| event.chain.chain_id == chain_id),
+            "A pool event batch crosses chains"
+        );
 
         // Prepare vectors for each column
         let len = swaps.len();
@@ -993,7 +1013,23 @@ impl BlockchainCacheDatabase {
         }
 
         // Execute batch insert with UNNEST
-        sqlx::query(
+        let mut transaction = self.begin_chain_write(chain_id).await?;
+        let identities: Vec<_> = swaps
+            .iter()
+            .map(|event| PoolEventIdentity {
+                pool: event.pool_identifier,
+                block: event.block,
+                block_hash: event.block_hash.as_deref(),
+                transaction_hash: &event.transaction_hash,
+                transaction_index: event.transaction_index,
+                log_index: event.log_index,
+                timestamp: event.ts_event,
+            })
+            .collect();
+        self.record_pool_event_identities(&mut transaction, chain_id, "swap", &identities)
+            .await?;
+
+        let inserted = sqlx::query(
             "
             INSERT INTO pool_swap_event (
                 chain_id, dex_name, pool_identifier, block, transaction_hash, transaction_index,
@@ -1011,7 +1047,24 @@ impl BlockchainCacheDatabase {
             ) AS t(chain_id, dex_name, pool_identifier, block, transaction_hash, transaction_index,
                    log_index, sender, recipient, sqrt_price_x96, liquidity, tick, amount0, amount1,
                    order_side, base_quantity, quote_quantity, spot_price, execution_price)
-            ON CONFLICT (chain_id, transaction_hash, log_index) DO NOTHING
+            ON CONFLICT (chain_id, transaction_hash, log_index) DO UPDATE
+            SET log_index = EXCLUDED.log_index
+            WHERE pool_swap_event.dex_name IS NOT DISTINCT FROM EXCLUDED.dex_name
+                AND pool_swap_event.pool_identifier IS NOT DISTINCT FROM EXCLUDED.pool_identifier
+                AND pool_swap_event.block IS NOT DISTINCT FROM EXCLUDED.block
+                AND pool_swap_event.transaction_index IS NOT DISTINCT FROM EXCLUDED.transaction_index
+                AND pool_swap_event.sender IS NOT DISTINCT FROM EXCLUDED.sender
+                AND pool_swap_event.recipient IS NOT DISTINCT FROM EXCLUDED.recipient
+                AND pool_swap_event.sqrt_price_x96 IS NOT DISTINCT FROM EXCLUDED.sqrt_price_x96
+                AND pool_swap_event.liquidity IS NOT DISTINCT FROM EXCLUDED.liquidity
+                AND pool_swap_event.tick IS NOT DISTINCT FROM EXCLUDED.tick
+                AND pool_swap_event.amount0 IS NOT DISTINCT FROM EXCLUDED.amount0
+                AND pool_swap_event.amount1 IS NOT DISTINCT FROM EXCLUDED.amount1
+                AND pool_swap_event.order_side IS NOT DISTINCT FROM EXCLUDED.order_side
+                AND pool_swap_event.base_quantity IS NOT DISTINCT FROM EXCLUDED.base_quantity
+                AND pool_swap_event.quote_quantity IS NOT DISTINCT FROM EXCLUDED.quote_quantity
+                AND pool_swap_event.spot_price IS NOT DISTINCT FROM EXCLUDED.spot_price
+                AND pool_swap_event.execution_price IS NOT DISTINCT FROM EXCLUDED.execution_price
            ",
         )
         .bind(&chain_ids[..])
@@ -1033,10 +1086,16 @@ impl BlockchainCacheDatabase {
         .bind(&quote_quantities[..])
         .bind(&spot_prices[..])
         .bind(&execution_prices[..])
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await
-        .map(|_| ())
-        .map_err(|e| anyhow::anyhow!("Failed to batch insert into pool_swap_event table: {e}"))
+        .map(|result| result.rows_affected())
+        .map_err(|e| anyhow::anyhow!("Failed to batch insert into pool_swap_event table: {e}"))?;
+        anyhow::ensure!(
+            inserted == u64::try_from(swaps.len())?,
+            "A duplicate pool event conflicts with its retained payload"
+        );
+        transaction.commit().await?;
+        Ok(())
     }
 
     /// Inserts multiple pool liquidity updates in a single database operation using UNNEST for optimal performance.
@@ -1052,6 +1111,10 @@ impl BlockchainCacheDatabase {
         if updates.is_empty() {
             return Ok(());
         }
+        anyhow::ensure!(
+            updates.iter().all(|event| event.chain.chain_id == chain_id),
+            "A pool event batch crosses chains"
+        );
 
         // Prepare vectors for each column
         let len = updates.len();
@@ -1091,7 +1154,23 @@ impl BlockchainCacheDatabase {
         }
 
         // Execute batch insert with UNNEST
-        sqlx::query(
+        let mut transaction = self.begin_chain_write(chain_id).await?;
+        let identities: Vec<_> = updates
+            .iter()
+            .map(|event| PoolEventIdentity {
+                pool: event.pool_identifier,
+                block: event.block,
+                block_hash: event.block_hash.as_deref(),
+                transaction_hash: &event.transaction_hash,
+                transaction_index: event.transaction_index,
+                log_index: event.log_index,
+                timestamp: event.ts_event,
+            })
+            .collect();
+        self.record_pool_event_identities(&mut transaction, chain_id, "liquidity", &identities)
+            .await?;
+
+        let inserted = sqlx::query(
             "
             INSERT INTO pool_liquidity_event (
                 chain_id, dex_name, pool_identifier, block, transaction_hash, transaction_index,
@@ -1103,13 +1182,26 @@ impl BlockchainCacheDatabase {
                 log_index, event_type, sender, owner, position_liquidity::u128,
                 amount0::U256, amount1::U256, tick_lower, tick_upper
             FROM UNNEST(
-                $1::INT[], $2::TEXT[], $3::TEXT[], $4::INT[], $5::TEXT[], $6::INT[],
+                $1::INT[], $2::TEXT[], $3::TEXT[], $4::BIGINT[], $5::TEXT[], $6::INT[],
                 $7::INT[], $8::TEXT[], $9::TEXT[], $10::TEXT[], $11::TEXT[],
                 $12::TEXT[], $13::TEXT[], $14::INT[], $15::INT[]
             ) AS t(chain_id, dex_name, pool_identifier, block, transaction_hash, transaction_index,
                    log_index, event_type, sender, owner, position_liquidity,
                    amount0, amount1, tick_lower, tick_upper)
-            ON CONFLICT (chain_id, transaction_hash, log_index) DO NOTHING
+            ON CONFLICT (chain_id, transaction_hash, log_index) DO UPDATE
+            SET log_index = EXCLUDED.log_index
+            WHERE pool_liquidity_event.dex_name IS NOT DISTINCT FROM EXCLUDED.dex_name
+                AND pool_liquidity_event.pool_identifier IS NOT DISTINCT FROM EXCLUDED.pool_identifier
+                AND pool_liquidity_event.block IS NOT DISTINCT FROM EXCLUDED.block
+                AND pool_liquidity_event.transaction_index IS NOT DISTINCT FROM EXCLUDED.transaction_index
+                AND pool_liquidity_event.event_type IS NOT DISTINCT FROM EXCLUDED.event_type
+                AND pool_liquidity_event.sender IS NOT DISTINCT FROM EXCLUDED.sender
+                AND pool_liquidity_event.owner IS NOT DISTINCT FROM EXCLUDED.owner
+                AND pool_liquidity_event.position_liquidity IS NOT DISTINCT FROM EXCLUDED.position_liquidity
+                AND pool_liquidity_event.amount0 IS NOT DISTINCT FROM EXCLUDED.amount0
+                AND pool_liquidity_event.amount1 IS NOT DISTINCT FROM EXCLUDED.amount1
+                AND pool_liquidity_event.tick_lower IS NOT DISTINCT FROM EXCLUDED.tick_lower
+                AND pool_liquidity_event.tick_upper IS NOT DISTINCT FROM EXCLUDED.tick_upper
            ",
         )
         .bind(&chain_ids[..])
@@ -1127,10 +1219,16 @@ impl BlockchainCacheDatabase {
         .bind(&amount1s[..])
         .bind(&tick_lowers[..])
         .bind(&tick_uppers[..])
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await
-        .map(|_| ())
-        .map_err(|e| anyhow::anyhow!("Failed to batch insert into pool_liquidity_event table: {e}"))
+        .map(|result| result.rows_affected())
+        .map_err(|e| anyhow::anyhow!("Failed to batch insert into pool_liquidity_event table: {e}"))?;
+        anyhow::ensure!(
+            inserted == u64::try_from(updates.len())?,
+            "A duplicate pool event conflicts with its retained payload"
+        );
+        transaction.commit().await?;
+        Ok(())
     }
 
     /// Adds or updates a token record in the database.
@@ -1139,6 +1237,8 @@ impl BlockchainCacheDatabase {
     ///
     /// Returns an error if the database operation fails.
     pub async fn add_token(&self, token: &Token) -> anyhow::Result<()> {
+        let mut transaction = self.begin_chain_write(token.chain.chain_id).await?;
+
         sqlx::query(
             "
             INSERT INTO token (
@@ -1157,10 +1257,12 @@ impl BlockchainCacheDatabase {
         .bind(token.name.as_str())
         .bind(token.symbol.as_str())
         .bind(i32::from(token.decimals))
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await
         .map(|_| ())
-        .map_err(|e| anyhow::anyhow!("Failed to insert into token table: {e}"))
+        .map_err(|e| anyhow::anyhow!("Failed to insert into token table: {e}"))?;
+        transaction.commit().await?;
+        Ok(())
     }
 
     /// Records an invalid token address with associated error information.
@@ -1174,6 +1276,8 @@ impl BlockchainCacheDatabase {
         address: &Address,
         error_string: &str,
     ) -> anyhow::Result<()> {
+        let mut transaction = self.begin_chain_write(chain_id).await?;
+
         sqlx::query(
             "
             INSERT INTO token (
@@ -1186,10 +1290,12 @@ impl BlockchainCacheDatabase {
         .bind(chain_id as i32)
         .bind(address.to_string())
         .bind(error_string)
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await
         .map(|_| ())
-        .map_err(|e| anyhow::anyhow!("Failed to insert into token table: {e}"))
+        .map_err(|e| anyhow::anyhow!("Failed to insert into token table: {e}"))?;
+        transaction.commit().await?;
+        Ok(())
     }
 
     /// Persists a token swap transaction event to the `pool_swap` table.
@@ -1198,54 +1304,8 @@ impl BlockchainCacheDatabase {
     ///
     /// Returns an error if the database operation fails.
     pub async fn add_swap(&self, chain_id: u32, swap: &PoolSwap) -> anyhow::Result<()> {
-        // Extract trade_info fields if available
-        let (order_side, base_quantity, quote_quantity, spot_price, execution_price) =
-            if let Some(ref trade_info) = swap.trade_info {
-                (
-                    Some(trade_info.order_side.to_string()),
-                    Some(trade_info.quantity_base.as_decimal()),
-                    Some(trade_info.quantity_quote.as_decimal()),
-                    Some(trade_info.spot_price.as_decimal()),
-                    Some(trade_info.execution_price.as_decimal()),
-                )
-            } else {
-                (None, None, None, None, None)
-            };
-
-        sqlx::query(
-            "
-            INSERT INTO pool_swap_event (
-                chain_id, dex_name, pool_identifier, block, transaction_hash, transaction_index,
-                log_index, sender, recipient, sqrt_price_x96, liquidity, tick, amount0, amount1,
-                order_side, base_quantity, quote_quantity, spot_price, execution_price
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::U160, $11::U128, $12, $13::I256, $14::I256, $15, $16, $17, $18, $19)
-            ON CONFLICT (chain_id, transaction_hash, log_index)
-            DO NOTHING
-        ",
-        )
-        .bind(chain_id as i32)
-        .bind(swap.dex.name.to_string())
-        .bind(swap.pool_identifier.as_str())
-        .bind(swap.block as i64)
-        .bind(swap.transaction_hash.as_str())
-        .bind(swap.transaction_index as i32)
-        .bind(swap.log_index as i32)
-        .bind(swap.sender.to_string())
-        .bind(swap.recipient.to_string())
-        .bind(swap.sqrt_price_x96.to_string())
-        .bind(swap.liquidity.to_string())
-        .bind(swap.tick)
-        .bind(swap.amount0.to_string())
-        .bind(swap.amount1.to_string())
-        .bind(order_side)
-        .bind(base_quantity)
-        .bind(quote_quantity)
-        .bind(spot_price)
-        .bind(execution_price)
-        .execute(&self.pool)
-        .await
-        .map(|_| ())
-        .map_err(|e| anyhow::anyhow!("Failed to insert into pool_swap table: {e}"))
+        self.add_pool_swaps_batch(chain_id, std::slice::from_ref(swap))
+            .await
     }
 
     /// Persists a liquidity position change (mint/burn) event to the `pool_liquidity` table.
@@ -1258,35 +1318,8 @@ impl BlockchainCacheDatabase {
         chain_id: u32,
         liquidity_update: &PoolLiquidityUpdate,
     ) -> anyhow::Result<()> {
-        sqlx::query(
-            "
-            INSERT INTO pool_liquidity_event (
-                chain_id, dex_name, pool_identifier, block, transaction_hash, transaction_index, log_index,
-                event_type, sender, owner, position_liquidity, amount0, amount1, tick_lower, tick_upper
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
-            ON CONFLICT (chain_id, transaction_hash, log_index)
-            DO NOTHING
-        ",
-        )
-        .bind(chain_id as i32)
-        .bind(liquidity_update.dex.name.to_string())
-        .bind(liquidity_update.pool_identifier.as_str())
-        .bind(liquidity_update.block as i64)
-        .bind(liquidity_update.transaction_hash.as_str())
-        .bind(liquidity_update.transaction_index as i32)
-        .bind(liquidity_update.log_index as i32)
-        .bind(liquidity_update.kind.to_string())
-        .bind(liquidity_update.sender.map(|sender| sender.to_string()))
-        .bind(liquidity_update.owner.to_string())
-        .bind(U128Pg(liquidity_update.position_liquidity))
-        .bind(U256Pg(liquidity_update.amount0))
-        .bind(U256Pg(liquidity_update.amount1))
-        .bind(liquidity_update.tick_lower)
-        .bind(liquidity_update.tick_upper)
-        .execute(&self.pool)
-        .await
-        .map(|_| ())
-        .map_err(|e| anyhow::anyhow!("Failed to insert into pool_liquidity table: {e}"))
+        self.add_pool_liquidity_updates_batch(chain_id, std::slice::from_ref(liquidity_update))
+            .await
     }
 
     /// Retrieves all valid token records for the given chain and converts them into `Token` domain objects.
@@ -1446,6 +1479,10 @@ impl BlockchainCacheDatabase {
         dex: &DexType,
         block_number: u64,
     ) -> anyhow::Result<()> {
+        let mut transaction = self.begin_chain_write(chain_id).await?;
+        self.require_unmanaged_progress(&mut transaction, chain_id)
+            .await?;
+
         sqlx::query(
             "
             UPDATE dex
@@ -1456,10 +1493,12 @@ impl BlockchainCacheDatabase {
         .bind(chain_id as i32)
         .bind(dex.to_string())
         .bind(block_number as i64)
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await
         .map(|_| ())
-        .map_err(|e| anyhow::anyhow!("Failed to update dex last synced block: {e}"))
+        .map_err(|e| anyhow::anyhow!("Failed to update dex last synced block: {e}"))?;
+        transaction.commit().await?;
+        Ok(())
     }
 
     /// Updates the last synced block number for a pool.
@@ -1474,10 +1513,17 @@ impl BlockchainCacheDatabase {
         pool_identifier: &PoolIdentifier,
         block_number: u64,
     ) -> anyhow::Result<()> {
+        let mut transaction = self.begin_chain_write(chain_id).await?;
+        self.require_unmanaged_progress(&mut transaction, chain_id)
+            .await?;
+
         sqlx::query(
             "
             UPDATE pool
-            SET last_full_sync_block_number = $4
+            SET last_full_sync_block_number = $4,
+                last_full_sync_block_hash = COALESCE(
+                    (SELECT hash FROM pool_event_block WHERE chain_id = $1 AND number = $4),
+                    (SELECT hash FROM block WHERE chain_id = $1 AND number = $4))
             WHERE chain_id = $1
             AND dex_name = $2
             AND pool_identifier = $3
@@ -1487,10 +1533,12 @@ impl BlockchainCacheDatabase {
         .bind(dex.to_string())
         .bind(pool_identifier.as_ref())
         .bind(block_number as i64)
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await
         .map(|_| ())
-        .map_err(|e| anyhow::anyhow!("Failed to update pool last synced block: {e}"))
+        .map_err(|e| anyhow::anyhow!("Failed to update pool last synced block: {e}"))?;
+        transaction.commit().await?;
+        Ok(())
     }
 
     /// Retrieves the saved checkpoint block number from the last completed pool synchronization for a specific DEX.
@@ -1540,6 +1588,7 @@ impl BlockchainCacheDatabase {
             WHERE chain_id = $1
             AND dex_name = $2
             AND pool_identifier = $3
+            AND last_full_sync_block_hash IS NOT NULL
             ",
         )
         .bind(chain_id as i32)
@@ -1560,7 +1609,8 @@ impl BlockchainCacheDatabase {
     ) -> anyhow::Result<PoolEventSyncState> {
         let pool_state = sqlx::query_as::<_, (i32, Option<i64>)>(
             "
-            SELECT event_sync_version, last_full_sync_block_number
+            SELECT event_sync_version,
+                CASE WHEN last_full_sync_block_hash IS NOT NULL THEN last_full_sync_block_number END
             FROM pool
             WHERE chain_id = $1
             AND dex_name = $2
@@ -1585,6 +1635,7 @@ impl BlockchainCacheDatabase {
             WHERE chain_id = $1
             AND dex_name = $2
             AND pool_identifier = $3
+            AND block_hash IS NOT NULL
             ORDER BY event_family
             ",
         )
@@ -1614,18 +1665,44 @@ impl BlockchainCacheDatabase {
         block_number: u64,
         version: Option<u32>,
     ) -> anyhow::Result<()> {
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = self.begin_chain_write(chain_id).await?;
+        self.require_unmanaged_progress(&mut transaction, chain_id)
+            .await?;
+        let hashes: Vec<Option<String>> = sqlx::query_scalar(
+            "SELECT hash FROM pool_event_block WHERE chain_id = $1 AND number = $2
+             UNION ALL SELECT hash FROM block WHERE chain_id = $1 AND number = $2",
+        )
+        .bind(chain_id as i32)
+        .bind(block_number as i64)
+        .fetch_all(&mut *transaction)
+        .await?;
+        let block_hash = hashes
+            .into_iter()
+            .flatten()
+            .next()
+            .context("Pool event progress requires a verified block hash")?;
+        verify_stored_hash(
+            &mut transaction,
+            chain_id,
+            block_number,
+            parse_hash(&block_hash)?,
+            true,
+        )
+        .await?;
 
         for event_family in event_families {
             sqlx::query(
                 "
                 INSERT INTO pool_event_sync (
                     chain_id, dex_name, pool_identifier, event_family,
-                    last_full_sync_block_number
+                    last_full_sync_block_number, block_hash
                 )
-                VALUES ($1, $2, $3, $4, $5)
+                VALUES ($1, $2, $3, $4, $5, $6)
                 ON CONFLICT (chain_id, dex_name, pool_identifier, event_family)
-                DO UPDATE SET last_full_sync_block_number =
+                DO UPDATE SET block_hash = CASE
+                    WHEN EXCLUDED.last_full_sync_block_number >= pool_event_sync.last_full_sync_block_number
+                    THEN EXCLUDED.block_hash ELSE pool_event_sync.block_hash END,
+                    last_full_sync_block_number =
                     GREATEST(
                         pool_event_sync.last_full_sync_block_number,
                         EXCLUDED.last_full_sync_block_number
@@ -1637,6 +1714,7 @@ impl BlockchainCacheDatabase {
             .bind(pool_identifier.as_ref())
             .bind(event_family)
             .bind(block_number as i64)
+            .bind(&block_hash)
             .execute(&mut *transaction)
             .await
             .map_err(|e| {
@@ -1649,6 +1727,9 @@ impl BlockchainCacheDatabase {
                 "
                 UPDATE pool
                 SET
+                    last_full_sync_block_hash = CASE
+                        WHEN last_full_sync_block_number IS NULL OR last_full_sync_block_number <= $5
+                        THEN $6 ELSE last_full_sync_block_hash END,
                     event_sync_version = GREATEST(event_sync_version, $4),
                     last_full_sync_block_number =
                         GREATEST(COALESCE(last_full_sync_block_number, $5), $5)
@@ -1662,6 +1743,7 @@ impl BlockchainCacheDatabase {
             .bind(pool_identifier.as_ref())
             .bind(version as i32)
             .bind(block_number as i64)
+            .bind(&block_hash)
             .execute(&mut *transaction)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to finalize pool event sync progress: {e}"))?;
@@ -1709,6 +1791,12 @@ impl BlockchainCacheDatabase {
         if collects.is_empty() {
             return Ok(());
         }
+        anyhow::ensure!(
+            collects
+                .iter()
+                .all(|event| event.chain.chain_id == chain_id),
+            "A pool event batch crosses chains"
+        );
 
         // Prepare vectors for each column
         let len = collects.len();
@@ -1742,7 +1830,23 @@ impl BlockchainCacheDatabase {
         }
 
         // Execute batch insert with UNNEST
-        sqlx::query(
+        let mut transaction = self.begin_chain_write(chain_id).await?;
+        let identities: Vec<_> = collects
+            .iter()
+            .map(|event| PoolEventIdentity {
+                pool: event.pool_identifier,
+                block: event.block,
+                block_hash: event.block_hash.as_deref(),
+                transaction_hash: &event.transaction_hash,
+                transaction_index: event.transaction_index,
+                log_index: event.log_index,
+                timestamp: event.ts_event,
+            })
+            .collect();
+        self.record_pool_event_identities(&mut transaction, chain_id, "collect", &identities)
+            .await?;
+
+        let inserted = sqlx::query(
             "
             INSERT INTO pool_collect_event (
                 chain_id, dex_name, pool_identifier, block, transaction_hash, transaction_index,
@@ -1752,11 +1856,21 @@ impl BlockchainCacheDatabase {
                 chain_id, dex_name, pool_identifier, block, transaction_hash, transaction_index,
                 log_index, owner, amount0::U256, amount1::U256, tick_lower, tick_upper
             FROM UNNEST(
-                $1::INT[], $2::TEXT[], $3::TEXT[], $4::INT[], $5::TEXT[], $6::INT[],
+                $1::INT[], $2::TEXT[], $3::TEXT[], $4::BIGINT[], $5::TEXT[], $6::INT[],
                 $7::INT[], $8::TEXT[], $9::TEXT[], $10::TEXT[], $11::INT[], $12::INT[]
             ) AS t(chain_id, dex_name, pool_identifier, block, transaction_hash, transaction_index,
                    log_index, owner, amount0, amount1, tick_lower, tick_upper)
-            ON CONFLICT (chain_id, transaction_hash, log_index) DO NOTHING
+            ON CONFLICT (chain_id, transaction_hash, log_index) DO UPDATE
+            SET log_index = EXCLUDED.log_index
+            WHERE pool_collect_event.dex_name IS NOT DISTINCT FROM EXCLUDED.dex_name
+                AND pool_collect_event.pool_identifier IS NOT DISTINCT FROM EXCLUDED.pool_identifier
+                AND pool_collect_event.block IS NOT DISTINCT FROM EXCLUDED.block
+                AND pool_collect_event.transaction_index IS NOT DISTINCT FROM EXCLUDED.transaction_index
+                AND pool_collect_event.owner IS NOT DISTINCT FROM EXCLUDED.owner
+                AND pool_collect_event.amount0 IS NOT DISTINCT FROM EXCLUDED.amount0
+                AND pool_collect_event.amount1 IS NOT DISTINCT FROM EXCLUDED.amount1
+                AND pool_collect_event.tick_lower IS NOT DISTINCT FROM EXCLUDED.tick_lower
+                AND pool_collect_event.tick_upper IS NOT DISTINCT FROM EXCLUDED.tick_upper
            ",
         )
         .bind(&chain_ids[..])
@@ -1771,10 +1885,16 @@ impl BlockchainCacheDatabase {
         .bind(&amount1s[..])
         .bind(&tick_lowers[..])
         .bind(&tick_uppers[..])
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await
-        .map(|_| ())
-        .map_err(|e| anyhow::anyhow!("Failed to batch insert into pool_fee_collect table: {e}"))
+        .map(|result| result.rows_affected())
+        .map_err(|e| anyhow::anyhow!("Failed to batch insert into pool_fee_collect table: {e}"))?;
+        anyhow::ensure!(
+            inserted == u64::try_from(collects.len())?,
+            "A duplicate pool event conflicts with its retained payload"
+        );
+        transaction.commit().await?;
+        Ok(())
     }
 
     /// Inserts multiple pool flash events in a single database operation using UNNEST for optimal performance.
@@ -1790,6 +1910,12 @@ impl BlockchainCacheDatabase {
         if flash_events.is_empty() {
             return Ok(());
         }
+        anyhow::ensure!(
+            flash_events
+                .iter()
+                .all(|event| event.chain.chain_id == chain_id),
+            "A pool event batch crosses chains"
+        );
 
         // Prepare vectors for each column
         let len = flash_events.len();
@@ -1825,7 +1951,23 @@ impl BlockchainCacheDatabase {
         }
 
         // Execute batch insert with UNNEST
-        sqlx::query(
+        let mut transaction = self.begin_chain_write(chain_id).await?;
+        let identities: Vec<_> = flash_events
+            .iter()
+            .map(|event| PoolEventIdentity {
+                pool: event.pool_identifier,
+                block: event.block,
+                block_hash: event.block_hash.as_deref(),
+                transaction_hash: &event.transaction_hash,
+                transaction_index: event.transaction_index,
+                log_index: event.log_index,
+                timestamp: event.ts_event,
+            })
+            .collect();
+        self.record_pool_event_identities(&mut transaction, chain_id, "flash", &identities)
+            .await?;
+
+        let inserted = sqlx::query(
             "
             INSERT INTO pool_flash_event (
                 chain_id, dex_name, pool_identifier, block, transaction_hash, transaction_index,
@@ -1835,11 +1977,22 @@ impl BlockchainCacheDatabase {
                 chain_id, dex_name, pool_identifier, block, transaction_hash, transaction_index,
                 log_index, sender, recipient, amount0::U256, amount1::U256, paid0::U256, paid1::U256
             FROM UNNEST(
-                $1::INT[], $2::TEXT[], $3::TEXT[], $4::INT[], $5::TEXT[], $6::INT[],
+                $1::INT[], $2::TEXT[], $3::TEXT[], $4::BIGINT[], $5::TEXT[], $6::INT[],
                 $7::INT[], $8::TEXT[], $9::TEXT[], $10::TEXT[], $11::TEXT[], $12::TEXT[], $13::TEXT[]
             ) AS t(chain_id, dex_name, pool_identifier, block, transaction_hash, transaction_index,
                    log_index, sender, recipient, amount0, amount1, paid0, paid1)
-            ON CONFLICT (chain_id, transaction_hash, log_index) DO NOTHING
+            ON CONFLICT (chain_id, transaction_hash, log_index) DO UPDATE
+            SET log_index = EXCLUDED.log_index
+            WHERE pool_flash_event.dex_name IS NOT DISTINCT FROM EXCLUDED.dex_name
+                AND pool_flash_event.pool_identifier IS NOT DISTINCT FROM EXCLUDED.pool_identifier
+                AND pool_flash_event.block IS NOT DISTINCT FROM EXCLUDED.block
+                AND pool_flash_event.transaction_index IS NOT DISTINCT FROM EXCLUDED.transaction_index
+                AND pool_flash_event.sender IS NOT DISTINCT FROM EXCLUDED.sender
+                AND pool_flash_event.recipient IS NOT DISTINCT FROM EXCLUDED.recipient
+                AND pool_flash_event.amount0 IS NOT DISTINCT FROM EXCLUDED.amount0
+                AND pool_flash_event.amount1 IS NOT DISTINCT FROM EXCLUDED.amount1
+                AND pool_flash_event.paid0 IS NOT DISTINCT FROM EXCLUDED.paid0
+                AND pool_flash_event.paid1 IS NOT DISTINCT FROM EXCLUDED.paid1
            ",
         )
         .bind(&chain_ids[..])
@@ -1855,10 +2008,16 @@ impl BlockchainCacheDatabase {
         .bind(&amount1s[..])
         .bind(&paid0s[..])
         .bind(&paid1s[..])
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await
-        .map(|_| ())
-        .map_err(|e| anyhow::anyhow!("Failed to batch insert into pool_flash_event table: {e}"))
+        .map(|result| result.rows_affected())
+        .map_err(|e| anyhow::anyhow!("Failed to batch insert into pool_flash_event table: {e}"))?;
+        anyhow::ensure!(
+            inserted == u64::try_from(flash_events.len())?,
+            "A duplicate pool event conflicts with its retained payload"
+        );
+        transaction.commit().await?;
+        Ok(())
     }
 
     /// Inserts multiple pool fee-protocol update events in a single database operation using UNNEST.
@@ -1874,6 +2033,10 @@ impl BlockchainCacheDatabase {
         if updates.is_empty() {
             return Ok(());
         }
+        anyhow::ensure!(
+            updates.iter().all(|event| event.chain.chain_id == chain_id),
+            "A pool event batch crosses chains"
+        );
 
         // Prepare vectors for each column
         let len = updates.len();
@@ -1911,7 +2074,28 @@ impl BlockchainCacheDatabase {
         }
 
         // Execute batch insert with UNNEST
-        sqlx::query(
+        let mut transaction = self.begin_chain_write(chain_id).await?;
+        let identities: Vec<_> = updates
+            .iter()
+            .map(|event| PoolEventIdentity {
+                pool: event.pool_identifier,
+                block: event.block,
+                block_hash: event.block_hash.as_deref(),
+                transaction_hash: &event.transaction_hash,
+                transaction_index: event.transaction_index,
+                log_index: event.log_index,
+                timestamp: event.ts_event,
+            })
+            .collect();
+        self.record_pool_event_identities(
+            &mut transaction,
+            chain_id,
+            "fee_protocol_update",
+            &identities,
+        )
+        .await?;
+
+        let inserted = sqlx::query(
             "
             INSERT INTO pool_fee_protocol_update_event (
                 chain_id, dex_name, pool_identifier, block, transaction_hash, transaction_index,
@@ -1921,11 +2105,18 @@ impl BlockchainCacheDatabase {
                 chain_id, dex_name, pool_identifier, block, transaction_hash, transaction_index,
                 log_index, fee_protocol0_new, fee_protocol1_new
             FROM UNNEST(
-                $1::INT[], $2::TEXT[], $3::TEXT[], $4::INT[], $5::TEXT[], $6::INT[],
+                $1::INT[], $2::TEXT[], $3::TEXT[], $4::BIGINT[], $5::TEXT[], $6::INT[],
                 $7::INT[], $8::INT[], $9::INT[]
             ) AS t(chain_id, dex_name, pool_identifier, block, transaction_hash, transaction_index,
                    log_index, fee_protocol0_new, fee_protocol1_new)
-            ON CONFLICT (chain_id, transaction_hash, log_index) DO NOTHING
+            ON CONFLICT (chain_id, transaction_hash, log_index) DO UPDATE
+            SET log_index = EXCLUDED.log_index
+            WHERE pool_fee_protocol_update_event.dex_name IS NOT DISTINCT FROM EXCLUDED.dex_name
+                AND pool_fee_protocol_update_event.pool_identifier IS NOT DISTINCT FROM EXCLUDED.pool_identifier
+                AND pool_fee_protocol_update_event.block IS NOT DISTINCT FROM EXCLUDED.block
+                AND pool_fee_protocol_update_event.transaction_index IS NOT DISTINCT FROM EXCLUDED.transaction_index
+                AND pool_fee_protocol_update_event.fee_protocol0_new IS NOT DISTINCT FROM EXCLUDED.fee_protocol0_new
+                AND pool_fee_protocol_update_event.fee_protocol1_new IS NOT DISTINCT FROM EXCLUDED.fee_protocol1_new
            ",
         )
         .bind(&chain_ids[..])
@@ -1937,12 +2128,18 @@ impl BlockchainCacheDatabase {
         .bind(&log_indices[..])
         .bind(&fee_protocol0s[..])
         .bind(&fee_protocol1s[..])
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await
-        .map(|_| ())
+        .map(|result| result.rows_affected())
         .map_err(|e| {
             anyhow::anyhow!("Failed to batch insert into pool_fee_protocol_update_event table: {e}")
-        })
+        })?;
+        anyhow::ensure!(
+            inserted == u64::try_from(updates.len())?,
+            "A duplicate pool event conflicts with its retained payload"
+        );
+        transaction.commit().await?;
+        Ok(())
     }
 
     /// Inserts multiple pool protocol-fee withdrawal events in a single database operation using UNNEST.
@@ -1958,6 +2155,12 @@ impl BlockchainCacheDatabase {
         if collects.is_empty() {
             return Ok(());
         }
+        anyhow::ensure!(
+            collects
+                .iter()
+                .all(|event| event.chain.chain_id == chain_id),
+            "A pool event batch crosses chains"
+        );
 
         // Prepare vectors for each column
         let len = collects.len();
@@ -1989,7 +2192,28 @@ impl BlockchainCacheDatabase {
         }
 
         // Execute batch insert with UNNEST
-        sqlx::query(
+        let mut transaction = self.begin_chain_write(chain_id).await?;
+        let identities: Vec<_> = collects
+            .iter()
+            .map(|event| PoolEventIdentity {
+                pool: event.pool_identifier,
+                block: event.block,
+                block_hash: event.block_hash.as_deref(),
+                transaction_hash: &event.transaction_hash,
+                transaction_index: event.transaction_index,
+                log_index: event.log_index,
+                timestamp: event.ts_event,
+            })
+            .collect();
+        self.record_pool_event_identities(
+            &mut transaction,
+            chain_id,
+            "fee_protocol_collect",
+            &identities,
+        )
+        .await?;
+
+        let inserted = sqlx::query(
             "
             INSERT INTO pool_fee_protocol_collect_event (
                 chain_id, dex_name, pool_identifier, block, transaction_hash, transaction_index,
@@ -1999,11 +2223,20 @@ impl BlockchainCacheDatabase {
                 chain_id, dex_name, pool_identifier, block, transaction_hash, transaction_index,
                 log_index, sender, recipient, amount0::U256, amount1::U256
             FROM UNNEST(
-                $1::INT[], $2::TEXT[], $3::TEXT[], $4::INT[], $5::TEXT[], $6::INT[],
+                $1::INT[], $2::TEXT[], $3::TEXT[], $4::BIGINT[], $5::TEXT[], $6::INT[],
                 $7::INT[], $8::TEXT[], $9::TEXT[], $10::TEXT[], $11::TEXT[]
             ) AS t(chain_id, dex_name, pool_identifier, block, transaction_hash, transaction_index,
                    log_index, sender, recipient, amount0, amount1)
-            ON CONFLICT (chain_id, transaction_hash, log_index) DO NOTHING
+            ON CONFLICT (chain_id, transaction_hash, log_index) DO UPDATE
+            SET log_index = EXCLUDED.log_index
+            WHERE pool_fee_protocol_collect_event.dex_name IS NOT DISTINCT FROM EXCLUDED.dex_name
+                AND pool_fee_protocol_collect_event.pool_identifier IS NOT DISTINCT FROM EXCLUDED.pool_identifier
+                AND pool_fee_protocol_collect_event.block IS NOT DISTINCT FROM EXCLUDED.block
+                AND pool_fee_protocol_collect_event.transaction_index IS NOT DISTINCT FROM EXCLUDED.transaction_index
+                AND pool_fee_protocol_collect_event.sender IS NOT DISTINCT FROM EXCLUDED.sender
+                AND pool_fee_protocol_collect_event.recipient IS NOT DISTINCT FROM EXCLUDED.recipient
+                AND pool_fee_protocol_collect_event.amount0 IS NOT DISTINCT FROM EXCLUDED.amount0
+                AND pool_fee_protocol_collect_event.amount1 IS NOT DISTINCT FROM EXCLUDED.amount1
            ",
         )
         .bind(&chain_ids[..])
@@ -2017,14 +2250,20 @@ impl BlockchainCacheDatabase {
         .bind(&recipients[..])
         .bind(&amount0s[..])
         .bind(&amount1s[..])
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await
-        .map(|_| ())
+        .map(|result| result.rows_affected())
         .map_err(|e| {
             anyhow::anyhow!(
                 "Failed to batch insert into pool_fee_protocol_collect_event table: {e}"
             )
-        })
+        })?;
+        anyhow::ensure!(
+            inserted == u64::try_from(collects.len())?,
+            "A duplicate pool event conflicts with its retained payload"
+        );
+        transaction.commit().await?;
+        Ok(())
     }
 
     /// Adds a pool snapshot to the database.
@@ -2039,7 +2278,24 @@ impl BlockchainCacheDatabase {
         pool_identifier: &PoolIdentifier,
         snapshot: &PoolSnapshot,
     ) -> anyhow::Result<()> {
-        sqlx::query(
+        let mut transaction = self.begin_chain_write(chain_id).await?;
+        let content_digest = snapshot_content_digest(snapshot)?;
+        let block_hash = snapshot
+            .block_position
+            .block_hash
+            .as_deref()
+            .map(parse_hash)
+            .transpose()?
+            .context("Snapshot lacks its original block hash")?;
+        verify_stored_hash(
+            &mut transaction,
+            chain_id,
+            snapshot.block_position.number,
+            block_hash,
+            true,
+        )
+        .await?;
+        let inserted = sqlx::query(
             "
             INSERT INTO pool_snapshot (
                 chain_id, dex_name, pool_identifier, block, transaction_index, log_index, transaction_hash,
@@ -2050,12 +2306,12 @@ impl BlockchainCacheDatabase {
                 total_amount0_deposited, total_amount1_deposited,
                 total_amount0_collected, total_amount1_collected,
                 total_swaps, total_mints, total_burns, total_fee_collects, total_flashes,
-                liquidity_utilization_rate
+                liquidity_utilization_rate, observed_block_hash, observed_timestamp, complete, content_digest
             ) VALUES (
                 $1, $2, $3, $4, $5, $6, $7,
                 $8, $9::U160, $10::U128, $11::U256, $12::U256, $13, $14, $15,
                 $16::U256, $17::U256, $18::U256, $19::U256, $20::U256, $21::U256,
-                $22, $23, $24, $25, $26, $27
+                $22, $23, $24, $25, $26, $27, $28, $29, TRUE, $30
             )
             ON CONFLICT (chain_id, pool_identifier, block, transaction_index, log_index)
             DO UPDATE SET
@@ -2080,7 +2336,16 @@ impl BlockchainCacheDatabase {
                 total_burns = EXCLUDED.total_burns,
                 total_fee_collects = EXCLUDED.total_fee_collects,
                 total_flashes = EXCLUDED.total_flashes,
-                liquidity_utilization_rate = EXCLUDED.liquidity_utilization_rate
+                liquidity_utilization_rate = EXCLUDED.liquidity_utilization_rate,
+                observed_block_hash = EXCLUDED.observed_block_hash,
+                observed_timestamp = EXCLUDED.observed_timestamp, complete = TRUE,
+                content_digest = EXCLUDED.content_digest,
+                validated_content_digest = CASE WHEN pool_snapshot.content_digest = EXCLUDED.content_digest
+                    THEN pool_snapshot.validated_content_digest ELSE NULL END,
+                validation_state = CASE WHEN pool_snapshot.content_digest = EXCLUDED.content_digest
+                    THEN pool_snapshot.validation_state ELSE 'replay' END
+            WHERE pool_snapshot.observed_block_hash IS NULL
+               OR pool_snapshot.observed_block_hash = EXCLUDED.observed_block_hash
             ",
         )
         .bind(chain_id as i32)
@@ -2110,10 +2375,53 @@ impl BlockchainCacheDatabase {
         .bind(snapshot.analytics.total_fee_collects as i32)
         .bind(snapshot.analytics.total_flashes as i32)
         .bind(snapshot.analytics.liquidity_utilization_rate)
-        .execute(&self.pool)
+        .bind(block_hash.to_string())
+        .bind(snapshot.ts_event.to_string())
+        .bind(content_digest)
+        .execute(&mut *transaction)
         .await
-        .map(|_| ())
-        .map_err(|e| anyhow::anyhow!("Failed to insert into pool_snapshot table: {e}"))
+        .map(|result| result.rows_affected())
+        .map_err(|e| anyhow::anyhow!("Failed to insert into pool_snapshot table: {e}"))?;
+
+        anyhow::ensure!(
+            inserted == 1,
+            "Snapshot conflicts with its retained branch identity"
+        );
+
+        // Replacing a same-anchor snapshot must remove children absent from its new complete view
+        for table in ["pool_position", "pool_tick"] {
+            sqlx::query(AssertSqlSafe(format!(
+                "DELETE FROM {table} WHERE chain_id = $1 AND pool_identifier = $2
+                 AND snapshot_block = $3 AND snapshot_transaction_index = $4 AND snapshot_log_index = $5"
+            )))
+            .bind(chain_id as i32)
+            .bind(pool_identifier.as_ref())
+            .bind(snapshot.block_position.number as i64)
+            .bind(snapshot.block_position.transaction_index as i32)
+            .bind(snapshot.block_position.log_index as i32)
+            .execute(&mut *transaction).await?;
+        }
+        let positions: Vec<_> = snapshot
+            .positions
+            .iter()
+            .map(|position| (*pool_identifier, position.clone()))
+            .collect();
+        let ticks: Vec<_> = snapshot
+            .ticks
+            .iter()
+            .map(|tick| (*pool_identifier, tick))
+            .collect();
+        self.insert_pool_positions(
+            &mut transaction,
+            chain_id,
+            &snapshot.block_position,
+            &positions,
+        )
+        .await?;
+        self.insert_pool_ticks(&mut transaction, chain_id, &snapshot.block_position, &ticks)
+            .await?;
+        transaction.commit().await?;
+        Ok(())
     }
 
     /// Inserts multiple pool positions in a single database operation using UNNEST for optimal performance.
@@ -2121,12 +2429,11 @@ impl BlockchainCacheDatabase {
     /// # Errors
     ///
     /// Returns an error if the database operation fails.
-    pub async fn add_pool_positions_batch(
+    async fn insert_pool_positions(
         &self,
+        transaction: &mut Transaction<'_, Postgres>,
         chain_id: u32,
-        snapshot_block: u64,
-        snapshot_transaction_index: u32,
-        snapshot_log_index: u32,
+        position: &BlockPosition,
         positions: &[(PoolIdentifier, PoolPosition)],
     ) -> anyhow::Result<()> {
         if positions.is_empty() {
@@ -2207,9 +2514,9 @@ impl BlockchainCacheDatabase {
            ",
         )
         .bind(chain_id as i32)
-        .bind(snapshot_block as i64)
-        .bind(snapshot_transaction_index as i32)
-        .bind(snapshot_log_index as i32)
+        .bind(position.number as i64)
+        .bind(position.transaction_index as i32)
+        .bind(position.log_index as i32)
         .bind(&pool_identifiers[..])
         .bind(&owners[..])
         .bind(&tick_lowers[..])
@@ -2223,7 +2530,7 @@ impl BlockchainCacheDatabase {
         .bind(&total_amount1_depositeds as &[Option<String>])
         .bind(&total_amount0_collecteds as &[Option<String>])
         .bind(&total_amount1_collecteds as &[Option<String>])
-        .execute(&self.pool)
+        .execute(&mut **transaction)
         .await
         .map(|_| ())
         .map_err(|e| anyhow::anyhow!("Failed to batch insert into pool_position table: {e}"))
@@ -2234,12 +2541,11 @@ impl BlockchainCacheDatabase {
     /// # Errors
     ///
     /// Returns an error if the database operation fails.
-    pub async fn add_pool_ticks_batch(
+    async fn insert_pool_ticks(
         &self,
+        transaction: &mut Transaction<'_, Postgres>,
         chain_id: u32,
-        snapshot_block: u64,
-        snapshot_transaction_index: u32,
-        snapshot_log_index: u32,
+        position: &BlockPosition,
         ticks: &[(PoolIdentifier, &PoolTick)],
     ) -> anyhow::Result<()> {
         if ticks.is_empty() {
@@ -2297,9 +2603,9 @@ impl BlockchainCacheDatabase {
            ",
         )
         .bind(chain_id as i32)
-        .bind(snapshot_block as i64)
-        .bind(snapshot_transaction_index as i32)
-        .bind(snapshot_log_index as i32)
+        .bind(position.number as i64)
+        .bind(position.transaction_index as i32)
+        .bind(position.log_index as i32)
         .bind(&pool_identifiers[..])
         .bind(&tick_values[..])
         .bind(&liquidity_grosses[..])
@@ -2308,7 +2614,7 @@ impl BlockchainCacheDatabase {
         .bind(&fee_growth_outside_1s[..])
         .bind(&initializeds[..])
         .bind(&last_updated_blocks[..])
-        .execute(&self.pool)
+        .execute(&mut **transaction)
         .await
         .map(|_| ())
         .map_err(|e| anyhow::anyhow!("Failed to batch insert into pool_tick table: {e}"))
@@ -2324,6 +2630,8 @@ impl BlockchainCacheDatabase {
         chain_id: u32,
         initialize_event: &InitializeEvent,
     ) -> anyhow::Result<()> {
+        let mut transaction = self.begin_chain_write(chain_id).await?;
+
         sqlx::query(
             "
             UPDATE pool
@@ -2340,10 +2648,12 @@ impl BlockchainCacheDatabase {
         .bind(initialize_event.pool_identifier.as_ref())
         .bind(initialize_event.tick)
         .bind(initialize_event.sqrt_price_x96.to_string())
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await
         .map(|_| ())
-        .map_err(|e| anyhow::anyhow!("Failed to update pool initial price and tick: {e}"))
+        .map_err(|e| anyhow::anyhow!("Failed to update pool initial price and tick: {e}"))?;
+        transaction.commit().await?;
+        Ok(())
     }
 
     /// Loads the latest usable pool snapshot from the database.
@@ -2380,15 +2690,13 @@ impl BlockchainCacheDatabase {
         max_block: Option<u64>,
         require_valid: bool,
     ) -> anyhow::Result<Option<PoolSnapshot>> {
+        let mut transaction = self.begin_chain_read(chain_id).await?;
         let allow_invalid = !require_valid;
         let result = sqlx::query(
             "
             SELECT
                 block, transaction_index, log_index, transaction_hash,
-                COALESCE(
-                    (SELECT hash FROM pool_event_block WHERE pool_event_block.chain_id = pool_snapshot.chain_id AND pool_event_block.number = pool_snapshot.block),
-                    (SELECT hash FROM block WHERE block.chain_id = pool_snapshot.chain_id AND block.number = pool_snapshot.block)
-                ) as block_hash,
+                observed_block_hash as block_hash,
                 current_tick, price_sqrt_ratio_x96::TEXT, liquidity::TEXT,
                 protocol_fees_token0::TEXT, protocol_fees_token1::TEXT, fee_protocol,
                 fee_protocol0_basis_points, fee_protocol1_basis_points,
@@ -2397,13 +2705,11 @@ impl BlockchainCacheDatabase {
                 total_amount0_collected::TEXT, total_amount1_collected::TEXT,
                 total_swaps, total_mints, total_burns, total_fee_collects, total_flashes,
                 liquidity_utilization_rate,
-                (SELECT dex_name FROM pool WHERE chain_id = $1 AND address = $2) as dex_name,
-                COALESCE(
-                    (SELECT timestamp::TEXT FROM block WHERE block.chain_id = pool_snapshot.chain_id AND block.number = pool_snapshot.block),
-                    (SELECT timestamp::TEXT FROM pool_event_block WHERE pool_event_block.chain_id = pool_snapshot.chain_id AND pool_event_block.number = pool_snapshot.block)
-                ) as block_timestamp
+                (SELECT dex_name FROM pool WHERE chain_id = $1 AND pool_identifier = $2) as dex_name,
+                observed_timestamp as block_timestamp
             FROM pool_snapshot
             WHERE chain_id = $1 AND pool_identifier = $2
+                AND complete AND observed_block_hash IS NOT NULL
                 AND ($3::BIGINT IS NULL OR block <= $3)
                 AND ($4 OR validation_state <> 'invalid')
             ORDER BY block DESC, transaction_index DESC, log_index DESC
@@ -2414,7 +2720,7 @@ impl BlockchainCacheDatabase {
         .bind(pool_identifier.as_ref())
         .bind(max_block.map(|b| b as i64))
         .bind(allow_invalid)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *transaction)
         .await
         .map_err(|e| anyhow::anyhow!("Failed to load latest valid pool snapshot: {e}"))?;
 
@@ -2431,13 +2737,7 @@ impl BlockchainCacheDatabase {
                 .with_context(|| "Pool snapshot transaction index is negative")?;
             let log_index =
                 u32::try_from(log_index).with_context(|| "Pool snapshot log index is negative")?;
-            let block_hash = if transaction_index == BLOCK_SCOPED_SNAPSHOT_INDEX
-                && log_index == BLOCK_SCOPED_SNAPSHOT_INDEX
-            {
-                Some(transaction_hash.clone())
-            } else {
-                observed_block_hash
-            };
+            let block_hash = observed_block_hash;
             let block_timestamp = row
                 .try_get::<Option<String>, _>("block_timestamp")?
                 .ok_or_else(|| {
@@ -2506,22 +2806,20 @@ impl BlockchainCacheDatabase {
 
             // Load positions and ticks
             let positions = self
-                .load_pool_positions_for_snapshot(
+                .load_pool_positions_in_transaction(
+                    &mut transaction,
                     chain_id,
                     pool_identifier,
-                    block,
-                    transaction_index,
-                    log_index,
+                    &block_position,
                 )
                 .await?;
 
             let ticks = self
-                .load_pool_ticks_for_snapshot(
+                .load_pool_ticks_in_transaction(
+                    &mut transaction,
                     chain_id,
                     pool_identifier,
-                    block,
-                    transaction_index,
-                    log_index,
+                    &block_position,
                 )
                 .await?;
 
@@ -2576,10 +2874,22 @@ impl BlockchainCacheDatabase {
         log_index: u32,
         state: &str,
     ) -> anyhow::Result<()> {
+        let mut transaction = self.begin_chain_write(chain_id).await?;
+        let managed: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM blockchain_canonical_state WHERE chain_id = $1)",
+        )
+        .bind(i32::try_from(chain_id)?)
+        .fetch_one(&mut *transaction)
+        .await?;
+        anyhow::ensure!(
+            !managed,
+            "Canonical snapshot validation requires the exact validated snapshot content"
+        );
+
         sqlx::query(
             "
             UPDATE pool_snapshot
-            SET validation_state = $6
+            SET validation_state = $6, validated_content_digest = NULL
             WHERE chain_id = $1
             AND pool_identifier = $2
             AND block = $3
@@ -2593,10 +2903,110 @@ impl BlockchainCacheDatabase {
         .bind(transaction_index as i32)
         .bind(log_index as i32)
         .bind(state)
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await
         .map(|_| ())
-        .map_err(|e| anyhow::anyhow!("Failed to set pool snapshot validation state: {e}"))
+        .map_err(|e| anyhow::anyhow!("Failed to set pool snapshot validation state: {e}"))?;
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    /// Persists a validation result only if the snapshot still matches the validated content.
+    ///
+    /// The caller retains the exact snapshot across external validation. A rewritten snapshot
+    /// or a recovery epoch change rejects the delayed result instead of certifying new content.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the writer is stale, the snapshot is missing or changed, or the database fails.
+    pub async fn set_pool_snapshot_validation_state_for_snapshot(
+        &self,
+        chain_id: u32,
+        pool_identifier: &PoolIdentifier,
+        snapshot: &PoolSnapshot,
+        state: &str,
+    ) -> anyhow::Result<()> {
+        let content_digest = snapshot_content_digest(snapshot)?;
+        let block_hash = snapshot
+            .block_position
+            .block_hash
+            .as_deref()
+            .map(parse_hash)
+            .transpose()?
+            .context("Validated snapshot lacks its original hash")?;
+        let mut transaction = self.begin_chain_write(chain_id).await?;
+        verify_stored_hash(
+            &mut transaction,
+            chain_id,
+            snapshot.block_position.number,
+            block_hash,
+            true,
+        )
+        .await?;
+        let updated = sqlx::query(
+            "UPDATE pool_snapshot SET validation_state = $6,
+                validated_content_digest = CASE WHEN $6 IN ('on_chain', 'invalid') THEN $8 ELSE NULL END
+             WHERE chain_id = $1 AND pool_identifier = $2 AND block = $3
+               AND transaction_index = $4 AND log_index = $5 AND complete
+               AND observed_block_hash = $7 AND content_digest = $8",
+        )
+        .bind(i32::try_from(chain_id)?)
+        .bind(pool_identifier.as_ref())
+        .bind(i64::try_from(snapshot.block_position.number)?)
+        .bind(i32::try_from(snapshot.block_position.transaction_index)?)
+        .bind(i32::try_from(snapshot.block_position.log_index)?)
+        .bind(state)
+        .bind(block_hash.to_string())
+        .bind(content_digest)
+        .execute(&mut *transaction)
+        .await?;
+        anyhow::ensure!(
+            updated.rows_affected() == 1,
+            "Validated snapshot was replaced, removed, or is incomplete"
+        );
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    /// Reads a validation result bound to the exact complete snapshot supplied by the caller.
+    ///
+    /// A legacy height-only verdict has no content proof and returns `None`. This query also
+    /// rejects a snapshot replaced between loading its child rows and reading its verdict.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the snapshot lacks its original identity or the query fails.
+    pub async fn get_pool_snapshot_validation_state_for_snapshot(
+        &self,
+        chain_id: u32,
+        pool_identifier: &PoolIdentifier,
+        snapshot: &PoolSnapshot,
+    ) -> anyhow::Result<Option<String>> {
+        let digest = snapshot_content_digest(snapshot)?;
+        let hash = snapshot
+            .block_position
+            .block_hash
+            .as_deref()
+            .map(parse_hash)
+            .transpose()?
+            .context("Snapshot verdict requires its original hash")?;
+        sqlx::query_scalar::<_, String>(
+            "SELECT validation_state FROM pool_snapshot
+             WHERE chain_id = $1 AND pool_identifier = $2 AND block = $3
+               AND transaction_index = $4 AND log_index = $5 AND complete
+               AND observed_block_hash = $6 AND content_digest = $7
+               AND validated_content_digest = content_digest",
+        )
+        .bind(i32::try_from(chain_id)?)
+        .bind(pool_identifier.as_ref())
+        .bind(i64::try_from(snapshot.block_position.number)?)
+        .bind(i32::try_from(snapshot.block_position.transaction_index)?)
+        .bind(i32::try_from(snapshot.block_position.log_index)?)
+        .bind(hash.to_string())
+        .bind(digest)
+        .fetch_optional(&self.pool)
+        .await
+        .context("Failed to load content-bound snapshot validation")
     }
 
     /// Reads the stored `validation_state` for the snapshot at the given watermark.
@@ -2651,6 +3061,29 @@ impl BlockchainCacheDatabase {
         snapshot_transaction_index: u32,
         snapshot_log_index: u32,
     ) -> anyhow::Result<Vec<PoolPosition>> {
+        let mut transaction = self.begin_chain_read(chain_id).await?;
+        let position = BlockPosition::new(
+            snapshot_block,
+            String::new(),
+            snapshot_transaction_index,
+            snapshot_log_index,
+        );
+        self.load_pool_positions_in_transaction(
+            &mut transaction,
+            chain_id,
+            pool_identifier,
+            &position,
+        )
+        .await
+    }
+
+    async fn load_pool_positions_in_transaction(
+        &self,
+        transaction: &mut Transaction<'_, Postgres>,
+        chain_id: u32,
+        pool_identifier: &PoolIdentifier,
+        position: &BlockPosition,
+    ) -> anyhow::Result<Vec<PoolPosition>> {
         let rows = sqlx::query(
             "
             SELECT
@@ -2665,14 +3098,15 @@ impl BlockchainCacheDatabase {
             AND snapshot_block = $3
             AND snapshot_transaction_index = $4
             AND snapshot_log_index = $5
+            ORDER BY owner, tick_lower, tick_upper
             ",
         )
         .bind(chain_id as i32)
         .bind(pool_identifier.as_ref())
-        .bind(snapshot_block as i64)
-        .bind(snapshot_transaction_index as i32)
-        .bind(snapshot_log_index as i32)
-        .fetch_all(&self.pool)
+        .bind(i64::try_from(position.number)?)
+        .bind(i32::try_from(position.transaction_index)?)
+        .bind(i32::try_from(position.log_index)?)
+        .fetch_all(&mut **transaction)
         .await
         .map_err(|e| anyhow::anyhow!("Failed to load pool positions: {e}"))?;
 
@@ -2723,6 +3157,24 @@ impl BlockchainCacheDatabase {
         snapshot_transaction_index: u32,
         snapshot_log_index: u32,
     ) -> anyhow::Result<Vec<PoolTick>> {
+        let mut transaction = self.begin_chain_read(chain_id).await?;
+        let position = BlockPosition::new(
+            snapshot_block,
+            String::new(),
+            snapshot_transaction_index,
+            snapshot_log_index,
+        );
+        self.load_pool_ticks_in_transaction(&mut transaction, chain_id, pool_identifier, &position)
+            .await
+    }
+
+    async fn load_pool_ticks_in_transaction(
+        &self,
+        transaction: &mut Transaction<'_, Postgres>,
+        chain_id: u32,
+        pool_identifier: &PoolIdentifier,
+        position: &BlockPosition,
+    ) -> anyhow::Result<Vec<PoolTick>> {
         let rows = sqlx::query(
             "
             SELECT
@@ -2735,14 +3187,15 @@ impl BlockchainCacheDatabase {
             AND snapshot_block = $3
             AND snapshot_transaction_index = $4
             AND snapshot_log_index = $5
+            ORDER BY tick_value
             ",
         )
         .bind(chain_id as i32)
         .bind(pool_identifier.as_ref())
-        .bind(snapshot_block as i64)
-        .bind(snapshot_transaction_index as i32)
-        .bind(snapshot_log_index as i32)
-        .fetch_all(&self.pool)
+        .bind(i64::try_from(position.number)?)
+        .bind(i32::try_from(position.transaction_index)?)
+        .bind(i32::try_from(position.log_index)?)
+        .fetch_all(&mut **transaction)
         .await
         .map_err(|e| anyhow::anyhow!("Failed to load pool ticks: {e}"))?;
 
@@ -2787,10 +3240,11 @@ impl BlockchainCacheDatabase {
     ) -> Pin<Box<dyn Stream<Item = Result<DexPoolData, anyhow::Error>> + Send + 'a>> {
         const QUERY_ALL: &str = "
             SELECT events.*,
-                COALESCE(
-                    (SELECT hash FROM pool_event_block WHERE pool_event_block.chain_id = events.chain_id AND pool_event_block.number = events.block),
-                    (SELECT hash FROM block WHERE block.chain_id = events.chain_id AND block.number = events.block)
-                ) as block_hash
+                (SELECT i.observed_block_hash FROM pool_event_identity i
+                 WHERE i.chain_id = events.chain_id AND i.transaction_hash = events.transaction_hash
+                   AND i.log_index = events.log_index AND i.pool_identifier = events.pool_identifier
+                   AND i.block = events.block AND i.transaction_index = events.transaction_index
+                   AND i.event_family = events.event_type) as block_hash
             FROM (
             (SELECT
                 'swap' as event_type,
@@ -2800,10 +3254,9 @@ impl BlockchainCacheDatabase {
                 transaction_hash,
                 transaction_index,
                 log_index,
-                COALESCE(
-                    (SELECT timestamp::TEXT FROM block WHERE block.chain_id = pool_swap_event.chain_id AND block.number = pool_swap_event.block),
-                    (SELECT timestamp::TEXT FROM pool_event_block WHERE pool_event_block.chain_id = pool_swap_event.chain_id AND pool_event_block.number = pool_swap_event.block)
-                ) as block_timestamp,
+                (SELECT i.observed_timestamp FROM pool_event_identity i
+                 WHERE i.chain_id = pool_swap_event.chain_id AND i.transaction_hash = pool_swap_event.transaction_hash
+                   AND i.log_index = pool_swap_event.log_index AND i.event_family = 'swap') as block_timestamp,
                 sender,
                 recipient,
                 NULL::TEXT as owner,
@@ -2836,10 +3289,9 @@ impl BlockchainCacheDatabase {
                 transaction_hash,
                 transaction_index,
                 log_index,
-                COALESCE(
-                    (SELECT timestamp::TEXT FROM block WHERE block.chain_id = pool_liquidity_event.chain_id AND block.number = pool_liquidity_event.block),
-                    (SELECT timestamp::TEXT FROM pool_event_block WHERE pool_event_block.chain_id = pool_liquidity_event.chain_id AND pool_event_block.number = pool_liquidity_event.block)
-                ) as block_timestamp,
+                (SELECT i.observed_timestamp FROM pool_event_identity i
+                 WHERE i.chain_id = pool_liquidity_event.chain_id AND i.transaction_hash = pool_liquidity_event.transaction_hash
+                   AND i.log_index = pool_liquidity_event.log_index AND i.event_family = 'liquidity') as block_timestamp,
                 sender,
                 NULL::TEXT as recipient,
                 owner,
@@ -2872,10 +3324,9 @@ impl BlockchainCacheDatabase {
                 transaction_hash,
                 transaction_index,
                 log_index,
-                COALESCE(
-                    (SELECT timestamp::TEXT FROM block WHERE block.chain_id = pool_collect_event.chain_id AND block.number = pool_collect_event.block),
-                    (SELECT timestamp::TEXT FROM pool_event_block WHERE pool_event_block.chain_id = pool_collect_event.chain_id AND pool_event_block.number = pool_collect_event.block)
-                ) as block_timestamp,
+                (SELECT i.observed_timestamp FROM pool_event_identity i
+                 WHERE i.chain_id = pool_collect_event.chain_id AND i.transaction_hash = pool_collect_event.transaction_hash
+                   AND i.log_index = pool_collect_event.log_index AND i.event_family = 'collect') as block_timestamp,
                 NULL::TEXT as sender,
                 NULL::TEXT as recipient,
                 owner,
@@ -2908,10 +3359,9 @@ impl BlockchainCacheDatabase {
                 transaction_hash,
                 transaction_index,
                 log_index,
-                COALESCE(
-                    (SELECT timestamp::TEXT FROM block WHERE block.chain_id = pool_fee_protocol_update_event.chain_id AND block.number = pool_fee_protocol_update_event.block),
-                    (SELECT timestamp::TEXT FROM pool_event_block WHERE pool_event_block.chain_id = pool_fee_protocol_update_event.chain_id AND pool_event_block.number = pool_fee_protocol_update_event.block)
-                ) as block_timestamp,
+                (SELECT i.observed_timestamp FROM pool_event_identity i
+                 WHERE i.chain_id = pool_fee_protocol_update_event.chain_id AND i.transaction_hash = pool_fee_protocol_update_event.transaction_hash
+                   AND i.log_index = pool_fee_protocol_update_event.log_index AND i.event_family = 'fee_protocol_update') as block_timestamp,
                 NULL::TEXT as sender,
                 NULL::TEXT as recipient,
                 NULL::TEXT as owner,
@@ -2944,10 +3394,9 @@ impl BlockchainCacheDatabase {
                 transaction_hash,
                 transaction_index,
                 log_index,
-                COALESCE(
-                    (SELECT timestamp::TEXT FROM block WHERE block.chain_id = pool_fee_protocol_collect_event.chain_id AND block.number = pool_fee_protocol_collect_event.block),
-                    (SELECT timestamp::TEXT FROM pool_event_block WHERE pool_event_block.chain_id = pool_fee_protocol_collect_event.chain_id AND pool_event_block.number = pool_fee_protocol_collect_event.block)
-                ) as block_timestamp,
+                (SELECT i.observed_timestamp FROM pool_event_identity i
+                 WHERE i.chain_id = pool_fee_protocol_collect_event.chain_id AND i.transaction_hash = pool_fee_protocol_collect_event.transaction_hash
+                   AND i.log_index = pool_fee_protocol_collect_event.log_index AND i.event_family = 'fee_protocol_collect') as block_timestamp,
                 sender,
                 recipient,
                 NULL::TEXT as owner,
@@ -2980,10 +3429,9 @@ impl BlockchainCacheDatabase {
                 transaction_hash,
                 transaction_index,
                 log_index,
-                COALESCE(
-                    (SELECT timestamp::TEXT FROM block WHERE block.chain_id = pool_flash_event.chain_id AND block.number = pool_flash_event.block),
-                    (SELECT timestamp::TEXT FROM pool_event_block WHERE pool_event_block.chain_id = pool_flash_event.chain_id AND pool_event_block.number = pool_flash_event.block)
-                ) as block_timestamp,
+                (SELECT i.observed_timestamp FROM pool_event_identity i
+                 WHERE i.chain_id = pool_flash_event.chain_id AND i.transaction_hash = pool_flash_event.transaction_hash
+                   AND i.log_index = pool_flash_event.log_index AND i.event_family = 'flash') as block_timestamp,
                 sender,
                 recipient,
                 NULL::TEXT as owner,
@@ -3012,10 +3460,11 @@ impl BlockchainCacheDatabase {
 
         const QUERY_FROM_POSITION: &str = "
             SELECT events.*,
-                COALESCE(
-                    (SELECT hash FROM pool_event_block WHERE pool_event_block.chain_id = events.chain_id AND pool_event_block.number = events.block),
-                    (SELECT hash FROM block WHERE block.chain_id = events.chain_id AND block.number = events.block)
-                ) as block_hash
+                (SELECT i.observed_block_hash FROM pool_event_identity i
+                 WHERE i.chain_id = events.chain_id AND i.transaction_hash = events.transaction_hash
+                   AND i.log_index = events.log_index AND i.pool_identifier = events.pool_identifier
+                   AND i.block = events.block AND i.transaction_index = events.transaction_index
+                   AND i.event_family = events.event_type) as block_hash
             FROM (
             (SELECT
                 'swap' as event_type,
@@ -3025,10 +3474,9 @@ impl BlockchainCacheDatabase {
                 transaction_hash,
                 transaction_index,
                 log_index,
-                COALESCE(
-                    (SELECT timestamp::TEXT FROM block WHERE block.chain_id = pool_swap_event.chain_id AND block.number = pool_swap_event.block),
-                    (SELECT timestamp::TEXT FROM pool_event_block WHERE pool_event_block.chain_id = pool_swap_event.chain_id AND pool_event_block.number = pool_swap_event.block)
-                ) as block_timestamp,
+                (SELECT i.observed_timestamp FROM pool_event_identity i
+                 WHERE i.chain_id = pool_swap_event.chain_id AND i.transaction_hash = pool_swap_event.transaction_hash
+                   AND i.log_index = pool_swap_event.log_index AND i.event_family = 'swap') as block_timestamp,
                 sender,
                 recipient,
                 NULL::TEXT as owner,
@@ -3062,10 +3510,9 @@ impl BlockchainCacheDatabase {
                 transaction_hash,
                 transaction_index,
                 log_index,
-                COALESCE(
-                    (SELECT timestamp::TEXT FROM block WHERE block.chain_id = pool_liquidity_event.chain_id AND block.number = pool_liquidity_event.block),
-                    (SELECT timestamp::TEXT FROM pool_event_block WHERE pool_event_block.chain_id = pool_liquidity_event.chain_id AND pool_event_block.number = pool_liquidity_event.block)
-                ) as block_timestamp,
+                (SELECT i.observed_timestamp FROM pool_event_identity i
+                 WHERE i.chain_id = pool_liquidity_event.chain_id AND i.transaction_hash = pool_liquidity_event.transaction_hash
+                   AND i.log_index = pool_liquidity_event.log_index AND i.event_family = 'liquidity') as block_timestamp,
                 sender,
                 NULL::TEXT as recipient,
                 owner,
@@ -3099,10 +3546,9 @@ impl BlockchainCacheDatabase {
                 transaction_hash,
                 transaction_index,
                 log_index,
-                COALESCE(
-                    (SELECT timestamp::TEXT FROM block WHERE block.chain_id = pool_collect_event.chain_id AND block.number = pool_collect_event.block),
-                    (SELECT timestamp::TEXT FROM pool_event_block WHERE pool_event_block.chain_id = pool_collect_event.chain_id AND pool_event_block.number = pool_collect_event.block)
-                ) as block_timestamp,
+                (SELECT i.observed_timestamp FROM pool_event_identity i
+                 WHERE i.chain_id = pool_collect_event.chain_id AND i.transaction_hash = pool_collect_event.transaction_hash
+                   AND i.log_index = pool_collect_event.log_index AND i.event_family = 'collect') as block_timestamp,
                 NULL::TEXT as sender,
                 NULL::TEXT as recipient,
                 owner,
@@ -3136,10 +3582,9 @@ impl BlockchainCacheDatabase {
                 transaction_hash,
                 transaction_index,
                 log_index,
-                COALESCE(
-                    (SELECT timestamp::TEXT FROM block WHERE block.chain_id = pool_fee_protocol_update_event.chain_id AND block.number = pool_fee_protocol_update_event.block),
-                    (SELECT timestamp::TEXT FROM pool_event_block WHERE pool_event_block.chain_id = pool_fee_protocol_update_event.chain_id AND pool_event_block.number = pool_fee_protocol_update_event.block)
-                ) as block_timestamp,
+                (SELECT i.observed_timestamp FROM pool_event_identity i
+                 WHERE i.chain_id = pool_fee_protocol_update_event.chain_id AND i.transaction_hash = pool_fee_protocol_update_event.transaction_hash
+                   AND i.log_index = pool_fee_protocol_update_event.log_index AND i.event_family = 'fee_protocol_update') as block_timestamp,
                 NULL::TEXT as sender,
                 NULL::TEXT as recipient,
                 NULL::TEXT as owner,
@@ -3173,10 +3618,9 @@ impl BlockchainCacheDatabase {
                 transaction_hash,
                 transaction_index,
                 log_index,
-                COALESCE(
-                    (SELECT timestamp::TEXT FROM block WHERE block.chain_id = pool_fee_protocol_collect_event.chain_id AND block.number = pool_fee_protocol_collect_event.block),
-                    (SELECT timestamp::TEXT FROM pool_event_block WHERE pool_event_block.chain_id = pool_fee_protocol_collect_event.chain_id AND pool_event_block.number = pool_fee_protocol_collect_event.block)
-                ) as block_timestamp,
+                (SELECT i.observed_timestamp FROM pool_event_identity i
+                 WHERE i.chain_id = pool_fee_protocol_collect_event.chain_id AND i.transaction_hash = pool_fee_protocol_collect_event.transaction_hash
+                   AND i.log_index = pool_fee_protocol_collect_event.log_index AND i.event_family = 'fee_protocol_collect') as block_timestamp,
                 sender,
                 recipient,
                 NULL::TEXT as owner,
@@ -3210,10 +3654,9 @@ impl BlockchainCacheDatabase {
                 transaction_hash,
                 transaction_index,
                 log_index,
-                COALESCE(
-                    (SELECT timestamp::TEXT FROM block WHERE block.chain_id = pool_flash_event.chain_id AND block.number = pool_flash_event.block),
-                    (SELECT timestamp::TEXT FROM pool_event_block WHERE pool_event_block.chain_id = pool_flash_event.chain_id AND pool_event_block.number = pool_flash_event.block)
-                ) as block_timestamp,
+                (SELECT i.observed_timestamp FROM pool_event_identity i
+                 WHERE i.chain_id = pool_flash_event.chain_id AND i.transaction_hash = pool_flash_event.transaction_hash
+                   AND i.log_index = pool_flash_event.log_index AND i.event_family = 'flash') as block_timestamp,
                 sender,
                 recipient,
                 NULL::TEXT as owner,
@@ -7670,7 +8113,10 @@ pub(crate) mod tests {
             .acquire_timeout(Duration::from_secs(3))
             .connect_with(pg_options)
             .await?;
-        Ok(BlockchainCacheDatabase { pool })
+        Ok(BlockchainCacheDatabase {
+            pool,
+            canonical_epoch: None,
+        })
     }
 
     impl BlockchainCacheDatabase {

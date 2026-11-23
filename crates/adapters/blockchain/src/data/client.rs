@@ -20,6 +20,7 @@ use anyhow::Context;
 use nautilus_common::{
     clients::DataClient,
     defi::RequestPoolSnapshot,
+    live::sender::EventSender,
     messages::{
         DataEvent,
         defi::{
@@ -36,7 +37,11 @@ use nautilus_live::{
     task::{TaskGroup, TaskGroupGuard},
 };
 use nautilus_model::{
-    defi::{DefiData, DexType, PoolIdentifier, SharedChain, validation::validate_address},
+    defi::{
+        Block, DefiData, DexType, PoolIdentifier, SharedChain,
+        data::{CanonicalAnchor, CanonicalStateInvalidated},
+        validation::validate_address,
+    },
     identifiers::{ClientId, Venue},
 };
 use ustr::Ustr;
@@ -84,6 +89,7 @@ pub struct BlockchainDataClient {
     command_tx: tokio::sync::mpsc::UnboundedSender<DefiDataCommand>,
     command_rx: Option<tokio::sync::mpsc::UnboundedReceiver<DefiDataCommand>>,
     session_tasks: TaskGroup,
+    canonical_failure: Arc<parking_lot::Mutex<Option<String>>>,
     cancellation_token: tokio_util::sync::CancellationToken,
 }
 
@@ -113,6 +119,7 @@ impl BlockchainDataClient {
             command_rx: Some(command_rx),
             cancellation_token: session_tasks.cancellation_token(),
             session_tasks,
+            canonical_failure: Arc::new(parking_lot::Mutex::new(None)),
         })
     }
 
@@ -127,6 +134,13 @@ impl BlockchainDataClient {
         &mut self,
     ) -> anyhow::Result<tokio::sync::oneshot::Receiver<anyhow::Result<()>>> {
         anyhow::ensure!(self.command_rx.is_some(), "Command receiver already taken");
+        if self.config.canonical_pool_data.is_some() {
+            anyhow::ensure!(
+                self.canonical_failure().is_none(),
+                "Failed canonical source requires a new run"
+            );
+            return self.spawn_canonical_process_task();
+        }
 
         let cancellation_token = self.cancellation_token.clone();
 
@@ -251,6 +265,271 @@ impl BlockchainDataClient {
             .spawn(future)
             .map_err(|e| anyhow::anyhow!("Failed to register blockchain process task: {e}"))?;
         Ok(startup_rx)
+    }
+
+    /// Starts the fixed-universe source and an independent, bounded head observer.
+    /// Ends an owner or observer without treating sibling channel teardown as source failure.
+    ///
+    /// Prefer an already observed cancellation. The second check covers cancellation occurring
+    /// while the work future is polled, before its watch-channel error is classified. Once an
+    /// error is returned, callers latch it unconditionally, even if shutdown starts afterwards.
+    async fn canonical_until_cancelled<F>(
+        cancellation: &tokio_util::sync::CancellationToken,
+        work: F,
+    ) -> anyhow::Result<()>
+    where
+        F: std::future::Future<Output = anyhow::Result<()>>,
+    {
+        tokio::select! {
+            biased;
+            () = cancellation.cancelled() => Ok(()),
+            result = work => {
+                if cancellation.is_cancelled() { Ok(()) } else { result }
+            }
+        }
+    }
+
+    fn spawn_canonical_process_task(
+        &mut self,
+    ) -> anyhow::Result<tokio::sync::oneshot::Receiver<anyhow::Result<()>>> {
+        let data_tx = nautilus_common::live::runner::get_data_event_sender();
+        let cancellation = self.cancellation_token.clone();
+        let mut core = BlockchainDataClientCore::new(
+            self.config.clone(),
+            None,
+            Some(data_tx.clone()),
+            cancellation.clone(),
+        )?;
+        let mut commands = self
+            .command_rx
+            .take()
+            .context("Canonical command receiver already taken")?;
+        self.hypersync_rx.take();
+        self.hypersync_tx.take();
+        let http = Arc::clone(&core.http_rpc_client);
+        let config = self
+            .config
+            .canonical_pool_data
+            .clone()
+            .context("Canonical source is not configured")?;
+        let chain = self.chain.name;
+        let chain_id = self.chain.chain_id;
+        let client_id = self.client_id;
+        let failure = Arc::clone(&self.canonical_failure);
+        let observed_anchor = Arc::new(parking_lot::Mutex::new(None::<CanonicalAnchor>));
+        let head_anchor = Arc::clone(&observed_anchor);
+        let head_failure = Arc::clone(&failure);
+        let head_cancel = cancellation.clone();
+        let head_tx_data = data_tx.clone();
+        let (head_tx, mut head_rx) = tokio::sync::watch::channel(None::<Block>);
+        let (startup_tx, startup_rx) = tokio::sync::oneshot::channel();
+
+        self.session_tasks
+            .spawn(async move {
+                let result = async {
+                    let mut interval =
+                        tokio::time::interval(Duration::from_millis(config.poll_interval_ms));
+                    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                    let mut last_hash = None;
+
+                    loop {
+                        interval.tick().await;
+                        let mut head = http.latest_block_header().await?;
+                        head.set_chain(chain);
+                        let hash = head.hash.parse::<B256>()?;
+                        head.parent_hash.parse::<B256>()?;
+
+                        if last_hash == Some(hash) {
+                            continue;
+                        }
+
+                        // Deliver freshness before slow pool hydration, log acquisition or SQL work.
+                        head_tx_data
+                            .send(DataEvent::DeFi(DefiData::Block(head.clone())))
+                            .map_err(|_| {
+                                anyhow::anyhow!("Native head observation channel is closed")
+                            })?;
+                        head_tx.send(Some(head)).map_err(|_| {
+                            anyhow::anyhow!("Canonical source head receiver is closed")
+                        })?;
+                        last_hash = Some(hash);
+                    }
+                    #[allow(unreachable_code)]
+                    Ok::<(), anyhow::Error>(())
+                };
+
+                if let Err(e) = Self::canonical_until_cancelled(&head_cancel, result).await {
+                    Self::fail_canonical_source(
+                        &head_failure,
+                        &head_anchor,
+                        &head_tx_data,
+                        &head_cancel,
+                        chain_id,
+                        &e,
+                    );
+                }
+            })
+            .map_err(|e| anyhow::anyhow!("Failed to register canonical head observer: {e}"))?;
+
+        self.session_tasks.spawn(async move {
+            // connect() must not await native hydration requests: the runner may start only
+            // after client startup completes. Readiness is established by the native cache.
+            let connected = tokio::select! {
+                () = cancellation.cancelled() => Err(anyhow::anyhow!("Canonical startup was cancelled")),
+                connected = core.connect() => connected,
+            };
+
+            if let Err(e) = connected {
+                let message = format!("Canonical source startup failed: {e:#}");
+                Self::fail_canonical_source(&failure, &observed_anchor, &data_tx, &cancellation,
+                    chain_id, &anyhow::anyhow!(message.clone()));
+                let _ = startup_tx.send(Err(anyhow::anyhow!(message)));
+                core.disconnect().await;
+                return;
+            }
+
+            if startup_tx.send(Ok(())).is_err() {
+                cancellation.cancel();
+                core.disconnect().await;
+                return;
+            }
+
+            let source = async {
+                core.begin_canonical_feed(client_id).await?;
+                *observed_anchor.lock() = core.canonical.as_ref().map(|state| state.anchor);
+                let mut needs_check = true;
+
+                loop {
+                    let target = head_rx.borrow().clone();
+                    let can_advance = needs_check && core.canonical_hydration_complete() && target.is_some();
+
+                    tokio::select! {
+                        biased;
+                        command = commands.recv() => {
+                            let command = command.context("Canonical native command channel is closed")?;
+                            Box::pin(Self::handle_canonical_command(command, &mut core)).await?;
+                            if core.canonical_hydration_complete() { needs_check = true; }
+                        }
+                        changed = head_rx.changed() => {
+                            changed.context("Canonical head observer stopped")?;
+                            needs_check = true;
+                        }
+                        () = tokio::task::yield_now(), if can_advance => {
+                            let head = target.as_ref().context("Canonical target disappeared")?;
+                            let advanced = core.advance_canonical_feed(head, client_id).await?;
+                            let anchor = core.canonical.as_ref().map(|state| state.anchor);
+                            *observed_anchor.lock() = anchor;
+                            needs_check = advanced && anchor.is_some_and(|anchor| anchor.number < head.number);
+                        }
+                    }
+                }
+                #[allow(unreachable_code)]
+                Ok::<(), anyhow::Error>(())
+            };
+            let result =
+                Box::pin(Self::canonical_until_cancelled(&cancellation, source)).await;
+
+            if let Err(e) = result {
+                Self::fail_canonical_source(&failure, &observed_anchor, &data_tx, &cancellation,
+                    chain_id, &e);
+            } else if let Some(reason) = failure.lock().clone() {
+                // A head failure can interrupt a long snapshot read. Invalidate the current
+                // epoch again after cancellation, so no bootstrap queued in between survives.
+                let epoch = core.canonical.as_ref().map_or(0, |state| state.anchor.epoch);
+                let _ = data_tx.send(DataEvent::DeFi(DefiData::CanonicalInvalidation(
+                    CanonicalStateInvalidated { chain_id, epoch, reason,
+                        ts_init: nautilus_core::time::get_atomic_clock_realtime().get_time_ns() },
+                )));
+            }
+            core.disconnect().await;
+        }).map_err(|e| anyhow::anyhow!("Failed to register canonical source owner: {e}"))?;
+        Ok(startup_rx)
+    }
+
+    fn fail_canonical_source(
+        failure: &parking_lot::Mutex<Option<String>>,
+        anchor: &parking_lot::Mutex<Option<CanonicalAnchor>>,
+        data_tx: &EventSender<DataEvent>,
+        cancellation: &tokio_util::sync::CancellationToken,
+        chain_id: u32,
+        e: &anyhow::Error,
+    ) {
+        let reason = {
+            let mut failure = failure.lock();
+            failure
+                .get_or_insert_with(|| format!("Canonical source failed: {e:#}"))
+                .clone()
+        };
+        let epoch = anchor.lock().map_or(0, |anchor| anchor.epoch);
+        let _ = data_tx.send(DataEvent::DeFi(DefiData::CanonicalInvalidation(
+            CanonicalStateInvalidated {
+                chain_id,
+                epoch,
+                reason,
+                ts_init: nautilus_core::time::get_atomic_clock_realtime().get_time_ns(),
+            },
+        )));
+        cancellation.cancel();
+    }
+
+    /// Returns the first canonical source failure, retained through shutdown for run sealing.
+    #[must_use]
+    pub fn canonical_failure(&self) -> Option<String> {
+        self.canonical_failure.lock().clone()
+    }
+
+    async fn handle_canonical_command(
+        command: DefiDataCommand,
+        core: &mut BlockchainDataClientCore,
+    ) -> anyhow::Result<()> {
+        let instrument = match command {
+            DefiDataCommand::Request(DefiRequestCommand::PoolSnapshot(request)) => {
+                if let Some(response) = core.canonical_snapshot_response(&request).await? {
+                    core.send_data_checked(DataEvent::PoolSnapshotResponse(response))?;
+                }
+                return Ok(());
+            }
+            DefiDataCommand::Subscribe(DefiSubscribeCommand::Blocks(command)) => {
+                anyhow::ensure!(
+                    command.chain == core.chain.name,
+                    "Canonical subscription chain mismatch"
+                );
+                return Ok(());
+            }
+            DefiDataCommand::Unsubscribe(DefiUnsubscribeCommand::Blocks(command)) => {
+                anyhow::ensure!(
+                    command.chain == core.chain.name,
+                    "Canonical subscription chain mismatch"
+                );
+                return Ok(());
+            }
+            DefiDataCommand::Subscribe(command) => match command {
+                DefiSubscribeCommand::Pool(command) => command.instrument_id,
+                DefiSubscribeCommand::PoolSwaps(command) => command.instrument_id,
+                DefiSubscribeCommand::PoolLiquidityUpdates(command) => command.instrument_id,
+                DefiSubscribeCommand::PoolFeeCollects(command) => command.instrument_id,
+                DefiSubscribeCommand::PoolFlashEvents(command) => command.instrument_id,
+                DefiSubscribeCommand::Blocks(_) => unreachable!(),
+            },
+            DefiDataCommand::Unsubscribe(command) => match command {
+                DefiUnsubscribeCommand::Pool(command) => command.instrument_id,
+                DefiUnsubscribeCommand::PoolSwaps(command) => command.instrument_id,
+                DefiUnsubscribeCommand::PoolLiquidityUpdates(command) => command.instrument_id,
+                DefiUnsubscribeCommand::PoolFeeCollects(command) => command.instrument_id,
+                DefiUnsubscribeCommand::PoolFlashEvents(command) => command.instrument_id,
+                DefiUnsubscribeCommand::Blocks(_) => unreachable!(),
+            },
+        };
+        anyhow::ensure!(
+            core.config
+                .canonical_pool_data
+                .as_ref()
+                .is_some_and(|config| config.pools.contains(&instrument)),
+            "Canonical subscription is outside the fixed pool universe"
+        );
+        // Pool metadata and every mutation travel in bootstrap / complete batch observations.
+        // Native subscription disposal removes consumers; it never changes the source universe.
+        Ok(())
     }
 
     async fn process_live_blockchain_message(
@@ -1267,6 +1546,9 @@ impl BlockchainDataClient {
             .finish_shutdown(Duration::from_secs(2), Duration::from_secs(2))
             .await
             .map_err(|e| anyhow::anyhow!("Blockchain process task shutdown failed: {e}"))?;
+        if let Some(reason) = self.canonical_failure() {
+            anyhow::bail!("{reason}");
+        }
         Ok(())
     }
 
@@ -1392,7 +1674,8 @@ impl DataClient for BlockchainDataClient {
     }
 
     fn is_connected(&self) -> bool {
-        self.session_tasks.is_open()
+        self.canonical_failure().is_none()
+            && self.session_tasks.is_open()
             && !self.session_tasks.is_empty()
             && !self.session_tasks.all_finished()
     }
@@ -2214,3 +2497,7 @@ mod tests {
         ))
     }
 }
+
+#[cfg(test)]
+#[path = "canonical_tests.rs"]
+mod canonical_tests;

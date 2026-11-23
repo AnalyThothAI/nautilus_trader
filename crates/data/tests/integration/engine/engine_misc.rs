@@ -14,6 +14,8 @@
 // -------------------------------------------------------------------------------------------------
 
 #[cfg(feature = "defi")]
+use nautilus_common::messages::defi::PoolSnapshotResponse;
+#[cfg(feature = "defi")]
 use nautilus_model::defi::Chain;
 
 use super::*;
@@ -1171,7 +1173,7 @@ fn test_pool_updater_processes_burn_updates_profiler(
         Arc::clone(&chain),
         Arc::clone(&dex),
         Address::from([0x12; 20]),
-        PoolIdentifier::new("0x1234567890123456789012345678901234567890"),
+        PoolIdentifier::from_address(Address::from([0x12; 20])),
         0u64,
         token0,
         token1,
@@ -1664,7 +1666,7 @@ fn test_process_defi_pools_publishes_distinct_tradable_instruments(
 
 #[cfg(feature = "defi")]
 #[rstest]
-fn test_setup_pool_updater_skips_snapshot_when_pool_in_cache(
+fn test_setup_pool_updater_requests_snapshot_with_warm_pool_metadata(
     data_engine: Rc<RefCell<DataEngine>>,
     clock: Rc<RefCell<VirtualClock>>,
     cache: Rc<RefCell<Cache>>,
@@ -1747,21 +1749,22 @@ fn test_setup_pool_updater_skips_snapshot_when_pool_in_cache(
     let cmd = DataCommand::DefiSubscribe(DefiSubscribeCommand::Pool(subscribe_pool));
     data_engine.execute(cmd.clone());
 
-    // Verify the cache-first optimization: when a pool exists in the data engine's
-    // cache, setup_pool_updater should skip the snapshot request and proceed
-    // directly to creating the profiler and updater from the cached pool.
-    // Only the SubscribePool command should be forwarded to the client.
+    // A cached initial price does not supply positions or the tick distribution
     let recorded = recorder.borrow();
-    assert_eq!(
-        recorded.len(),
-        1,
-        "Expected only 1 command (SubscribePool), but got {} commands. \
-         When pool is in cache, snapshot request should be skipped.",
-        recorded.len()
-    );
-
-    // The single command should be the subscription
+    assert_eq!(recorded.len(), 2);
     assert_eq!(recorded[0], cmd);
+    assert!(matches!(
+        &recorded[1],
+        DataCommand::DefiRequest(DefiRequestCommand::PoolSnapshot(request))
+            if request.instrument_id == instrument_id
+    ));
+    assert!(
+        data_engine
+            .cache()
+            .borrow()
+            .pool_profiler(&instrument_id)
+            .is_none()
+    );
 }
 
 #[cfg(feature = "defi")]
@@ -1995,14 +1998,58 @@ fn test_reset_clears_pool_updater_state(
         }))
     };
 
+    let snapshot = PoolSnapshot::new(
+        instrument_id,
+        PoolState {
+            price_sqrt_ratio_x96: pool.initial_sqrt_price_x96.unwrap(),
+            current_tick: 0,
+            ..Default::default()
+        },
+        Vec::new(),
+        Vec::new(),
+        PoolAnalytics::default(),
+        BlockPosition::new(1000, "0x0".to_string(), 0, 0),
+        UnixNanos::default(),
+        UnixNanos::default(),
+    );
+    let respond = || {
+        let request_id = recorder
+            .borrow()
+            .iter()
+            .rev()
+            .find_map(|command| match command {
+                DataCommand::DefiRequest(DefiRequestCommand::PoolSnapshot(request)) => {
+                    Some(request.request_id)
+                }
+                _ => None,
+            })
+            .unwrap();
+        data_engine
+            .borrow_mut()
+            .process(&PoolSnapshotResponse::new(request_id, snapshot.clone()));
+    };
     let engine_cache = Rc::clone(data_engine.borrow().cache());
     engine_cache.borrow_mut().add_pool(pool.clone()).unwrap();
     data_engine.borrow_mut().execute(subscribe());
+    respond();
+    assert!(
+        engine_cache
+            .borrow()
+            .pool_profiler(&instrument_id)
+            .is_some()
+    );
 
     data_engine.borrow_mut().reset();
     engine_cache.borrow_mut().reset();
     engine_cache.borrow_mut().add_pool(pool).unwrap();
     data_engine.borrow_mut().execute(subscribe());
+    assert!(
+        engine_cache
+            .borrow()
+            .pool_profiler(&instrument_id)
+            .is_none()
+    );
+    respond();
 
     assert!(
         engine_cache
@@ -2596,6 +2643,7 @@ fn test_execute_defi_command_counters(data_engine: Rc<RefCell<DataEngine>>) {
         request_id: UUID4::new(),
         ts_init: UnixNanos::default(),
         params: None,
+        canonical_anchor: None,
     }));
 
     data_engine.execute(req);

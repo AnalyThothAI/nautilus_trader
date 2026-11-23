@@ -79,7 +79,7 @@ use handlers::{
 };
 use indexmap::IndexMap;
 #[cfg(feature = "defi")]
-use nautilus_common::messages::defi::PoolSnapshotResponse;
+use nautilus_common::messages::defi::{PoolSnapshotResponse, RequestPoolSnapshot};
 use nautilus_common::{
     cache::Cache,
     clock::Clock,
@@ -110,7 +110,7 @@ use nautilus_core::{
     datetime::NANOSECONDS_IN_DAY,
 };
 #[cfg(feature = "defi")]
-use nautilus_model::defi::DefiData;
+use nautilus_model::defi::{DefiData, data::canonical::CanonicalPoolBatch};
 use nautilus_model::{
     data::{
         Bar, BarType, CustomData, Data, DataRef, DataType, FundingRateUpdate, HasTsInit,
@@ -234,9 +234,12 @@ pub struct DataEngine {
     #[cfg(feature = "defi")]
     pub(crate) pool_updaters: AHashMap<InstrumentId, Rc<PoolUpdater>>,
     #[cfg(feature = "defi")]
-    pub(crate) pool_snapshot_pending: AHashMap<InstrumentId, UUID4>,
+    pub(crate) pool_snapshot_pending: AHashMap<InstrumentId, RequestPoolSnapshot>,
     #[cfg(feature = "defi")]
     pub(crate) pool_event_buffers: AHashMap<InstrumentId, Vec<DefiData>>,
+    // The last complete batch is a bounded duplicate/conflict fact, not a second market state.
+    #[cfg(feature = "defi")]
+    pub(crate) canonical_batches: AHashMap<u32, CanonicalPoolBatch>,
 }
 
 impl DataEngine {
@@ -318,6 +321,8 @@ impl DataEngine {
             pool_snapshot_pending: AHashMap::new(),
             #[cfg(feature = "defi")]
             pool_event_buffers: AHashMap::new(),
+            #[cfg(feature = "defi")]
+            canonical_batches: AHashMap::new(),
         }
     }
 

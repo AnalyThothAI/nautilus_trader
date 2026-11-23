@@ -878,6 +878,9 @@ fn replay_position(data: &DefiData) -> (u64, u32, u32, u8) {
 #[cfg(feature = "defi")]
 const fn replay_phase(data: &DefiData) -> u8 {
     match data {
+        DefiData::CanonicalInvalidation(_) => 0,
+        DefiData::CanonicalBootstrap(_) => 2,
+        DefiData::CanonicalBatch(_) => 4,
         DefiData::Block(_) => 0,
         DefiData::Pool(_) => 1,
         DefiData::PoolSnapshot(_) => 2,

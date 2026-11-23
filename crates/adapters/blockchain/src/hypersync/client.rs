@@ -107,6 +107,25 @@ impl HyperSyncClient {
         tx: Option<tokio::sync::mpsc::UnboundedSender<BlockchainMessage>>,
         cancellation_token: tokio_util::sync::CancellationToken,
     ) -> anyhow::Result<Self> {
+        let api_token = std::env::var(API_TOKEN_ENV).map_err(|e| match e {
+            VarError::NotPresent => ConfigError::missing_field(API_TOKEN_ENV),
+            VarError::NotUnicode(_) => ConfigError::invalid_format(API_TOKEN_ENV, API_TOKEN_FORMAT),
+        })?;
+
+        Self::new_with_api_token(chain, tx, cancellation_token, api_token)
+    }
+
+    /// Creates a HyperSync client using an explicit credential without reading environment state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the endpoint or credential is invalid, or client initialization fails.
+    pub fn new_with_api_token(
+        chain: SharedChain,
+        tx: Option<tokio::sync::mpsc::UnboundedSender<BlockchainMessage>>,
+        cancellation_token: tokio_util::sync::CancellationToken,
+        api_token: String,
+    ) -> anyhow::Result<Self> {
         let mut config = hypersync_client::ClientConfig::default();
 
         let hypersync_url = chain
@@ -117,10 +136,7 @@ impl HyperSyncClient {
             .map_err(|e| ConfigError::invalid_value("chain.hypersync_url", e.to_string()))?;
 
         config.url = hypersync_url.to_string();
-        config.api_token = std::env::var(API_TOKEN_ENV).map_err(|e| match e {
-            VarError::NotPresent => ConfigError::missing_field(API_TOKEN_ENV),
-            VarError::NotUnicode(_) => ConfigError::invalid_format(API_TOKEN_ENV, API_TOKEN_FORMAT),
-        })?;
+        config.api_token = api_token;
 
         check_non_empty_field(API_TOKEN_ENV, &config.api_token)?;
 
@@ -272,6 +288,61 @@ impl HyperSyncClient {
                 }
             }
         }
+    }
+
+    /// Streams a bounded query with explicit transport, decoding and coverage failures.
+    ///
+    /// Successful EOF proves that the indexer advanced beyond the inclusive target block.
+    /// It does not authenticate the branch; callers must still validate the checkpoint by hash.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the range is invalid or stream creation fails. Stream items report
+    /// provider errors, malformed block metadata, and incomplete terminal coverage.
+    pub async fn request_contract_events_stream_checked(
+        &self,
+        from_block: u64,
+        to_block: u64,
+        contract_address: &Address,
+        topics: Vec<&str>,
+    ) -> anyhow::Result<impl Stream<Item = anyhow::Result<PoolEventStreamItem>> + use<>> {
+        anyhow::ensure!(from_block <= to_block, "HyperSync query range is reversed");
+        let end = to_block
+            .checked_add(1)
+            .context("HyperSync target block overflows")?;
+        let query = Self::construct_contract_events_query(
+            from_block,
+            Some(to_block),
+            &[*contract_address],
+            &topics,
+        );
+        let chain = self.chain.name;
+        let mut rx = self
+            .client
+            .stream(query, StreamConfig::default())
+            .await
+            .map_err(|_| anyhow::anyhow!("HyperSync contract-event stream creation failed"))?;
+        Ok(async_stream::try_stream! {
+            let mut cursor = from_block;
+
+            while let Some(response) = rx.recv().await {
+                let response = response.map_err(|_| anyhow::anyhow!("HyperSync contract-event stream failed"))?;
+                (response.next_block > cursor && response.next_block <= end).then_some(()).context("HyperSync coverage does not advance within the bounded query")?;
+                for block in response.data.blocks.into_iter().flatten() {
+                    let block = transform_hypersync_block(chain, block)?;
+                    (block.number >= cursor && block.number < response.next_block).then_some(()).context("HyperSync block is outside response coverage")?;
+                    yield PoolEventStreamItem::Block(block);
+                }
+
+                for log in response.data.logs.into_iter().flatten() {
+                    let number = crate::hypersync::log::extract_block_number(&log)?;
+                    (number >= cursor && number < response.next_block).then_some(()).context("HyperSync log is outside response coverage")?;
+                    yield PoolEventStreamItem::Log(log);
+                }
+                cursor = response.next_block;
+            }
+            (cursor == end).then_some(()).context("HyperSync ended before the required checkpoint")?;
+        })
     }
 
     /// Disconnects from the HyperSync service and stops all background tasks.

@@ -21,6 +21,7 @@ pub mod quote;
 pub mod size_estimator;
 pub mod snapshot;
 pub mod swap_math;
+pub mod validation;
 
 // Re-exports
 pub use error::{

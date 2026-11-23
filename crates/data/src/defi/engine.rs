@@ -18,10 +18,11 @@
 //! This module provides DeFi processing methods for the `DataEngine`.
 //! All code in this module requires the `defi` feature flag.
 
-use std::{rc::Rc, sync::Arc};
+use std::{collections::BTreeSet, rc::Rc, sync::Arc};
 
+use alloy_primitives::B256;
 use nautilus_common::{
-    defi,
+    defi::{self, cache::PoolStateHealth},
     messages::defi::{
         DefiRequestCommand, DefiSubscribeCommand, DefiUnsubscribeCommand, PoolSnapshotResponse,
         RequestPoolSnapshot,
@@ -32,8 +33,18 @@ use nautilus_core::UUID4;
 use nautilus_model::{
     defi::{
         Blockchain, DefiData, Pool, PoolProfiler,
-        data::{DexPoolData, block::BlockPosition},
-        pool_analysis::PoolSnapshot,
+        data::{
+            DexPoolData,
+            block::BlockPosition,
+            canonical::{
+                CanonicalAnchor, CanonicalPoolBatch, CanonicalPoolBootstrap,
+                CanonicalStateInvalidated,
+            },
+        },
+        pool_analysis::{
+            PoolSnapshot,
+            validation::{validate_canonical_snapshot, validate_pool_profiler},
+        },
     },
     identifiers::{ClientId, InstrumentId},
     instruments::{CurrencyPair, InstrumentAny},
@@ -42,7 +53,8 @@ use nautilus_model::{
 use crate::engine::{
     DataEngine,
     pool::{
-        PoolCollectHandler, PoolFlashHandler, PoolLiquidityHandler, PoolSwapHandler, PoolUpdater,
+        CanonicalBatchReceipt, PoolApplyOutcome, PoolCollectHandler, PoolFlashHandler,
+        PoolLiquidityHandler, PoolSwapHandler, PoolUpdater,
     },
 };
 
@@ -84,7 +96,446 @@ fn convert_and_sort_buffered_events(buffered_events: Vec<DefiData>) -> Vec<DexPo
     events
 }
 
+/// Compares complete chain payloads without treating receive timestamps as chain identity.
+fn same_canonical_batch_payload(left: &CanonicalPoolBatch, right: &CanonicalPoolBatch) -> bool {
+    // Block's ordinary equality compares its hash only; a canonical duplicate must preserve
+    // all header payload fields used by consumers, including transaction cost inputs
+    let a = &left.block;
+    let b = &right.block;
+    if left.anchor != right.anchor
+        || a.chain != b.chain
+        || a.hash != b.hash
+        || a.number != b.number
+        || a.parent_hash != b.parent_hash
+        || a.miner != b.miner
+        || a.gas_limit != b.gas_limit
+        || a.gas_used != b.gas_used
+        || a.base_fee_per_gas != b.base_fee_per_gas
+        || a.blob_gas_used != b.blob_gas_used
+        || a.excess_blob_gas != b.excess_blob_gas
+        || a.l1_gas_price != b.l1_gas_price
+        || a.l1_gas_used != b.l1_gas_used
+        || a.l1_fee_scalar != b.l1_fee_scalar
+        || a.timestamp != b.timestamp
+        || left.pools != right.pools
+        || left.events.len() != right.events.len()
+    {
+        return false;
+    }
+    left.events
+        .iter()
+        .zip(&right.events)
+        .all(|(previous, incoming)| {
+            let mut normalized = incoming.clone();
+            match (previous, &mut normalized) {
+                (DexPoolData::Swap(a), DexPoolData::Swap(b)) => b.ts_init = a.ts_init,
+                (DexPoolData::LiquidityUpdate(a), DexPoolData::LiquidityUpdate(b)) => {
+                    b.ts_init = a.ts_init;
+                }
+                (DexPoolData::FeeCollect(a), DexPoolData::FeeCollect(b)) => b.ts_init = a.ts_init,
+                (DexPoolData::FeeProtocolUpdate(a), DexPoolData::FeeProtocolUpdate(b)) => {
+                    b.ts_init = a.ts_init;
+                }
+                (DexPoolData::FeeProtocolCollect(a), DexPoolData::FeeProtocolCollect(b)) => {
+                    b.ts_init = a.ts_init;
+                }
+                (DexPoolData::Flash(a), DexPoolData::Flash(b)) => b.ts_init = a.ts_init,
+                _ => return false,
+            }
+            previous == &normalized
+        })
+}
+
 impl DataEngine {
+    /// Replaces a pool's state through an explicitly hash-bound snapshot request.
+    ///
+    /// The old updater, pending response and buffered events are detached before the new request
+    /// is dispatched. Canonical pools accept market changes only through complete native batches.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the epoch is stale, the pool belongs to another chain, or dispatch fails.
+    pub fn request_pool_snapshot_at(
+        &mut self,
+        instrument_id: &InstrumentId,
+        client_id: Option<&ClientId>,
+        anchor: CanonicalAnchor,
+    ) -> anyhow::Result<UUID4> {
+        self.request_pool_snapshot_with_identity(instrument_id, client_id, anchor, UUID4::new())
+    }
+
+    fn request_pool_snapshot_with_identity(
+        &mut self,
+        instrument_id: &InstrumentId,
+        client_id: Option<&ClientId>,
+        anchor: CanonicalAnchor,
+        request_id: UUID4,
+    ) -> anyhow::Result<UUID4> {
+        let request =
+            self.prepare_pool_snapshot_with_identity(instrument_id, client_id, anchor, request_id)?;
+        if let Err(e) = self.execute_defi_request(DefiRequestCommand::PoolSnapshot(request)) {
+            self.fail_pool_hydration(instrument_id, &e.to_string());
+            return Err(e);
+        }
+        Ok(request_id)
+    }
+
+    fn prepare_pool_snapshot_with_identity(
+        &mut self,
+        instrument_id: &InstrumentId,
+        client_id: Option<&ClientId>,
+        anchor: CanonicalAnchor,
+        request_id: UUID4,
+    ) -> anyhow::Result<RequestPoolSnapshot> {
+        let current_epoch = {
+            let cache = self.cache().borrow();
+            let epoch = cache.canonical_epoch(anchor.chain_id);
+            anyhow::ensure!(
+                epoch.is_none_or(|current| anchor.epoch >= current),
+                "Obsolete hydration epoch"
+            );
+            anyhow::ensure!(
+                cache
+                    .pool(instrument_id)
+                    .is_none_or(|pool| pool.chain.chain_id == anchor.chain_id)
+                    && cache
+                        .pool_state_health(instrument_id)
+                        .is_none_or(|health| health.anchor().chain_id == anchor.chain_id),
+                "Pool hydration chain mismatch"
+            );
+            epoch
+        };
+
+        if current_epoch != Some(anchor.epoch) {
+            let ts_init = self.clock().borrow().timestamp_ns();
+            self.invalidate_canonical_state(&CanonicalStateInvalidated {
+                chain_id: anchor.chain_id,
+                epoch: anchor.epoch,
+                reason: "Canonical hydration started".to_string(),
+                ts_init,
+            });
+        }
+        self.release_pool_updater(instrument_id);
+        self.canonical_batches.remove(&anchor.chain_id);
+        self.cache()
+            .borrow_mut()
+            .begin_pool_hydration(*instrument_id, anchor, request_id)?;
+        let request = RequestPoolSnapshot::new(
+            *instrument_id,
+            client_id.copied(),
+            request_id,
+            self.clock().borrow().timestamp_ns(),
+            None,
+        )
+        .with_canonical_anchor(anchor);
+        self.pool_snapshot_pending
+            .insert(*instrument_id, request.clone());
+        Ok(request)
+    }
+
+    /// Begins native hydration from a recorded source bootstrap and its exact request identities.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the epoch, pool universe, metadata, request IDs or dispatch are invalid.
+    pub fn process_canonical_bootstrap(
+        &mut self,
+        bootstrap: &CanonicalPoolBootstrap,
+    ) -> anyhow::Result<()> {
+        let epoch = self
+            .cache()
+            .borrow()
+            .canonical_epoch(bootstrap.anchor.chain_id);
+        anyhow::ensure!(
+            epoch.is_none_or(|current| bootstrap.anchor.epoch >= current),
+            "Obsolete canonical bootstrap epoch"
+        );
+        let result = self.apply_canonical_bootstrap(bootstrap);
+
+        if let Err(e) = &result {
+            self.invalidate_canonical_state(&CanonicalStateInvalidated {
+                chain_id: bootstrap.anchor.chain_id,
+                epoch: bootstrap.anchor.epoch,
+                reason: e.to_string(),
+                ts_init: bootstrap.ts_init,
+            });
+        }
+
+        result
+    }
+
+    fn apply_canonical_bootstrap(
+        &mut self,
+        bootstrap: &CanonicalPoolBootstrap,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !bootstrap.pools.is_empty(),
+            "Canonical bootstrap has no managed pools"
+        );
+        anyhow::ensure!(
+            bootstrap
+                .pools
+                .windows(2)
+                .all(|pools| pools[0].pool.instrument_id < pools[1].pool.instrument_id),
+            "Canonical bootstrap pools must be unique and sorted"
+        );
+        let requests = bootstrap
+            .pools
+            .iter()
+            .map(|pool| pool.request_id.to_string())
+            .collect::<BTreeSet<_>>();
+        anyhow::ensure!(
+            requests.len() == bootstrap.pools.len(),
+            "Canonical bootstrap request IDs must be unique"
+        );
+        let pools = bootstrap
+            .pools
+            .iter()
+            .map(|entry| entry.pool.instrument_id)
+            .collect::<Vec<_>>();
+        let current_pools = self
+            .cache()
+            .borrow()
+            .canonical_pool_ids(bootstrap.anchor.chain_id);
+        anyhow::ensure!(
+            current_pools.is_empty() || current_pools == pools,
+            "Canonical bootstrap cannot change the running pool universe"
+        );
+
+        {
+            let cache = self.cache().borrow();
+
+            for entry in &bootstrap.pools {
+                anyhow::ensure!(
+                    entry.pool.chain.chain_id == bootstrap.anchor.chain_id
+                        && cache
+                            .pool(&entry.pool.instrument_id)
+                            .is_none_or(|pool| pool.chain.chain_id == bootstrap.anchor.chain_id)
+                        && cache
+                            .pool_state_health(&entry.pool.instrument_id)
+                            .is_none_or(
+                                |health| health.anchor().chain_id == bootstrap.anchor.chain_id
+                            ),
+                    "Canonical bootstrap pool belongs to another chain"
+                );
+            }
+        }
+
+        let needs_invalidation = {
+            let cache = self.cache().borrow();
+            cache.canonical_epoch(bootstrap.anchor.chain_id) != Some(bootstrap.anchor.epoch)
+                || current_pools.iter().any(|id| {
+                    !matches!(
+                        cache.pool_state_health(id),
+                        Some(PoolStateHealth::Dirty { .. })
+                    )
+                })
+        };
+
+        if needs_invalidation {
+            self.invalidate_canonical_state(&CanonicalStateInvalidated {
+                chain_id: bootstrap.anchor.chain_id,
+                epoch: bootstrap.anchor.epoch,
+                reason: "Canonical source bootstrap started".to_string(),
+                ts_init: bootstrap.ts_init,
+            });
+        }
+
+        // Register the entire universe before any metadata publication or request dispatch.
+        // A failure must leave every declared pool Dirty, including pools not yet requested.
+        let requests = bootstrap
+            .pools
+            .iter()
+            .map(|entry| {
+                self.prepare_pool_snapshot_with_identity(
+                    &entry.pool.instrument_id,
+                    Some(&bootstrap.client_id),
+                    bootstrap.anchor,
+                    entry.request_id,
+                )
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        for entry in &bootstrap.pools {
+            anyhow::ensure!(
+                self.handle_pool(&entry.pool),
+                "Canonical pool metadata failed integrity validation"
+            );
+        }
+
+        for request in requests {
+            self.execute_defi_request(DefiRequestCommand::PoolSnapshot(request))?;
+        }
+        Ok(())
+    }
+
+    /// Removes invalid canonical profilers and fences all old snapshot responses.
+    pub fn invalidate_canonical_state(&mut self, invalidation: &CanonicalStateInvalidated) {
+        if self
+            .cache()
+            .borrow()
+            .canonical_epoch(invalidation.chain_id)
+            .is_some_and(|epoch| invalidation.epoch < epoch)
+        {
+            return;
+        }
+
+        let pools = self
+            .cache()
+            .borrow()
+            .canonical_pool_ids(invalidation.chain_id);
+
+        for id in pools {
+            self.release_pool_updater(&id);
+        }
+
+        self.cache().borrow_mut().invalidate_canonical_chain(
+            invalidation.chain_id,
+            invalidation.epoch,
+            &invalidation.reason,
+        );
+        self.canonical_batches.remove(&invalidation.chain_id);
+        let topic = defi::switchboard::get_defi_canonical_invalidated_topic(invalidation.chain_id);
+        msgbus::publish_any(topic, invalidation);
+    }
+
+    /// Applies a complete canonical batch before exposing the resulting state to subscribers.
+    ///
+    /// All cache borrows have ended when the successful batch is published. Subscribers can freeze
+    /// an owned view from their cache without reentering the data engine. A duplicate of the last
+    /// batch produces a duplicate receipt and no second publication.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if identity, completeness, hydration or any pool event application fails.
+    pub fn process_canonical_pool_batch(
+        &mut self,
+        batch: &CanonicalPoolBatch,
+    ) -> anyhow::Result<CanonicalBatchReceipt> {
+        let epoch = self.cache().borrow().canonical_epoch(batch.anchor.chain_id);
+        anyhow::ensure!(
+            epoch.is_none_or(|current| batch.anchor.epoch >= current),
+            "Obsolete canonical batch epoch"
+        );
+
+        if let Err(e) = batch.validate() {
+            self.invalidate_canonical_state(&CanonicalStateInvalidated {
+                chain_id: batch.anchor.chain_id,
+                epoch: batch.anchor.epoch,
+                reason: e.to_string(),
+                ts_init: batch.ts_init,
+            });
+            return Err(e);
+        }
+
+        if self
+            .canonical_batches
+            .get(&batch.anchor.chain_id)
+            .is_some_and(|previous| same_canonical_batch_payload(previous, batch))
+        {
+            return Ok(CanonicalBatchReceipt {
+                anchor: batch.anchor,
+                applied: 0,
+                duplicates: batch.events.len(),
+                pools: batch.pools.clone(),
+            });
+        }
+
+        let result = self.apply_canonical_pool_batch(batch);
+
+        match result {
+            Ok(receipt) => {
+                self.canonical_batches
+                    .insert(batch.anchor.chain_id, batch.clone());
+                let topic =
+                    defi::switchboard::get_defi_canonical_batch_topic(batch.anchor.chain_id);
+                msgbus::publish_any(topic, batch);
+                Ok(receipt)
+            }
+            Err(e) => {
+                self.invalidate_canonical_state(&CanonicalStateInvalidated {
+                    chain_id: batch.anchor.chain_id,
+                    epoch: batch.anchor.epoch,
+                    reason: e.to_string(),
+                    ts_init: batch.ts_init,
+                });
+                Err(e)
+            }
+        }
+    }
+
+    fn apply_canonical_pool_batch(
+        &self,
+        batch: &CanonicalPoolBatch,
+    ) -> anyhow::Result<CanonicalBatchReceipt> {
+        let parent = batch.block.parent_hash.parse::<B256>()?;
+
+        {
+            let cache = self.cache().borrow();
+            anyhow::ensure!(
+                cache.canonical_pool_ids(batch.anchor.chain_id) == batch.pools,
+                "Canonical batch does not cover the managed pool universe"
+            );
+
+            for id in &batch.pools {
+                let Some(PoolStateHealth::Ready { complete_through }) = cache.pool_state_health(id)
+                else {
+                    anyhow::bail!("Canonical pool {id} is not ready");
+                };
+                anyhow::ensure!(
+                    complete_through.chain_id == batch.anchor.chain_id
+                        && complete_through.epoch == batch.anchor.epoch
+                        && complete_through.number.checked_add(1) == Some(batch.anchor.number)
+                        && complete_through.block_hash == parent
+                        && cache.pool_profiler(id).is_some()
+                        && self.pool_updaters.contains_key(id),
+                    "Canonical batch does not extend the complete state of {id}"
+                );
+            }
+        }
+
+        let mut applied = 0;
+        let mut duplicates = 0;
+
+        for event in &batch.events {
+            let updater = self
+                .pool_updaters
+                .get(&event.instrument_id())
+                .ok_or_else(|| anyhow::anyhow!("Missing canonical pool updater"))?;
+
+            match updater.apply(event) {
+                PoolApplyOutcome::Applied => applied += 1,
+                PoolApplyOutcome::Duplicate => duplicates += 1,
+                PoolApplyOutcome::MissingProfiler => {
+                    anyhow::bail!("Canonical profiler disappeared")
+                }
+                PoolApplyOutcome::Rejected(e) => {
+                    anyhow::bail!("Canonical pool event rejected: {e}")
+                }
+            }
+        }
+
+        {
+            let cache = self.cache().borrow();
+
+            for id in &batch.pools {
+                let profiler = cache.pool_profiler(id).ok_or_else(|| {
+                    anyhow::anyhow!("Canonical profiler disappeared before completion")
+                })?;
+                validate_pool_profiler(profiler)?;
+            }
+        }
+
+        self.cache()
+            .borrow_mut()
+            .complete_canonical_pool_batch(&batch.anchor, &batch.pools)?;
+        Ok(CanonicalBatchReceipt {
+            anchor: batch.anchor,
+            applied,
+            duplicates,
+            pools: batch.pools.clone(),
+        })
+    }
+
     /// Returns all blockchains for which blocks subscriptions exist.
     #[must_use]
     pub fn subscribed_blocks(&self) -> Vec<Blockchain> {
@@ -202,11 +653,18 @@ impl DataEngine {
             DefiUnsubscribeCommand::Blocks(_) => return Ok(()),
         };
 
-        // The updater serves every pool subscription shape on every client
-        if !self
-            .get_clients()
-            .iter()
-            .any(|client| client.has_defi_pool_demand(&instrument_id))
+        // Canonical updaters belong to the recovery epoch, independently of raw subscriptions
+        let canonical = self
+            .cache()
+            .borrow()
+            .pool_state_health(&instrument_id)
+            .is_some();
+
+        if !canonical
+            && !self
+                .get_clients()
+                .iter()
+                .any(|client| client.has_defi_pool_demand(&instrument_id))
         {
             self.release_pool_updater(&instrument_id);
         }
@@ -249,20 +707,63 @@ impl DataEngine {
     pub fn process_defi_data(&mut self, data: DefiData) {
         self.increment_data_count();
 
+        // Raw websocket events are hints for canonical pools. Only the complete batch owner
+        // can advance them; routing these through the legacy updater would apply each log twice.
+        let is_pool_event = matches!(
+            &data,
+            DefiData::PoolSwap(_)
+                | DefiData::PoolLiquidityUpdate(_)
+                | DefiData::PoolFeeCollect(_)
+                | DefiData::PoolFeeProtocolUpdate(_)
+                | DefiData::PoolFeeProtocolCollect(_)
+                | DefiData::PoolFlash(_)
+        );
+
+        if is_pool_event
+            && self
+                .cache()
+                .borrow()
+                .pool_state_health(&data.instrument_id())
+                .is_some()
+        {
+            return;
+        }
+
         match data {
+            DefiData::CanonicalBootstrap(bootstrap) => {
+                if let Err(e) = self.process_canonical_bootstrap(&bootstrap) {
+                    log::error!("Canonical pool bootstrap rejected: {e}");
+                }
+            }
+            DefiData::CanonicalBatch(batch) => {
+                if let Err(e) = self.process_canonical_pool_batch(&batch) {
+                    log::error!("Canonical pool batch rejected: {e}");
+                }
+            }
+            DefiData::CanonicalInvalidation(invalidation) => {
+                self.invalidate_canonical_state(&invalidation);
+            }
             DefiData::Block(block) => {
                 let topic = defi::switchboard::get_defi_blocks_topic(block.chain());
                 msgbus::publish_defi_block(topic, &block);
             }
-            DefiData::Pool(pool) => self.handle_pool(&pool),
+            DefiData::Pool(pool) => {
+                self.handle_pool(&pool);
+            }
             DefiData::PoolSnapshot(snapshot) => {
-                // Replayed snapshots carry no request identity, so any pending bootstrap accepts them
-                if !self
-                    .pool_snapshot_pending
-                    .contains_key(&snapshot.instrument_id)
-                {
+                // Legacy replay snapshots have no request identity. A canonical request must
+                // receive the explicit request and anchor envelope through the native response path.
+                let Some(request) = self.pool_snapshot_pending.get(&snapshot.instrument_id) else {
                     log::warn!(
-                        "Received unexpected pool snapshot for {} (not in pending set)",
+                        "Received unexpected pool snapshot for {}",
+                        snapshot.instrument_id
+                    );
+                    return;
+                };
+
+                if request.canonical_anchor.is_some() {
+                    log::warn!(
+                        "Discarding unbound replay snapshot for canonical pool {}",
                         snapshot.instrument_id
                     );
                     return;
@@ -365,7 +866,7 @@ impl DataEngine {
         }
     }
 
-    fn handle_pool(&mut self, pool: &Pool) {
+    fn handle_pool(&mut self, pool: &Pool) -> bool {
         let instrument = match CurrencyPair::try_from(pool) {
             Ok(instrument) => InstrumentAny::CurrencyPair(instrument),
             Err(e) => {
@@ -373,32 +874,42 @@ impl DataEngine {
                     "Failed to create instrument for Pool {}: {e}",
                     pool.instrument_id
                 );
-                return;
+                return false;
             }
         };
 
         if !self.cache_instrument(&instrument) {
-            return;
+            return false;
         }
 
         if let Err(e) = self.cache().borrow_mut().add_pool(pool.clone()) {
             log::error!("Failed to add Pool to cache: {e}");
-            return;
+            return false;
         }
 
         self.publish_instrument(&instrument);
 
         let topic = defi::switchboard::get_defi_pool_topic(pool.instrument_id);
         msgbus::publish_defi_pool(topic, pool);
+        true
     }
 
     pub(crate) fn handle_pool_snapshot_response(&mut self, response: &PoolSnapshotResponse) {
         let instrument_id = response.data.instrument_id;
 
-        if self.pool_snapshot_pending.get(&instrument_id) != Some(&response.correlation_id) {
-            log::warn!(
-                "Discarding pool snapshot for {instrument_id} from stale request {}",
-                response.correlation_id
+        let Some(request) = self.pool_snapshot_pending.get(&instrument_id) else {
+            return;
+        };
+
+        if request.request_id != response.correlation_id {
+            log::warn!("Discarding stale pool snapshot response for {instrument_id}");
+            return;
+        }
+
+        if request.canonical_anchor != response.canonical_anchor {
+            self.fail_pool_hydration(
+                &instrument_id,
+                "Snapshot response canonical anchor mismatch",
             );
             return;
         }
@@ -408,6 +919,9 @@ impl DataEngine {
 
     fn hydrate_pool_profiler(&mut self, snapshot: &PoolSnapshot) {
         let instrument_id = snapshot.instrument_id;
+        let Some(request) = self.pool_snapshot_pending.get(&instrument_id).cloned() else {
+            return;
+        };
         log::info!(
             "Received pool snapshot for {instrument_id} at block {} with {} positions and {} ticks",
             snapshot.block_position.number,
@@ -424,7 +938,7 @@ impl DataEngine {
 
         let Some(pool) = pool else {
             log::error!("Pool {instrument_id} not found in cache when processing snapshot");
-            self.abandon_pool_snapshot(&instrument_id);
+            self.fail_pool_hydration(&instrument_id, "Pool snapshot hydration failed");
             return;
         };
 
@@ -440,7 +954,15 @@ impl DataEngine {
                 "Refusing empty stub snapshot for {instrument_id} at pool creation block {}; pool will remain without profiler",
                 snapshot.block_position.number,
             );
-            self.abandon_pool_snapshot(&instrument_id);
+            self.fail_pool_hydration(&instrument_id, "Pool snapshot hydration failed");
+            return;
+        }
+
+        if let Some(anchor) = &request.canonical_anchor
+            && let Err(e) = validate_canonical_snapshot(&pool, snapshot, anchor)
+        {
+            log::error!("Invalid canonical snapshot for {instrument_id}: {e}");
+            self.fail_pool_hydration(&instrument_id, &e.to_string());
             return;
         }
 
@@ -448,7 +970,7 @@ impl DataEngine {
         let mut profiler = PoolProfiler::new(pool);
         if let Err(e) = profiler.restore_from_snapshot(snapshot.clone()) {
             log::error!("Failed to restore profiler from snapshot for {instrument_id}: {e}");
-            self.abandon_pool_snapshot(&instrument_id);
+            self.fail_pool_hydration(&instrument_id, "Pool snapshot hydration failed");
             return;
         }
 
@@ -467,21 +989,35 @@ impl DataEngine {
             );
 
             let events_to_apply = convert_and_sort_buffered_events(buffered_events);
-            let applied_count = Self::apply_buffered_events_to_profiler(
+            let applied_count = match Self::apply_buffered_events_to_profiler(
                 &mut profiler,
                 events_to_apply,
                 &snapshot.block_position,
                 instrument_id,
-            );
+            ) {
+                Ok(count) => count,
+                Err(e) => {
+                    log::error!("Failed to hydrate pool profiler for {instrument_id}: {e}");
+                    self.fail_pool_hydration(&instrument_id, "Pool snapshot hydration failed");
+                    return;
+                }
+            };
 
             log::info!("Applied {applied_count} buffered events to profiler for {instrument_id}");
         }
 
         // Add profiler to cache
-        let result = self.cache().borrow_mut().add_pool_profiler(profiler);
+        let result = if let Some(anchor) = &request.canonical_anchor {
+            self.cache()
+                .borrow_mut()
+                .install_hydrated_pool(profiler, anchor, request.request_id)
+        } else {
+            self.cache().borrow_mut().add_pool_profiler(profiler)
+        };
+
         if let Err(e) = result {
             log::error!("Failed to add pool profiler to cache for {instrument_id}: {e}");
-            self.abandon_pool_snapshot(&instrument_id);
+            self.fail_pool_hydration(&instrument_id, "Pool snapshot hydration failed");
             return;
         }
 
@@ -489,10 +1025,51 @@ impl DataEngine {
         self.pool_snapshot_pending.remove(&instrument_id);
         let updater = Rc::new(PoolUpdater::new(&instrument_id, Rc::clone(self.cache())));
 
-        self.subscribe_pool_updater_topics(instrument_id, Rc::clone(&updater));
+        if request.canonical_anchor.is_none() {
+            self.subscribe_pool_updater_topics(instrument_id, Rc::clone(&updater));
+        }
         self.pool_updaters.insert(instrument_id, updater);
 
+        if let Some(anchor) = request.canonical_anchor {
+            let all_ready = {
+                let cache = self.cache().borrow();
+                let pools = cache.canonical_pool_ids(anchor.chain_id);
+                !pools.is_empty() && pools.iter().all(|id| {
+                    matches!(
+                        cache.pool_state_health(id),
+                        Some(PoolStateHealth::Ready { complete_through }) if *complete_through == anchor
+                    ) && self.pool_updaters.contains_key(id)
+                })
+            };
+
+            if all_ready {
+                // This is derived during the final qualified native SnapshotResponse dispatch.
+                // Actor callbacks may freeze Cache here; no Cache borrow or engine reentry is held.
+                let topic = defi::switchboard::get_defi_canonical_ready_topic(anchor.chain_id);
+                msgbus::publish_any(topic, &anchor);
+            }
+        }
+
         log::info!("Pool profiler setup completed for {instrument_id}, now processing live events");
+    }
+
+    fn fail_pool_hydration(&mut self, instrument_id: &InstrumentId, reason: &str) {
+        let anchor = self
+            .pool_snapshot_pending
+            .get(instrument_id)
+            .and_then(|request| request.canonical_anchor);
+
+        if let Some(anchor) = anchor {
+            let ts_init = self.clock().borrow().timestamp_ns();
+            self.invalidate_canonical_state(&CanonicalStateInvalidated {
+                chain_id: anchor.chain_id,
+                epoch: anchor.epoch,
+                reason: reason.to_string(),
+                ts_init,
+            });
+        } else {
+            self.abandon_pool_snapshot(instrument_id);
+        }
     }
 
     fn abandon_pool_snapshot(&mut self, instrument_id: &InstrumentId) {
@@ -528,12 +1105,16 @@ impl DataEngine {
     /// Applies buffered events to a pool profiler, filtering to events after the snapshot.
     ///
     /// Returns the count of successfully applied events.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a post-snapshot event cannot be applied completely.
     fn apply_buffered_events_to_profiler(
         profiler: &mut PoolProfiler,
         events: Vec<DexPoolData>,
         snapshot_block: &BlockPosition,
         instrument_id: InstrumentId,
-    ) -> usize {
+    ) -> anyhow::Result<usize> {
         let mut applied_count = 0;
 
         for event in events {
@@ -548,17 +1129,20 @@ impl DataEngine {
                     && event_block.2 > snapshot_block.log_index);
 
             if is_after_snapshot {
-                if let Err(e) = profiler.process(&event) {
-                    log::error!(
-                        "Failed to apply buffered event to profiler for {instrument_id}: {e}"
-                    );
-                } else {
+                let previous = profiler.last_processed_event.clone();
+                profiler.process(&event).map_err(|e| {
+                    e.context(format!(
+                        "failed to apply buffered event for {instrument_id}"
+                    ))
+                })?;
+
+                if profiler.last_processed_event != previous {
                     applied_count += 1;
                 }
             }
         }
 
-        applied_count
+        Ok(applied_count)
     }
 
     fn setup_pool_updater(&mut self, instrument_id: &InstrumentId, client_id: Option<&ClientId>) {
@@ -570,46 +1154,31 @@ impl DataEngine {
             return;
         }
 
+        if self
+            .cache()
+            .borrow()
+            .pool_state_health(instrument_id)
+            .is_some()
+        {
+            log::warn!("Canonical pool {instrument_id} requires an explicit hydration request");
+            return;
+        }
+
         log::info!("Setting up pool updater for {instrument_id}");
 
-        // Check cache state and ensure profiler exists
-        {
-            let mut cache = self.cache().borrow_mut();
+        // Pool metadata and an initial price do not contain the positions or tick distribution.
+        // Only a restored or historically processed profiler can serve an existing legacy replay.
+        let has_state = self
+            .cache()
+            .borrow()
+            .pool_profiler(instrument_id)
+            .is_some_and(|profiler| {
+                profiler.is_initialized && profiler.last_processed_event.is_some()
+            });
 
-            if cache.pool_profiler(instrument_id).is_some() {
-                // Profiler already exists, proceed to create updater
-                log::debug!("Pool profiler already exists for {instrument_id}");
-            } else if let Some(pool) = cache.pool(instrument_id) {
-                // Pool exists but no profiler, create profiler from pool
-                let pool = Arc::new(pool.clone());
-                let mut pool_profiler = PoolProfiler::new(Arc::clone(&pool));
-
-                if let Some(initial_sqrt_price_x96) = pool.initial_sqrt_price_x96 {
-                    if let Err(e) = pool_profiler.initialize(initial_sqrt_price_x96) {
-                        log::error!("Failed to initialize pool profiler for {instrument_id}: {e}");
-                        drop(cache);
-                        return;
-                    }
-                    log::debug!(
-                        "Initialized pool profiler for {instrument_id} with sqrt_price {initial_sqrt_price_x96}"
-                    );
-                } else {
-                    log::debug!("Created pool profiler for {instrument_id}");
-                }
-
-                if let Err(e) = cache.add_pool_profiler(pool_profiler) {
-                    log::error!("Failed to add pool profiler for {instrument_id}: {e}");
-                    drop(cache);
-                    return;
-                }
-                drop(cache);
-            } else {
-                // Neither profiler nor pool exists, request snapshot
-                drop(cache);
-
-                self.request_pool_snapshot(instrument_id, client_id);
-                return;
-            }
+        if !has_state {
+            self.request_pool_snapshot(instrument_id, client_id);
+            return;
         }
 
         // Profiler exists, create updater and subscribe to topics
@@ -637,13 +1206,15 @@ impl DataEngine {
             None,
         );
 
+        self.pool_snapshot_pending
+            .insert(*instrument_id, request.clone());
+        self.pool_event_buffers.entry(*instrument_id).or_default();
+
         if let Err(e) = self.execute_defi_request(DefiRequestCommand::PoolSnapshot(request)) {
+            self.abandon_pool_snapshot(instrument_id);
             log::warn!("Failed to request pool snapshot for {instrument_id}: {e}");
         } else {
             log::debug!("Requested pool snapshot for {instrument_id}");
-            self.pool_snapshot_pending
-                .insert(*instrument_id, request_id);
-            self.pool_event_buffers.entry(*instrument_id).or_default();
         }
     }
 
@@ -663,9 +1234,27 @@ impl DataEngine {
         }
 
         self.abandon_pool_snapshots();
+        self.canonical_batches.clear();
     }
 
     pub(crate) fn abandon_pool_snapshots(&mut self) {
+        let chains = self.cache().borrow().canonical_chain_ids();
+        let ts_init = self.clock().borrow().timestamp_ns();
+
+        for chain_id in chains {
+            let epoch = self
+                .cache()
+                .borrow()
+                .canonical_epoch(chain_id)
+                .expect("Canonical chain was selected above");
+            self.invalidate_canonical_state(&CanonicalStateInvalidated {
+                chain_id,
+                epoch,
+                reason: "Data session ended before canonical continuation".to_string(),
+                ts_init,
+            });
+        }
+
         self.pool_snapshot_pending.clear();
         self.pool_event_buffers.clear();
     }
@@ -887,9 +1476,16 @@ mod tests {
         let cache = Rc::new(RefCell::new(Cache::default()));
         let mut engine = DataEngine::new(clock, cache, None);
         if pending {
-            engine
-                .pool_snapshot_pending
-                .insert(test_instrument_id, UUID4::new());
+            engine.pool_snapshot_pending.insert(
+                test_instrument_id,
+                RequestPoolSnapshot::new(
+                    test_instrument_id,
+                    None,
+                    UUID4::new(),
+                    UnixNanos::default(),
+                    None,
+                ),
+            );
         }
 
         let events = vec![

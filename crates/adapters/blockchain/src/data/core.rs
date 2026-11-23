@@ -74,13 +74,13 @@ const POOL_EVENT_BLOCK_BATCH_SIZE: usize = 20_000;
 const POOL_EVENT_SYNC_VERSION_LEGACY: u32 = 0;
 const POOL_EVENT_SYNC_VERSION_PROTOCOL_FEE: u32 = 1;
 // Give each added family a new introduction version, then advance this current version
-const POOL_EVENT_SYNC_VERSION: u32 = POOL_EVENT_SYNC_VERSION_PROTOCOL_FEE;
+pub(super) const POOL_EVENT_SYNC_VERSION: u32 = POOL_EVENT_SYNC_VERSION_PROTOCOL_FEE;
 // Block-scoped RPC snapshots include the whole block, so same-block replay must skip every log.
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct PoolEventFamily {
-    name: &'static str,
-    signature: String,
+pub(super) struct PoolEventFamily {
+    pub(super) name: &'static str,
+    pub(super) signature: String,
     introduced_version: u32,
 }
 
@@ -96,6 +96,8 @@ struct PoolEventSyncRange {
 /// including syncing historical data, processing real-time events, and managing cached entities.
 #[derive(Debug)]
 pub struct BlockchainDataClientCore {
+    pub(super) http_rpc_client: Arc<BlockchainHttpRpcClient>,
+    pub(super) canonical: Option<super::canonical::CanonicalFeedState>,
     /// The blockchain being targeted by this client instance.
     pub chain: SharedChain,
     /// The configuration for the data client.
@@ -105,7 +107,7 @@ pub struct BlockchainDataClientCore {
     /// Interface for interacting with ERC20 token contracts.
     tokens: Erc20Contract,
     /// Interface for interacting with UniswapV3 pool contracts.
-    univ3_pool: UniswapV3PoolContract,
+    pub(super) univ3_pool: UniswapV3PoolContract,
     /// Client for the HyperSync data indexing service.
     pub hypersync_client: HyperSyncClient,
     /// Optional WebSocket RPC client for direct blockchain node communication.
@@ -200,20 +202,40 @@ impl BlockchainDataClientCore {
             log::debug!("Using HyperSync for live data (no WebSocket RPC)");
             None
         };
-        let http_rpc_client = Arc::new(BlockchainHttpRpcClient::new(
+        let http_rpc_client = BlockchainHttpRpcClient::new(
             config.http_rpc_url.clone().into_inner(),
             config.rpc_requests_per_second,
             config.proxy_url.clone().map(|value| value.into_inner()),
-        )?);
+        )?;
+        let http_rpc_client = Arc::new(match &config.canonical_pool_data {
+            Some(canonical) => {
+                http_rpc_client.with_request_timeout_seconds(canonical.rpc_timeout_seconds)?
+            }
+            None => http_rpc_client,
+        });
         let multicall_calls_per_rpc_request = config.multicall_calls_per_rpc_request;
         let erc20_contract = Erc20Contract::new(
             Arc::clone(&http_rpc_client),
             config.pool_filters.remove_pools_with_empty_erc20fields,
         );
 
+        #[cfg(feature = "hypersync")]
+        let hypersync_client = if let Some(token) = &config.hypersync_api_token {
+            HyperSyncClient::new_with_api_token(
+                Arc::clone(&chain),
+                hypersync_tx,
+                cancellation_token.clone(),
+                token.clone().into_inner(),
+            )?
+        } else {
+            HyperSyncClient::new(Arc::clone(&chain), hypersync_tx, cancellation_token.clone())?
+        };
+        #[cfg(not(feature = "hypersync"))]
         let hypersync_client =
             HyperSyncClient::new(Arc::clone(&chain), hypersync_tx, cancellation_token.clone())?;
         Ok(Self {
+            http_rpc_client: Arc::clone(&http_rpc_client),
+            canonical: None,
             chain,
             config,
             rpc_client,
@@ -293,6 +315,41 @@ impl BlockchainDataClientCore {
             self.chain.name
         );
         self.initialize_cache_database().await;
+
+        if let Some(canonical) = self.config.canonical_pool_data.clone() {
+            anyhow::ensure!(
+                self.cache.database.is_some(),
+                "Canonical cache database failed to initialize"
+            );
+            let database = self
+                .cache
+                .database
+                .as_ref()
+                .context("Canonical database is absent")?;
+            database.seed_chain(&self.chain).await?;
+            database.ensure_canonical_schema().await?;
+            database.create_block_partition(&self.chain).await?;
+            database.create_token_partition(&self.chain).await?;
+            if let Some(state) = database.canonical_state(self.chain.chain_id).await? {
+                // Metadata registration must obey the durable fence on reconnect. This
+                // captured lease does not restore Ready: begin_canonical_feed still
+                // proves the ancestor and CAS-transitions into a new recovery epoch.
+                self.cache.database = Some(database.canonical_writer(state.anchor));
+            }
+            self.cache.load_tokens().await?;
+
+            for instrument in &canonical.pools {
+                let (_, dex) = instrument.venue.parse_dex()?;
+                let identifier = PoolIdentifier::Address(instrument.symbol.inner());
+                self.register_dex_exchange_for_pool(dex, &identifier)
+                    .await?;
+                anyhow::ensure!(
+                    self.get_pool(&identifier)?.instrument_id == *instrument,
+                    "Canonical pool metadata is missing or mismatched; discover the fixed universe before connecting"
+                );
+            }
+            return Ok(());
+        }
 
         if let Some(ref mut rpc_client) = self.rpc_client {
             rpc_client.connect().await?;
@@ -652,13 +709,13 @@ impl BlockchainDataClientCore {
 
         let pool_events_stream = self
             .hypersync_client
-            .request_contract_events_stream(
+            .request_contract_events_stream_checked(
                 effective_from_block,
-                Some(to_block),
+                to_block,
                 pool_address,
                 event_signatures,
             )
-            .await;
+            .await?;
         tokio::pin!(pool_events_stream);
 
         let mut last_block_saved = effective_from_block;
@@ -686,7 +743,7 @@ impl BlockchainDataClientCore {
             }
             result = async {
                 while let Some(item) = pool_events_stream.next().await {
-                    let log = match item {
+                    let log = match item? {
                         PoolEventStreamItem::Block(block) => {
                             self.record_pool_event_block(block, &mut block_batch).await?;
                             continue;
@@ -929,7 +986,7 @@ impl BlockchainDataClientCore {
         Ok(())
     }
 
-    fn pool_event_families(dex: &DexExtended) -> Vec<PoolEventFamily> {
+    pub(super) fn pool_event_families(dex: &DexExtended) -> Vec<PoolEventFamily> {
         let mut families = vec![
             PoolEventFamily {
                 name: "swap",
@@ -1817,18 +1874,18 @@ impl BlockchainDataClientCore {
 
         let pool_events_stream = self
             .hypersync_client
-            .request_contract_events_stream(
+            .request_contract_events_stream_checked(
                 from_block,
-                Some(to_block),
+                to_block,
                 &profiler.pool.address,
                 event_signatures,
             )
-            .await;
+            .await?;
         tokio::pin!(pool_events_stream);
         let mut block_batch: Vec<Block> = Vec::with_capacity(POOL_EVENT_BLOCK_BATCH_SIZE);
 
         while let Some(item) = pool_events_stream.next().await {
-            let log = match item {
+            let log = match item? {
                 PoolEventStreamItem::Block(block) => {
                     self.record_pool_event_block(block, &mut block_batch)
                         .await?;
@@ -2045,7 +2102,7 @@ impl BlockchainDataClientCore {
     ///
     /// Returns `None` when no database is configured, the profiler has no processed event, or no
     /// snapshot row exists at that watermark.
-    async fn stored_snapshot_validation(
+    pub(super) async fn stored_snapshot_validation(
         &self,
         profiler: &PoolProfiler,
     ) -> anyhow::Result<Option<SnapshotValidation>> {
@@ -2320,6 +2377,25 @@ impl BlockchainDataClientCore {
         &mut self,
         block_number: u64,
     ) -> anyhow::Result<BlockPosition> {
+        if let Some(state) = &self.canonical {
+            anyhow::ensure!(
+                state.anchor.number == block_number,
+                "Canonical snapshot height differs from its request"
+            );
+            let mut block = self
+                .http_rpc_client
+                .block_header_by_hash(state.anchor.block_hash)
+                .await?;
+            block.set_chain(self.chain.name);
+            let position = Self::block_scoped_snapshot_position_from_block(
+                &mut self.cache,
+                &block,
+                block_number,
+            )?;
+            self.cache.add_pool_event_blocks_batch(vec![block]).await?;
+            return Ok(position);
+        }
+
         let blocks_stream = self
             .hypersync_client
             .request_blocks_stream(block_number, Some(block_number))
@@ -2459,6 +2535,19 @@ impl BlockchainDataClientCore {
             Some(pool) => Ok(pool),
             None => anyhow::bail!("Pool {pool_identifier} is not registered"),
         }
+    }
+
+    /// Sends a required observation without converting admission failure into a log message.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the native input channel is absent or closed.
+    pub fn send_data_checked(&self, data: DataEvent) -> anyhow::Result<()> {
+        self.data_tx
+            .as_ref()
+            .context("No native data event sender")?
+            .send(data)
+            .map_err(|_| anyhow::anyhow!("Native data event channel closed"))
     }
 
     /// Sends a data event to all subscribers through the data channel.

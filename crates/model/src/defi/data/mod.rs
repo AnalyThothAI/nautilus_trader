@@ -29,6 +29,7 @@ use crate::{
 };
 
 pub mod block;
+pub mod canonical;
 pub mod collect;
 pub mod fee_protocol_collect;
 pub mod fee_protocol_update;
@@ -40,6 +41,10 @@ pub mod transaction;
 
 // Re-exports
 pub use block::Block;
+pub use canonical::{
+    CanonicalAnchor, CanonicalPoolBatch, CanonicalPoolBootstrap, CanonicalPoolHydration,
+    CanonicalStateInvalidated,
+};
 pub use collect::PoolFeeCollect;
 pub use fee_protocol_collect::PoolFeeProtocolCollect;
 pub use fee_protocol_update::PoolFeeProtocolUpdate;
@@ -48,7 +53,7 @@ pub use liquidity::{PoolLiquidityUpdate, PoolLiquidityUpdateType};
 pub use swap::PoolSwap;
 pub use transaction::Transaction;
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum DexPoolData {
     Swap(PoolSwap),
     LiquidityUpdate(PoolLiquidityUpdate),
@@ -59,6 +64,58 @@ pub enum DexPoolData {
 }
 
 impl DexPoolData {
+    /// Returns the instrument id observed with this event.
+    #[must_use]
+    pub fn instrument_id(&self) -> InstrumentId {
+        match self {
+            Self::Swap(event) => event.instrument_id,
+            Self::LiquidityUpdate(event) => event.instrument_id,
+            Self::FeeCollect(event) => event.instrument_id,
+            Self::FeeProtocolUpdate(event) => event.instrument_id,
+            Self::FeeProtocolCollect(event) => event.instrument_id,
+            Self::Flash(event) => event.instrument_id,
+        }
+    }
+
+    /// Returns the chain id observed with this event.
+    #[must_use]
+    pub fn chain_id(&self) -> u32 {
+        match self {
+            Self::Swap(event) => event.chain.chain_id,
+            Self::LiquidityUpdate(event) => event.chain.chain_id,
+            Self::FeeCollect(event) => event.chain.chain_id,
+            Self::FeeProtocolUpdate(event) => event.chain.chain_id,
+            Self::FeeProtocolCollect(event) => event.chain.chain_id,
+            Self::Flash(event) => event.chain.chain_id,
+        }
+    }
+
+    /// Returns the block hash observed with this event.
+    #[must_use]
+    pub fn block_hash(&self) -> Option<&str> {
+        match self {
+            Self::Swap(event) => event.block_hash.as_deref(),
+            Self::LiquidityUpdate(event) => event.block_hash.as_deref(),
+            Self::FeeCollect(event) => event.block_hash.as_deref(),
+            Self::FeeProtocolUpdate(event) => event.block_hash.as_deref(),
+            Self::FeeProtocolCollect(event) => event.block_hash.as_deref(),
+            Self::Flash(event) => event.block_hash.as_deref(),
+        }
+    }
+
+    /// Returns the transaction hash observed with this event.
+    #[must_use]
+    pub fn transaction_hash(&self) -> &str {
+        match self {
+            Self::Swap(event) => event.transaction_hash.as_str(),
+            Self::LiquidityUpdate(event) => event.transaction_hash.as_str(),
+            Self::FeeCollect(event) => event.transaction_hash.as_str(),
+            Self::FeeProtocolUpdate(event) => event.transaction_hash.as_str(),
+            Self::FeeProtocolCollect(event) => event.transaction_hash.as_str(),
+            Self::Flash(event) => event.transaction_hash.as_str(),
+        }
+    }
+
     /// Returns the block number associated with this pool event.
     #[must_use]
     pub fn block_number(&self) -> u64 {
@@ -108,8 +165,14 @@ impl DexPoolData {
     feature = "python",
     pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.model")
 )]
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum DefiData {
+    /// A checkpoint announcement which initiates native, correlated hydration requests.
+    CanonicalBootstrap(CanonicalPoolBootstrap),
+    /// A complete, hash-bound canonical block batch.
+    CanonicalBatch(CanonicalPoolBatch),
+    /// A canonical state invalidation before recovery.
+    CanonicalInvalidation(CanonicalStateInvalidated),
     /// A block completion in a blockchain network.
     Block(Block),
     /// A DEX liquidity pool definition or update.
@@ -136,6 +199,9 @@ impl DefiData {
     #[rustfmt::skip]
     pub fn block_position(&self) -> (u64, u32, u32) {
         match self {
+            Self::CanonicalBootstrap(bootstrap) => (bootstrap.anchor.number, 0, 0),
+            Self::CanonicalBatch(batch) => (batch.anchor.number, block::BLOCK_SCOPED_SNAPSHOT_INDEX, block::BLOCK_SCOPED_SNAPSHOT_INDEX),
+            Self::CanonicalInvalidation(_) => (0, 0, 0),
             Self::Block(block) => (block.number, 0, 0),
             Self::Pool(pool) => (pool.creation_block, 0, 0),
             Self::PoolSnapshot(snapshot) => (
@@ -174,6 +240,9 @@ impl DefiData {
     #[must_use]
     pub fn ts_event(&self) -> UnixNanos {
         match self {
+            Self::CanonicalBootstrap(bootstrap) => bootstrap.ts_init,
+            Self::CanonicalBatch(batch) => batch.block.timestamp,
+            Self::CanonicalInvalidation(event) => event.ts_init,
             Self::Block(block) => block.timestamp,
             Self::Pool(pool) => pool.ts_event,
             Self::PoolSnapshot(snapshot) => snapshot.ts_event,
@@ -196,6 +265,9 @@ impl DefiData {
     #[must_use]
     pub fn ts_init(&self) -> UnixNanos {
         match self {
+            Self::CanonicalBootstrap(bootstrap) => bootstrap.ts_init,
+            Self::CanonicalBatch(batch) => batch.ts_init,
+            Self::CanonicalInvalidation(event) => event.ts_init,
             Self::Block(block) => block.timestamp,
             Self::Pool(pool) => pool.ts_init,
             Self::PoolSnapshot(snapshot) => snapshot.ts_init,
@@ -216,6 +288,11 @@ impl DefiData {
     #[must_use]
     pub fn instrument_id(&self) -> InstrumentId {
         match self {
+            Self::CanonicalBootstrap(_)
+            | Self::CanonicalBatch(_)
+            | Self::CanonicalInvalidation(_) => {
+                panic!("`InstrumentId` not applicable to chain-wide canonical data")
+            }
             Self::Block(_) => panic!("`InstrumentId` not applicable to `Block`"), // TBD?
             Self::PoolSnapshot(snapshot) => snapshot.instrument_id,
             Self::PoolSwap(swap) => swap.instrument_id,
@@ -286,6 +363,21 @@ impl HasTsInit for PoolFlash {
 impl Display for DefiData {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::CanonicalBootstrap(bootstrap) => write!(
+                f,
+                "CanonicalPoolBootstrap(chain={}, epoch={}, block={})",
+                bootstrap.anchor.chain_id, bootstrap.anchor.epoch, bootstrap.anchor.number
+            ),
+            Self::CanonicalBatch(batch) => write!(
+                f,
+                "CanonicalPoolBatch(chain={}, epoch={}, block={})",
+                batch.anchor.chain_id, batch.anchor.epoch, batch.anchor.number
+            ),
+            Self::CanonicalInvalidation(event) => write!(
+                f,
+                "CanonicalStateInvalidated(chain={}, epoch={})",
+                event.chain_id, event.epoch
+            ),
             Self::Block(b) => write!(f, "{b}"),
             Self::Pool(p) => write!(f, "{p}"),
             Self::PoolSnapshot(s) => write!(f, "PoolSnapshot(block={})", s.block_position.number),
@@ -344,5 +436,18 @@ impl From<PoolSnapshot> for DefiData {
 impl From<PoolFlash> for DefiData {
     fn from(value: PoolFlash) -> Self {
         Self::PoolFlash(value)
+    }
+}
+
+impl From<DexPoolData> for DefiData {
+    fn from(value: DexPoolData) -> Self {
+        match value {
+            DexPoolData::Swap(event) => Self::PoolSwap(event),
+            DexPoolData::LiquidityUpdate(event) => Self::PoolLiquidityUpdate(event),
+            DexPoolData::FeeCollect(event) => Self::PoolFeeCollect(event),
+            DexPoolData::FeeProtocolUpdate(event) => Self::PoolFeeProtocolUpdate(event),
+            DexPoolData::FeeProtocolCollect(event) => Self::PoolFeeProtocolCollect(event),
+            DexPoolData::Flash(event) => Self::PoolFlash(event),
+        }
     }
 }

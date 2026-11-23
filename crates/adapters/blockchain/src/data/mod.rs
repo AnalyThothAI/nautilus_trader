@@ -15,6 +15,7 @@
 
 use alloy::primitives::B256;
 
+pub mod canonical;
 pub mod client;
 pub mod core;
 pub mod subscription;
