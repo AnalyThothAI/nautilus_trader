@@ -220,7 +220,14 @@ pub fn transform_row_to_dex_pool_data(
         .parse()
         .map_err(|e| sqlx::Error::Decode(format!("Invalid pool identifier: {e}").into()))?;
     let block = decode_u64(row.try_get::<i64, _>("block")?, "event block")?;
-    let block_hash = row.try_get::<Option<String>, _>("block_hash")?;
+    let block_hash = row
+        .try_get::<Option<String>, _>("block_hash")?
+        .ok_or_else(|| {
+            sqlx::Error::Decode(
+                "Pool event has no original branch identity; refetch legacy data".into(),
+            )
+        })?;
+    let block_hash = Some(block_hash);
     let transaction_hash = row.try_get::<String, _>("transaction_hash")?;
     let transaction_index = decode_u32(
         row.try_get::<i32, _>("transaction_index")?,

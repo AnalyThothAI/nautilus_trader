@@ -16,10 +16,10 @@
 use std::{cmp::max, collections::HashSet, sync::Arc};
 
 use alloy::primitives::Address;
-use futures_util::StreamExt;
+use futures_util::{Stream, StreamExt};
 use nautilus_core::string::formatting::Separable;
 use nautilus_model::defi::{
-    Block, SharedDex,
+    Block, PoolIdentifier, SharedDex,
     amm::Pool,
     chain::SharedChain,
     reporting::{BlockchainSyncReportItems, BlockchainSyncReporter},
@@ -163,6 +163,106 @@ impl<'a> PoolDiscoveryService<'a> {
             self.chain.name
         );
 
+        self.sync_pool_range(dex, effective_from_block, to_block, None)
+            .await
+    }
+
+    /// Discovers a fixed set of pools without advancing factory-wide DEX coverage.
+    ///
+    /// Unselected creation events are filtered before any token metadata RPC. Existing
+    /// cached pools are reused only when they belong to the requested chain and DEX and
+    /// were created no later than the checkpoint. Callers must separately authenticate
+    /// their immutable configuration against the checkpoint's canonical block hash.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the universe is empty or duplicated, the range is reversed, work is
+    /// cancelled, a provider/database fails, or a required pool is missing at the checkpoint.
+    pub async fn sync_selected_pools(
+        &mut self,
+        dex: &DexExtended,
+        from_block: u64,
+        to_block: u64,
+        required: &[PoolIdentifier],
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(!required.is_empty(), "Selected pool universe is empty");
+        anyhow::ensure!(
+            from_block <= to_block,
+            "Selected pool discovery range is reversed"
+        );
+        anyhow::ensure!(!self.cancellation_token.is_cancelled(), "Sync cancelled");
+        let selected: HashSet<_> = required.iter().copied().collect();
+        anyhow::ensure!(
+            selected.len() == required.len(),
+            "Selected pool universe contains duplicates"
+        );
+
+        if required
+            .iter()
+            .all(|identifier| self.cache.get_pool(identifier).is_some())
+        {
+            return self.validate_selected_pools(dex, to_block, &selected);
+        }
+        self.sync_pool_range(dex, from_block, to_block, Some(&selected))
+            .await
+    }
+
+    async fn sync_pool_range(
+        &mut self,
+        dex: &DexExtended,
+        from_block: u64,
+        to_block: u64,
+        selected: Option<&HashSet<PoolIdentifier>>,
+    ) -> anyhow::Result<()> {
+        let cancellation = self.cancellation_token.clone();
+        let pools_stream = tokio::select! {
+            biased;
+            () = cancellation.cancelled() => anyhow::bail!("Sync cancelled"),
+            stream = self.hypersync_client.request_contract_events_stream_checked(
+                from_block,
+                to_block,
+                &dex.factory,
+                vec![dex.pool_created_event.as_ref()],
+            ) => stream?,
+        };
+        self.sync_pool_stream(dex, from_block, to_block, selected, pools_stream)
+            .await
+    }
+
+    fn validate_selected_pools(
+        &self,
+        dex: &DexExtended,
+        to_block: u64,
+        required: &HashSet<PoolIdentifier>,
+    ) -> anyhow::Result<()> {
+        for identifier in required {
+            let pool = self.cache.get_pool(identifier).ok_or_else(|| {
+                anyhow::anyhow!("Required pool {identifier} is missing at checkpoint {to_block}")
+            })?;
+            anyhow::ensure!(
+                pool.chain.chain_id == self.chain.chain_id
+                    && pool.dex.name == dex.dex.name
+                    && pool.dex.factory == dex.factory
+                    && pool.creation_block <= to_block,
+                "Required pool {identifier} has inconsistent chain, DEX, or creation height"
+            );
+        }
+        Ok(())
+    }
+
+    async fn sync_pool_stream<S>(
+        &mut self,
+        dex: &DexExtended,
+        effective_from_block: u64,
+        to_block: u64,
+        selected: Option<&HashSet<PoolIdentifier>>,
+        pools_stream: S,
+    ) -> anyhow::Result<()>
+    where
+        S: Stream<Item = anyhow::Result<PoolEventStreamItem>>,
+    {
+        anyhow::ensure!(!self.cancellation_token.is_cancelled(), "Sync cancelled");
+        let total_blocks = to_block.saturating_sub(effective_from_block) + 1;
         // Enable performance settings for sync operations
         if let Err(e) = self.cache.toggle_performance_settings(true).await {
             log::warn!("Failed to enable performance settings: {e}");
@@ -175,22 +275,11 @@ impl<'a> PoolDiscoveryService<'a> {
             BLOCKS_PROCESS_IN_SYNC_REPORT,
         );
 
-        let factory_address = &dex.factory;
-        let pair_created_event_signature = dex.pool_created_event.as_ref();
-        let pools_stream = self
-            .hypersync_client
-            .request_contract_events_stream(
-                effective_from_block,
-                Some(to_block),
-                factory_address,
-                vec![pair_created_event_signature],
-            )
-            .await;
-
         tokio::pin!(pools_stream);
 
         // LEVEL 1: RPC buffers (small, constrained by rate limits)
-        let token_rpc_batch_size = (self.config.multicall_calls_per_rpc_request / 3) as usize;
+        let token_rpc_batch_size =
+            ((self.config.multicall_calls_per_rpc_request / 3) as usize).max(1);
         let mut token_rpc_buffer: HashSet<Address> = HashSet::new();
 
         // LEVEL 2: DB buffers (large, optimize for throughput)
@@ -200,6 +289,14 @@ impl<'a> PoolDiscoveryService<'a> {
 
         let mut last_block_saved = effective_from_block;
 
+        let mut pending = selected.map(|required| {
+            required
+                .iter()
+                .filter(|identifier| self.cache.get_pool(identifier).is_none())
+                .copied()
+                .collect::<HashSet<_>>()
+        });
+
         // Tracking counters
         let mut total_discovered = 0;
         let mut total_skipped_exists = 0;
@@ -208,6 +305,7 @@ impl<'a> PoolDiscoveryService<'a> {
 
         let cancellation_token = self.cancellation_token.clone();
         let sync_result = tokio::select! {
+            biased;
             () = cancellation_token.cancelled() => {
                 log::debug!("Exchange pool sync cancelled");
                 Err(anyhow::anyhow!("Sync cancelled"))
@@ -215,7 +313,7 @@ impl<'a> PoolDiscoveryService<'a> {
 
             result = async {
                 while let Some(item) = pools_stream.next().await {
-                    let log = match item {
+                    let log = match item? {
                         PoolEventStreamItem::Block(block) => {
                             self.cache.cache_block_metadata(&block)?;
                             block_db_buffer.push(block);
@@ -227,10 +325,17 @@ impl<'a> PoolDiscoveryService<'a> {
                         PoolEventStreamItem::Log(log) => log,
                     };
                     let block_number = extract_block_number(&log)?;
-                    let blocks_progress = block_number - last_block_saved;
+                    let blocks_progress = block_number.saturating_sub(last_block_saved);
                     last_block_saved = block_number;
 
                     let pool = dex.parse_pool_created_event_hypersync(log)?;
+                    if selected.is_some_and(|required| !required.contains(&pool.pool_identifier)) {
+                        continue;
+                    }
+
+                    if let Some(pending) = pending.as_mut() {
+                        pending.remove(&pool.pool_identifier);
+                    }
                     total_discovered += 1;
 
                     if self.cache.get_pool(&pool.pool_identifier).is_some() {
@@ -300,6 +405,10 @@ impl<'a> PoolDiscoveryService<'a> {
                     if metrics.should_log_progress(block_number, to_block) {
                         metrics.log_progress(block_number);
                     }
+                    // Selected discovery proves only this fixed universe, not factory-wide coverage.
+                    if pending.as_ref().is_some_and(HashSet::is_empty) {
+                        break;
+                    }
                 }
 
                 // ==== FINAL FLUSH (all remaining data) ====
@@ -330,10 +439,14 @@ impl<'a> PoolDiscoveryService<'a> {
                 self.flush_pool_event_blocks(&mut block_db_buffer).await?;
                 metrics.log_final_stats();
 
-                // Update the last synced block after successful completion.
-                self.cache
-                    .update_dex_last_synced_block(&dex.dex.name, to_block)
-                    .await?;
+                if let Some(required) = selected {
+                    self.validate_selected_pools(dex, to_block, required)?;
+                } else {
+                    // Only a complete factory stream proves the full DEX watermark.
+                    self.cache
+                        .update_dex_last_synced_block(&dex.dex.name, to_block)
+                        .await?;
+                }
 
                 log::debug!(
                     "Successfully synced DEX {} pools up to block {} | Summary: discovered={}, saved={}, skipped_exists={}, skipped_invalid_tokens={}",
@@ -349,14 +462,12 @@ impl<'a> PoolDiscoveryService<'a> {
             } => result
         };
 
-        sync_result?;
-
         // Restore default safe settings after sync completion
         if let Err(e) = self.cache.toggle_performance_settings(false).await {
             log::warn!("Failed to restore default settings: {e}");
         }
 
-        Ok(())
+        sync_result
     }
 
     async fn flush_pool_event_blocks(&mut self, blocks: &mut Vec<Block>) -> anyhow::Result<()> {
@@ -508,3 +619,7 @@ impl<'a> PoolDiscoveryService<'a> {
         Ok(pools)
     }
 }
+
+#[cfg(test)]
+#[path = "pool_discovery_tests.rs"]
+mod tests;

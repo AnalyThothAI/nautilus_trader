@@ -29,7 +29,10 @@ use jiff::Timestamp;
 use nautilus_core::{Params, UUID4, UnixNanos, correctness::check_predicate_true};
 #[cfg(feature = "defi")]
 use nautilus_model::defi::{
-    Block, Blockchain, Pool, PoolLiquidityUpdate, PoolSwap, data::PoolFeeCollect, data::PoolFlash,
+    Block, Blockchain, Pool, PoolLiquidityUpdate, PoolSwap,
+    data::PoolFeeCollect,
+    data::PoolFlash,
+    data::{CanonicalAnchor, CanonicalPoolBatch, CanonicalStateInvalidated},
 };
 use nautilus_model::{
     data::{
@@ -614,6 +617,45 @@ pub trait DataActor {
     /// Returns an error if handling the instrument close update fails.
     #[allow(unused_variables)]
     fn on_instrument_close(&mut self, update: &InstrumentClose) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    #[cfg(feature = "defi")]
+    /// Actions performed after receiving a fully applied canonical pool batch.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the observation cannot be handled.
+    #[allow(unused_variables)]
+    fn on_canonical_pool_batch(&mut self, event: &CanonicalPoolBatch) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    #[cfg(feature = "defi")]
+    /// Actions performed after every pool in a canonical bootstrap becomes ready.
+    ///
+    /// This notification is derived from the accepted snapshot response and is dispatched
+    /// only after the whole universe and its native updaters have been installed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the notification cannot be handled.
+    #[allow(unused_variables)]
+    fn on_canonical_pool_ready(&mut self, anchor: &CanonicalAnchor) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    #[cfg(feature = "defi")]
+    /// Actions performed after receiving a canonical chain invalidation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the observation cannot be handled.
+    #[allow(unused_variables)]
+    fn on_canonical_state_invalidated(
+        &mut self,
+        event: &CanonicalStateInvalidated,
+    ) -> anyhow::Result<()> {
         Ok(())
     }
 
@@ -1216,6 +1258,60 @@ pub trait DataActor {
         }
 
         if let Err(e) = self.on_instrument_close(close) {
+            log_error(&e);
+        }
+    }
+
+    #[cfg(feature = "defi")]
+    /// Dispatches the canonical observation only while this component runs.
+    fn handle_canonical_pool_batch(&mut self, event: &CanonicalPoolBatch)
+    where
+        Self: Component,
+    {
+        log_received(event);
+
+        if self.not_running() {
+            log_not_running(event);
+            return;
+        }
+
+        if let Err(e) = self.on_canonical_pool_batch(event) {
+            log_error(&e);
+        }
+    }
+
+    #[cfg(feature = "defi")]
+    /// Dispatches the derived readiness notification only while this component runs.
+    fn handle_canonical_pool_ready(&mut self, anchor: &CanonicalAnchor)
+    where
+        Self: Component,
+    {
+        log_received(anchor);
+
+        if self.not_running() {
+            log_not_running(anchor);
+            return;
+        }
+
+        if let Err(e) = self.on_canonical_pool_ready(anchor) {
+            log_error(&e);
+        }
+    }
+
+    #[cfg(feature = "defi")]
+    /// Dispatches the canonical observation only while this component runs.
+    fn handle_canonical_state_invalidated(&mut self, event: &CanonicalStateInvalidated)
+    where
+        Self: Component,
+    {
+        log_received(event);
+
+        if self.not_running() {
+            log_not_running(event);
+            return;
+        }
+
+        if let Err(e) = self.on_canonical_state_invalidated(event) {
             log_error(&e);
         }
     }
@@ -2249,6 +2345,80 @@ pub trait DataActor {
             client_id,
             params,
         )
+    }
+
+    #[cfg(feature = "defi")]
+    /// Subscribes to applied batches and invalidations for a configured canonical universe.
+    ///
+    /// The data client owns the universe and source-completeness contract. This subscription
+    /// observes its state through the ordinary registered actor lifecycle.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the actor has not been registered with a trader.
+    fn subscribe_canonical_pool_state(&mut self, chain_id: u32)
+    where
+        Self: DataActorNative,
+        Self: 'static + Debug + Sized,
+    {
+        self.core().check_registered();
+        let actor_id = self.core().actor_id().inner();
+        let batch_handler =
+            ShareableMessageHandler::from_typed(move |event: &CanonicalPoolBatch| {
+                if let Some(mut actor) = try_get_actor_unchecked::<Self>(&actor_id) {
+                    actor.handle_canonical_pool_batch(event);
+                } else {
+                    log::error!("Actor {actor_id} not found for canonical batch handling");
+                }
+            });
+        let ready_handler = ShareableMessageHandler::from_typed(move |anchor: &CanonicalAnchor| {
+            if let Some(mut actor) = try_get_actor_unchecked::<Self>(&actor_id) {
+                actor.handle_canonical_pool_ready(anchor);
+            } else {
+                log::error!("Actor {actor_id} not found for canonical readiness handling");
+            }
+        });
+        let invalidation_handler =
+            ShareableMessageHandler::from_typed(move |event: &CanonicalStateInvalidated| {
+                if let Some(mut actor) = try_get_actor_unchecked::<Self>(&actor_id) {
+                    actor.handle_canonical_state_invalidated(event);
+                } else {
+                    log::error!("Actor {actor_id} not found for canonical invalidation handling");
+                }
+            });
+        self.core_mut().add_subscription_any(
+            defi::switchboard::get_defi_canonical_batch_topic(chain_id),
+            batch_handler,
+            None,
+            None,
+        );
+        self.core_mut().add_subscription_any(
+            defi::switchboard::get_defi_canonical_ready_topic(chain_id),
+            ready_handler,
+            None,
+            None,
+        );
+        self.core_mut().add_subscription_any(
+            defi::switchboard::get_defi_canonical_invalidated_topic(chain_id),
+            invalidation_handler,
+            None,
+            None,
+        );
+    }
+
+    #[cfg(feature = "defi")]
+    /// Removes canonical state observation handlers for the chain.
+    fn unsubscribe_canonical_pool_state(&mut self, chain_id: u32)
+    where
+        Self: DataActorNative,
+    {
+        self.core_mut()
+            .remove_subscription_any(defi::switchboard::get_defi_canonical_batch_topic(chain_id));
+        self.core_mut()
+            .remove_subscription_any(defi::switchboard::get_defi_canonical_ready_topic(chain_id));
+        self.core_mut().remove_subscription_any(
+            defi::switchboard::get_defi_canonical_invalidated_topic(chain_id),
+        );
     }
 
     #[cfg(feature = "defi")]

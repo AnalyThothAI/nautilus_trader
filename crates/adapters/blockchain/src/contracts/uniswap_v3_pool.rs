@@ -16,13 +16,14 @@
 use std::{collections::HashMap, sync::Arc};
 
 use alloy::{
-    primitives::{Address, U256, keccak256},
+    primitives::{Address, B256, U256, keccak256},
     sol,
     sol_types::{SolCall, private::primitives::aliases::I24},
 };
 use nautilus_core::{UnixNanos, hex};
 use nautilus_model::{
     defi::{
+        amm::Pool,
         data::block::BlockPosition,
         pool_analysis::{
             position::PoolPosition,
@@ -71,6 +72,13 @@ sol! {
             uint128 tokensOwed1;
         }
 
+        // Immutable pool configuration getters
+        function token0() external view returns (address);
+        function token1() external view returns (address);
+        function fee() external view returns (uint24);
+        function tickSpacing() external view returns (int24);
+        function factory() external view returns (address);
+
         // Core state getters
         function slot0() external view returns (Slot0Data memory);
         function liquidity() external view returns (uint128);
@@ -80,6 +88,7 @@ sol! {
 
         // Tick and position getters
         function ticks(int24 tick) external view returns (TickInfo memory);
+        function tickBitmap(int16 wordPosition) external view returns (uint256);
         function positions(bytes32 key) external view returns (PositionInfo memory);
     }
 }
@@ -135,6 +144,57 @@ impl UniswapV3PoolContract {
         Self {
             base: BaseContract::new_with_multicall_limit(client, multicall_calls_per_rpc_request),
         }
+    }
+
+    /// Verifies discovered pool metadata against immutable configuration at one block hash.
+    ///
+    /// Every Multicall chunk uses an EIP-1898 canonical hash selector. A discovered pool
+    /// cannot be used for canonical snapshots until its tokens, fee tier, tick spacing,
+    /// and factory match the contract at the checkpoint.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if metadata is missing or inconsistent, RPC/subcalls fail, responses are
+    /// incomplete, ABI values are invalid, or the configuration does not match.
+    pub async fn verify_pool_configuration_at_hash(
+        &self,
+        pool: &Pool,
+        block_hash: B256,
+    ) -> Result<(), UniswapV3PoolError> {
+        if block_hash.is_zero()
+            || pool.chain.chain_id != pool.dex.chain.chain_id
+            || pool.token0.chain.chain_id != pool.chain.chain_id
+            || pool.token1.chain.chain_id != pool.chain.chain_id
+            || pool.token0.address == pool.token1.address
+            || pool.fee.is_none()
+            || pool.tick_spacing.is_none_or(|spacing| spacing == 0)
+        {
+            return Err(UniswapV3PoolError::CallFailed {
+                field: "configuration".to_string(),
+                pool: pool.address,
+                reason: "Missing or inconsistent pool metadata/checkpoint hash".to_string(),
+            });
+        }
+        let calls = [
+            UniswapV3Pool::token0Call {}.abi_encode(),
+            UniswapV3Pool::token1Call {}.abi_encode(),
+            UniswapV3Pool::feeCall {}.abi_encode(),
+            UniswapV3Pool::tickSpacingCall {}.abi_encode(),
+            UniswapV3Pool::factoryCall {}.abi_encode(),
+        ]
+        .into_iter()
+        .map(|call_data| ContractCall {
+            target: pool.address,
+            allow_failure: false,
+            call_data,
+        })
+        .collect();
+        let results = self
+            .base
+            .at_canonical_block(block_hash)
+            .execute_multicall(calls, None)
+            .await?;
+        verify_pool_configuration_results(pool, &results)
     }
 
     /// Gets all global state in a single multicall.
@@ -399,6 +459,97 @@ impl UniswapV3PoolContract {
         decode_position_results(pool_address, positions, &results)
     }
 
+    /// Enumerates every initialized tick from the complete on-chain bitmap at one hash.
+    ///
+    /// This independently checks the topology supplied by a log indexer, including ranges
+    /// outside the current price. Every Multicall chunk uses the same EIP-1898 selector.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if spacing or ticks are invalid, chunks are missing, or subcalls fail.
+    pub async fn initialized_ticks_at_hash(
+        &self,
+        pool_address: &Address,
+        tick_spacing: i32,
+        block_hash: B256,
+    ) -> Result<Vec<i32>, UniswapV3PoolError> {
+        if tick_spacing <= 0 {
+            return Err(UniswapV3PoolError::CallFailed {
+                field: "tickSpacing".to_string(),
+                pool: *pool_address,
+                reason: "Tick spacing must be positive".to_string(),
+            });
+        }
+        let first_word = (-887_272_i32).div_euclid(tick_spacing).div_euclid(256);
+        let last_word = 887_272_i32.div_euclid(tick_spacing).div_euclid(256);
+        let words: Vec<i16> = (first_word..=last_word)
+            .map(|word| {
+                i16::try_from(word).map_err(|e| UniswapV3PoolError::CallFailed {
+                    field: "tickBitmap".to_string(),
+                    pool: *pool_address,
+                    reason: e.to_string(),
+                })
+            })
+            .collect::<Result<_, _>>()?;
+        let calls = words
+            .iter()
+            .map(|word| ContractCall {
+                target: *pool_address,
+                allow_failure: false,
+                call_data: UniswapV3Pool::tickBitmapCall {
+                    wordPosition: *word,
+                }
+                .abi_encode(),
+            })
+            .collect();
+        let results = self
+            .base
+            .at_canonical_block(block_hash)
+            .execute_multicall(calls, None)
+            .await?;
+
+        if results.len() != words.len() {
+            return Err(UniswapV3PoolError::CallFailed {
+                field: "tickBitmap".to_string(),
+                pool: *pool_address,
+                reason: "Incomplete bitmap response".to_string(),
+            });
+        }
+        let mut ticks = Vec::new();
+
+        for (word, result) in words.into_iter().zip(results) {
+            if !result.success {
+                return Err(UniswapV3PoolError::CallFailed {
+                    field: "tickBitmap".to_string(),
+                    pool: *pool_address,
+                    reason: "Bitmap subcall failed".to_string(),
+                });
+            }
+            let bitmap = UniswapV3Pool::tickBitmapCall::abi_decode_returns(&result.returnData)
+                .map_err(|e| UniswapV3PoolError::CallFailed {
+                    field: "tickBitmap".to_string(),
+                    pool: *pool_address,
+                    reason: e.to_string(),
+                })?;
+
+            for bit in 0..256 {
+                if bitmap.bit(bit) {
+                    let tick = (i32::from(word) * 256 + bit as i32)
+                        .checked_mul(tick_spacing)
+                        .filter(|tick| (-887_272..=887_272).contains(tick))
+                        .ok_or_else(|| UniswapV3PoolError::CallFailed {
+                            field: "tickBitmap".to_string(),
+                            pool: *pool_address,
+                            reason: "Initialized bitmap tick is outside the protocol range"
+                                .to_string(),
+                        })?;
+                    ticks.push(tick);
+                }
+            }
+        }
+        Ok(ticks)
+    }
+
     /// Fetches a complete pool snapshot directly from on-chain state.
     ///
     /// Retrieves global state, tick data, and position data from the blockchain
@@ -420,15 +571,30 @@ impl UniswapV3PoolContract {
         ts_init: UnixNanos,
         fee_protocol_encoding: FeeProtocolEncoding,
     ) -> Result<PoolSnapshot, UniswapV3PoolError> {
-        // Fetch all data at the specified block
+        let pinned = block_position
+            .block_hash
+            .as_deref()
+            .map(|hash| {
+                hash.parse()
+                    .map(|hash| Self {
+                        base: self.base.at_canonical_block(hash),
+                    })
+                    .map_err(|e| UniswapV3PoolError::CallFailed {
+                        field: "snapshot_block_hash".to_string(),
+                        pool: *pool_address,
+                        reason: format!("Invalid snapshot block hash: {e}"),
+                    })
+            })
+            .transpose()?;
+        let contract = pinned.as_ref().unwrap_or(self);
         let block = Some(block_position.number);
-        let global_state = self
+        let global_state = contract
             .get_global_state(pool_address, block, fee_protocol_encoding)
             .await?;
-        let ticks_map = self
+        let ticks_map = contract
             .batch_get_ticks(pool_address, tick_values, block)
             .await?;
-        let positions = self
+        let positions = contract
             .batch_get_positions(pool_address, position_keys, block)
             .await?;
 
@@ -555,6 +721,69 @@ fn decode_position_results(
         .collect()
 }
 
+fn verify_pool_configuration_results(
+    pool: &Pool,
+    results: &[Multicall3::Result],
+) -> Result<(), UniswapV3PoolError> {
+    let fields = ["token0", "token1", "fee", "tickSpacing", "factory"];
+    if results.len() != fields.len() {
+        return Err(UniswapV3PoolError::CallFailed {
+            field: "configuration".to_string(),
+            pool: pool.address,
+            reason: "Incomplete pool configuration response".to_string(),
+        });
+    }
+
+    for (field, result) in fields.into_iter().zip(results) {
+        if !result.success {
+            return Err(UniswapV3PoolError::CallFailed {
+                field: field.to_string(),
+                pool: pool.address,
+                reason: "Pool configuration subcall failed".to_string(),
+            });
+        }
+    }
+    let decode_error =
+        |field: &str, reason: alloy::sol_types::Error| UniswapV3PoolError::CallFailed {
+            field: field.to_string(),
+            pool: pool.address,
+            reason: format!("Invalid configuration ABI response: {reason}"),
+        };
+    let token0 = UniswapV3Pool::token0Call::abi_decode_returns(&results[0].returnData)
+        .map_err(|e| decode_error("token0", e))?;
+    let token1 = UniswapV3Pool::token1Call::abi_decode_returns(&results[1].returnData)
+        .map_err(|e| decode_error("token1", e))?;
+    let fee = UniswapV3Pool::feeCall::abi_decode_returns(&results[2].returnData)
+        .map_err(|e| decode_error("fee", e))?
+        .to::<u32>();
+    let tick_spacing = UniswapV3Pool::tickSpacingCall::abi_decode_returns(&results[3].returnData)
+        .map_err(|e| decode_error("tickSpacing", e))?
+        .as_i32();
+    let factory = UniswapV3Pool::factoryCall::abi_decode_returns(&results[4].returnData)
+        .map_err(|e| decode_error("factory", e))?;
+
+    for (field, matches) in [
+        ("token0", token0 == pool.token0.address),
+        ("token1", token1 == pool.token1.address),
+        ("fee", Some(fee) == pool.fee),
+        (
+            "tickSpacing",
+            u32::try_from(tick_spacing).ok() == pool.tick_spacing,
+        ),
+        ("factory", factory == pool.dex.factory),
+    ] {
+        if !matches {
+            return Err(UniswapV3PoolError::CallFailed {
+                field: field.to_string(),
+                pool: pool.address,
+                reason: "Discovered metadata differs from hash-pinned contract configuration"
+                    .to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
 const fn split_pancakeswap_v3_fee_protocol(fee_protocol: u32) -> (u32, u32) {
     (
         fee_protocol % PANCAKESWAP_V3_PROTOCOL_FEE_LANE_SIZE,
@@ -646,3 +875,7 @@ mod tests {
         ));
     }
 }
+
+#[cfg(test)]
+#[path = "uniswap_v3_pool_configuration_tests.rs"]
+mod configuration_tests;

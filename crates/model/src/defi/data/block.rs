@@ -81,7 +81,7 @@ impl BlockPosition {
 )]
 pub struct Block {
     /// The blockchain network this block is part of.
-    #[serde(skip)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chain: Option<Blockchain>, // TODO: We should make this required eventually
     /// The unique identifier hash of the block.
     pub hash: String,
@@ -227,6 +227,32 @@ mod tests {
 
     use super::{Block, BlockPosition};
     use crate::defi::{Blockchain, chain::chains, rpc::RpcNodeWssResponse};
+
+    #[rstest]
+    fn recorded_header_json_preserves_chain_identity_and_all_native_fields() {
+        let block = Block::new(
+            format!("0x{}", "01".repeat(32)),
+            format!("0x{}", "02".repeat(32)),
+            42,
+            "0x0000000000000000000000000000000000000000".into(),
+            30_000_000,
+            21_000,
+            UnixNanos::new(2_000_000_001),
+            Some(Blockchain::Ethereum),
+        )
+        .with_base_fee(U256::from(7))
+        .with_blob_gas(U256::from(8), U256::from(9))
+        .with_l1_fee_components(U256::from(10), 11, 12);
+        let encoded = serde_json::to_vec(&block).unwrap();
+        let decoded: Block = serde_json::from_slice(&encoded).unwrap();
+        // Block::PartialEq compares only the hash; compare the complete serialized header.
+        assert_eq!(
+            serde_json::to_value(&decoded).unwrap(),
+            serde_json::to_value(&block).unwrap()
+        );
+        assert_eq!(decoded.chain, Some(Blockchain::Ethereum));
+        assert_eq!(decoded.timestamp.as_u64(), 2_000_000_001);
+    }
 
     fn utc_timestamp(year: i16, month: i8, day: i8, hour: i8, minute: i8, second: i8) -> Timestamp {
         Offset::UTC

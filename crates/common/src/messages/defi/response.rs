@@ -14,13 +14,15 @@
 // -------------------------------------------------------------------------------------------------
 
 use nautilus_core::UUID4;
-use nautilus_model::defi::pool_analysis::PoolSnapshot;
+use nautilus_model::defi::{data::canonical::CanonicalAnchor, pool_analysis::PoolSnapshot};
 
 /// Represents a pool snapshot sent in reply to a [`RequestPoolSnapshot`](super::RequestPoolSnapshot).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct PoolSnapshotResponse {
     pub correlation_id: UUID4,
     pub data: PoolSnapshot,
+    /// The validated canonical identity requested by the caller.
+    pub canonical_anchor: Option<CanonicalAnchor>,
 }
 
 impl PoolSnapshotResponse {
@@ -30,6 +32,14 @@ impl PoolSnapshotResponse {
         Self {
             correlation_id,
             data,
+            canonical_anchor: None,
         }
+    }
+
+    /// Attaches the explicit canonical identity of this hydration.
+    #[must_use]
+    pub fn with_canonical_anchor(mut self, anchor: CanonicalAnchor) -> Self {
+        self.canonical_anchor = Some(anchor);
+        self
     }
 }

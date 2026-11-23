@@ -23,7 +23,9 @@ use std::{
 use ahash::AHashSet;
 use bytes::Bytes;
 #[cfg(feature = "defi")]
-use nautilus_model::defi::{Pool, PoolProfiler};
+use nautilus_model::defi::{
+    Pool, PoolProfiler, SharedPool, data::canonical::CanonicalAnchor, pool_analysis::PoolSnapshot,
+};
 use nautilus_model::{
     accounts::AccountAny,
     data::{
@@ -54,6 +56,8 @@ use super::{
     },
 };
 use crate::component::ComponentAccessError;
+#[cfg(feature = "defi")]
+use crate::defi::cache::PoolStateHealth;
 
 /// User-facing cache API.
 ///
@@ -2034,6 +2038,47 @@ impl<'a> CacheApi<'a> {
     #[must_use]
     pub fn pool_profiler(&self, instrument_id: &InstrumentId) -> Option<PoolProfiler> {
         self.cache().pool_profiler(instrument_id).cloned()
+    }
+
+    /// Returns the trust state of a pool managed by complete canonical batches.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the cache is already mutably borrowed.
+    #[cfg(feature = "defi")]
+    #[must_use]
+    pub fn pool_state_health(&self, instrument_id: &InstrumentId) -> Option<PoolStateHealth> {
+        self.cache().pool_state_health(instrument_id).cloned()
+    }
+
+    /// Returns the sorted instrument IDs managed by canonical batches for a chain.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the cache is already mutably borrowed.
+    #[cfg(feature = "defi")]
+    #[must_use]
+    pub fn canonical_pool_ids(&self, chain_id: u32) -> Vec<InstrumentId> {
+        self.cache().canonical_pool_ids(chain_id)
+    }
+
+    // panics-doc-ok: cache() calls RefCell::borrow, which panics on a conflicting mutable borrow.
+    /// Freezes every canonical pool at one proven complete-through anchor under a single borrow.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the universe is empty, any pool is unready or inconsistent, or the
+    /// requested anchor does not match every managed pool.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the cache is already mutably borrowed.
+    #[cfg(feature = "defi")]
+    pub fn canonical_pool_snapshots(
+        &self,
+        anchor: CanonicalAnchor,
+    ) -> anyhow::Result<Vec<(SharedPool, PoolSnapshot)>> {
+        self.cache().canonical_pool_snapshots(anchor)
     }
 
     /// Returns the pool profiler instrument IDs in the cache, optionally filtered by `venue`.

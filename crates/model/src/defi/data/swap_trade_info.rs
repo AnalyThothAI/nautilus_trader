@@ -52,7 +52,7 @@ use crate::{
 /// - `execution_price`: Average realized price for this swap (from amount ratio)
 ///
 /// Both prices are in quote/base direction (e.g., USDC per WETH) and adjusted for token decimals.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SwapTradeInfo {
     /// The direction of the trade from the base token perspective.
     pub order_side: OrderSide,

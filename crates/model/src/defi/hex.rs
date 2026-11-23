@@ -22,6 +22,22 @@ use alloy_primitives::U256;
 use nautilus_core::{UnixNanos, datetime::NANOSECONDS_IN_SECOND};
 use serde::{Deserialize, Deserializer};
 
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum HexOrInteger {
+    Integer(u64),
+    Hex(String),
+}
+
+impl HexOrInteger {
+    fn number<E: serde::de::Error>(self) -> Result<u64, E> {
+        match self {
+            Self::Integer(value) => Ok(value),
+            Self::Hex(value) => from_str_hex_to_u64(&value).map_err(E::custom),
+        }
+    }
+}
+
 /// Converts a hexadecimal string to a u64 integer.
 ///
 /// # Errors
@@ -51,20 +67,19 @@ pub fn from_str_hex_to_u64(hex_string: &str) -> Result<u64, std::num::ParseIntEr
     u64::from_str_radix(without_prefix, 16)
 }
 
-/// Custom deserializer function for hex numbers.
+/// Deserializes an RPC hex quantity or a native serialized unsigned integer.
 ///
 /// # Errors
 ///
-/// Returns an error if parsing the hex string to a number fails.
+/// Returns an error if hexadecimal is malformed, arithmetic overflows, or a numeric value is not an integer.
 pub fn deserialize_hex_number<'de, D>(deserializer: D) -> Result<u64, D::Error>
 where
     D: Deserializer<'de>,
 {
-    let hex_string: std::borrow::Cow<'de, str> = Deserialize::deserialize(deserializer)?;
-    from_str_hex_to_u64(hex_string.as_ref()).map_err(serde::de::Error::custom)
+    HexOrInteger::deserialize(deserializer)?.number()
 }
 
-/// Custom deserializer that converts an optional hexadecimal string into an `Option<u64>`.
+/// Deserializes an optional RPC hex quantity or native unsigned integer.
 ///
 /// The field is treated as optional - if the JSON field is `null` or absent the function returns
 /// `Ok(None)`. When the value **is** present it is parsed via [`from_str_hex_to_u64`] and wrapped
@@ -78,16 +93,9 @@ pub fn deserialize_opt_hex_u64<'de, D>(deserializer: D) -> Result<Option<u64>, D
 where
     D: Deserializer<'de>,
 {
-    // We first deserialize the value into an `Option<String>` so that missing / null JSON keys
-    // gracefully map to `None`.
-    let opt = Option::<String>::deserialize(deserializer)?;
-
-    match opt {
-        None => Ok(None),
-        Some(hex_string) => from_str_hex_to_u64(hex_string.as_str())
-            .map(Some)
-            .map_err(serde::de::Error::custom),
-    }
+    Option::<HexOrInteger>::deserialize(deserializer)?
+        .map(HexOrInteger::number)
+        .transpose()
 }
 
 /// Custom deserializer that converts an optional hexadecimal string into an `Option<U256>`.
@@ -118,7 +126,10 @@ where
     }
 }
 
-/// Custom deserializer function for hex timestamps to convert hex seconds to `UnixNanos`.
+/// Deserializes RPC hexadecimal seconds or a native integer count of nanoseconds.
+///
+/// The representations have explicit units: JSON-RPC strings contain seconds, while the unsigned
+/// integer emitted by [`UnixNanos`] contains nanoseconds and preserves subsecond precision.
 ///
 /// # Errors
 ///
@@ -127,8 +138,13 @@ pub fn deserialize_hex_timestamp<'de, D>(deserializer: D) -> Result<UnixNanos, D
 where
     D: Deserializer<'de>,
 {
-    let hex_string: std::borrow::Cow<'de, str> = Deserialize::deserialize(deserializer)?;
-    let seconds = from_str_hex_to_u64(hex_string.as_ref()).map_err(serde::de::Error::custom)?;
+    let value = HexOrInteger::deserialize(deserializer)?;
+    let seconds = match value {
+        HexOrInteger::Integer(nanos) => return Ok(UnixNanos::new(nanos)),
+        HexOrInteger::Hex(value) => {
+            from_str_hex_to_u64(&value).map_err(serde::de::Error::custom)?
+        }
+    };
 
     // Protect against multiplication overflow (extremely far future dates or malicious input).
     seconds
@@ -143,6 +159,48 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
+
+    #[derive(Debug, Deserialize)]
+    struct RecordedHeader {
+        #[serde(deserialize_with = "deserialize_hex_number")]
+        number: u64,
+        #[serde(default, deserialize_with = "deserialize_opt_hex_u64")]
+        optional: Option<u64>,
+        #[serde(deserialize_with = "deserialize_hex_timestamp")]
+        timestamp: UnixNanos,
+    }
+
+    #[rstest]
+    fn rpc_hex_seconds_and_recorded_nanoseconds_keep_their_units() {
+        let rpc: RecordedHeader =
+            serde_json::from_str(r#"{"number":"0X2a","optional":"0x3","timestamp":"0x2"}"#)
+                .unwrap();
+        let recorded: RecordedHeader =
+            serde_json::from_str(r#"{"number":42,"optional":3,"timestamp":2000000001}"#).unwrap();
+        assert_eq!(
+            (rpc.number, rpc.optional, rpc.timestamp.as_u64()),
+            (42, Some(3), 2_000_000_000)
+        );
+        assert_eq!(
+            (
+                recorded.number,
+                recorded.optional,
+                recorded.timestamp.as_u64()
+            ),
+            (42, Some(3), 2_000_000_001)
+        );
+    }
+
+    #[rstest]
+    #[case::negative_number(r#"{"number":-1,"timestamp":1}"#)]
+    #[case::fractional_number(r#"{"number":1.5,"timestamp":1}"#)]
+    #[case::overflow_number(r#"{"number":"0x10000000000000000","timestamp":1}"#)]
+    #[case::negative_timestamp(r#"{"number":1,"timestamp":-1}"#)]
+    #[case::fractional_timestamp(r#"{"number":1,"timestamp":1.5}"#)]
+    #[case::overflow_timestamp(r#"{"number":1,"timestamp":"0xffffffffffffffff"}"#)]
+    fn invalid_recorded_quantities_remain_rejected(#[case] input: &str) {
+        assert!(serde_json::from_str::<RecordedHeader>(input).is_err());
+    }
 
     #[rstest]
     fn test_from_str_hex_to_u64_valid() {

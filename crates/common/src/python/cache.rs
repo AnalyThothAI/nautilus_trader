@@ -3544,9 +3544,11 @@ impl Cache {
         self.pools(venue.as_ref()).into_iter().cloned().collect()
     }
 
-    /// Adds a `PoolProfiler` to the cache.
+    /// Adds an ordinary historical `PoolProfiler` to the cache.
     ///
-    /// This function does not return errors; the result type matches the other add methods.
+    /// # Errors
+    ///
+    /// Returns an error if the pool requires the explicit canonical hydration transition.
     #[pyo3(name = "add_pool_profiler")]
     fn py_add_pool_profiler(&mut self, pool_profiler: PoolProfiler) -> PyResult<()> {
         self.add_pool_profiler(pool_profiler)

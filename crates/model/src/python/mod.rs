@@ -404,6 +404,9 @@ pub fn model(_: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_class::<crate::defi::data::Transaction>()?;
         m.add_class::<crate::defi::data::Block>()?;
         m.add_class::<crate::defi::data::DefiData>()?;
+        m.add_class::<crate::defi::data::CanonicalPoolBatch>()?;
+        m.add_class::<crate::defi::data::CanonicalPoolBootstrap>()?;
+        m.add_class::<crate::defi::data::CanonicalStateInvalidated>()?;
         m.add_class::<crate::defi::dex::DexType>()?;
         m.add_class::<crate::defi::pool_analysis::PoolSnapshot>()?;
         m.add_class::<crate::defi::pool_analysis::PoolProfiler>()?;

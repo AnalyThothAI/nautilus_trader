@@ -13,7 +13,12 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-use serde::{Deserialize, de::DeserializeOwned};
+use std::marker::PhantomData;
+
+use serde::{
+    Deserialize, Deserializer,
+    de::{DeserializeOwned, Visitor},
+};
 
 /// A response structure received from a WebSocket JSON-RPC blockchain node subscription.
 #[derive(Debug, Deserialize)]
@@ -53,8 +58,13 @@ where
     pub jsonrpc: Option<String>,
     /// Request identifier returned by the server (optional for non-standard error responses).
     pub id: Option<u64>,
-    /// Deserialized result.
-    #[serde(bound(deserialize = ""))]
+    /// Deserialized result. Missing fields remain absent; an explicit null is preserved when
+    /// T can represent it, while non-nullable T retains the existing absent-result semantics.
+    #[serde(
+        default = "Option::default",
+        deserialize_with = "deserialize_present_result",
+        bound(deserialize = "")
+    )]
     pub result: Option<T>,
     /// Error information if the request failed.
     pub error: Option<RpcError>,
@@ -62,6 +72,39 @@ where
     pub code: Option<i32>,
     /// Error message (for non-standard rate limit responses).
     pub message: Option<String>,
+}
+
+/// Preserves an explicit nullable result without converting through `serde_json::Value`: direct
+/// streaming deserialization is required for u128 quantities wider than `serde_json::Number`.
+fn deserialize_present_result<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    struct PresentResult<T>(PhantomData<T>);
+    impl<'de, T: Deserialize<'de>> Visitor<'de> for PresentResult<T> {
+        type Value = Option<T>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a JSON-RPC result or explicit null")
+        }
+
+        fn visit_some<D: Deserializer<'de>>(
+            self,
+            deserializer: D,
+        ) -> Result<Self::Value, D::Error> {
+            T::deserialize(deserializer).map(Some)
+        }
+
+        fn visit_none<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+            Ok(T::deserialize(serde::de::value::UnitDeserializer::<E>::new()).ok())
+        }
+
+        fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+            self.visit_none()
+        }
+    }
+    deserializer.deserialize_option(PresentResult(PhantomData))
 }
 
 /// JSON-RPC error structure.
@@ -108,6 +151,52 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
+
+    #[rstest]
+    fn rpc_http_explicit_null_is_a_value_but_missing_result_is_absent() {
+        let null: RpcNodeHttpResponse<serde_json::Value> =
+            serde_json::from_str(r#"{"jsonrpc":"2.0","id":1,"result":null}"#).unwrap();
+        assert_eq!(null.result, Some(serde_json::Value::Null));
+        let missing: RpcNodeHttpResponse<serde_json::Value> =
+            serde_json::from_str(r#"{"jsonrpc":"2.0","id":1}"#).unwrap();
+        assert!(missing.result.is_none());
+    }
+
+    #[rstest]
+    fn rpc_http_nullable_results_preserve_option_and_legacy_execution_semantics() {
+        let null: RpcNodeHttpResponse<Option<u64>> =
+            serde_json::from_str(r#"{"jsonrpc":"2.0","id":1,"result":null}"#).unwrap();
+        assert_eq!(null.result, Some(None));
+        let strict: RpcNodeHttpResponse<String> =
+            serde_json::from_str(r#"{"jsonrpc":"2.0","id":1,"result":null}"#).unwrap();
+        assert!(strict.result.is_none());
+    }
+
+    #[rstest]
+    fn rpc_http_error_with_null_keeps_error_classification() {
+        let error: RpcNodeHttpResponse<String> = serde_json::from_str(
+            r#"{"jsonrpc":"2.0","id":1,"result":null,"error":{"code":3,"message":"execution reverted"}}"#,
+        ).unwrap();
+        assert!(error.result.is_none());
+        assert_eq!(error.error.unwrap().code, 3);
+    }
+
+    #[rstest]
+    fn rpc_http_nonnull_result_rejects_wrong_type() {
+        assert!(
+            serde_json::from_str::<RpcNodeHttpResponse<u64>>(
+                r#"{"jsonrpc":"2.0","id":1,"result":"not a quantity"}"#,
+            )
+            .is_err()
+        );
+    }
+
+    #[rstest]
+    fn rpc_http_result_preserves_u128_max_without_value_intermediary() {
+        let json = format!(r#"{{"jsonrpc":"2.0","id":1,"result":{}}}"#, u128::MAX);
+        let result: RpcNodeHttpResponse<u128> = serde_json::from_str(&json).unwrap();
+        assert_eq!(result.result, Some(u128::MAX));
+    }
 
     #[rstest]
     fn test_rpc_log_deserialize_pool_created_block_185() {

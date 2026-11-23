@@ -54,7 +54,7 @@ impl RawSwapData {
 /// This structure captures both the raw blockchain data from a swap event and
 /// optionally includes computed market-oriented trade information. It serves as
 /// the primary data structure for tracking and analyzing DEX swap activity.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(
     feature = "python",
     pyo3::pyclass(module = "nautilus_trader.model", from_py_object)
@@ -191,5 +191,71 @@ impl Display for PoolSwap {
             stringify!(PoolSwap),
             self.instrument_id,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use rstest::rstest;
+
+    use super::*;
+    use crate::{
+        defi::{AmmType, Chain, Dex, DexType},
+        enums::OrderSide,
+        types::{Price, Quantity},
+    };
+
+    #[rstest]
+    fn observed_swap_json_preserves_large_liquidity_and_trade_metadata() {
+        let chain = Arc::new(Chain::from_chain_id(1).unwrap().clone());
+        let dex = Arc::new(Dex::new(
+            (*chain).clone(),
+            DexType::UniswapV3,
+            "0x1F98431c8aD98523631AE4a59f267346ea31F984",
+            0,
+            AmmType::CLAMM,
+            "PoolCreated",
+            "Swap",
+            "Mint",
+            "Burn",
+            "Collect",
+        ));
+        let mut swap = PoolSwap::new(
+            chain,
+            dex,
+            InstrumentId::from("POOL.ETHEREUM-UNISWAPV3"),
+            PoolIdentifier::from_address(Address::repeat_byte(1)),
+            42,
+            format!("0x{}", "02".repeat(32)),
+            3,
+            4,
+            5.into(),
+            6.into(),
+            Address::repeat_byte(3),
+            Address::repeat_byte(4),
+            "123".parse().unwrap(),
+            "-122".parse().unwrap(),
+            "79228162514264337593543950336".parse().unwrap(),
+            (1_u128 << 100) + 17,
+            0,
+        );
+        swap.block_hash = Some(format!("0x{}", "05".repeat(32)));
+        swap.trade_info = Some(SwapTradeInfo {
+            order_side: OrderSide::Buy,
+            quantity_base: Quantity::from("1.25"),
+            quantity_quote: Quantity::from("2.50"),
+            spot_price: Price::from("2.00"),
+            execution_price: Price::from("2.01"),
+            is_inverted: true,
+            spot_price_before: Some(Price::from("1.99")),
+        });
+        let bytes = serde_json::to_vec(&swap).unwrap();
+        let replayed: PoolSwap = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(replayed, swap);
+        assert_eq!(replayed.liquidity, (1_u128 << 100) + 17);
+        assert_eq!(replayed.ts_init.as_u64(), 6);
+        assert!(replayed.trade_info.is_some());
     }
 }

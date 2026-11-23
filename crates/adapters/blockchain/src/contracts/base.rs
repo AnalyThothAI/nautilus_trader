@@ -15,7 +15,11 @@
 
 use std::sync::Arc;
 
-use alloy::{primitives::Address, sol, sol_types::SolCall};
+use alloy::{
+    primitives::{Address, B256},
+    sol,
+    sol_types::SolCall,
+};
 use nautilus_core::hex;
 use nautilus_model::defi::validation::validate_address;
 
@@ -62,6 +66,8 @@ pub struct BaseContract {
     multicall_calls_per_rpc_request: usize,
     /// Per-request RPC timeout in seconds, when bounded.
     rpc_timeout_secs: Option<u64>,
+    /// An immutable EIP-1898 selector shared by every call in one snapshot.
+    canonical_block_hash: Option<B256>,
 }
 
 /// Represents a single contract call for batching in multicall.
@@ -120,7 +126,26 @@ impl BaseContract {
             multicall_address,
             multicall_calls_per_rpc_request,
             rpc_timeout_secs,
+            canonical_block_hash: None,
         }
+    }
+
+    /// Returns an immutable contract view pinned to one canonical block hash.
+    pub(crate) fn at_canonical_block(&self, hash: B256) -> Self {
+        Self {
+            client: Arc::clone(&self.client),
+            multicall_address: self.multicall_address,
+            multicall_calls_per_rpc_request: self.multicall_calls_per_rpc_request,
+            rpc_timeout_secs: self.rpc_timeout_secs,
+            canonical_block_hash: Some(hash),
+        }
+    }
+
+    fn pin_request(&self, mut request: serde_json::Value) -> serde_json::Value {
+        if let Some(hash) = self.canonical_block_hash {
+            request["params"][1] = serde_json::json!({"blockHash": hash, "requireCanonical": true});
+        }
+        request
     }
 
     /// Gets a reference to the RPC client.
@@ -144,7 +169,8 @@ impl BaseContract {
             self.client
                 .construct_eth_call(&contract_address.to_string(), call_data, block);
 
-        self.execute_call_request(rpc_request).await
+        self.execute_call_request(self.pin_request(rpc_request))
+            .await
     }
 
     async fn execute_call_request(
@@ -153,7 +179,10 @@ impl BaseContract {
     ) -> Result<Vec<u8>, BlockchainRpcClientError> {
         let encoded_response = self
             .client
-            .execute_rpc_call_with_timeout::<String>(rpc_request, self.rpc_timeout_secs)
+            .execute_rpc_call_with_timeout::<String>(
+                self.pin_request(rpc_request),
+                self.rpc_timeout_secs,
+            )
             .await
             .map_err(|e| BlockchainRpcClientError::ClientError(format!("RPC call failed: {e}")))?;
 
@@ -208,7 +237,10 @@ impl BaseContract {
 
         let encoded_response = self
             .client
-            .execute_rpc_call_with_timeout::<String>(rpc_request, self.rpc_timeout_secs)
+            .execute_rpc_call_with_timeout::<String>(
+                self.pin_request(rpc_request),
+                self.rpc_timeout_secs,
+            )
             .await
             .map_err(|e| BlockchainRpcClientError::ClientError(format!("Multicall failed: {e}")))?;
 
@@ -251,6 +283,26 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
+
+    #[rstest]
+    fn pinned_contract_view_keeps_all_reads_on_one_hash() {
+        let rpc = Arc::new(
+            BlockchainHttpRpcClient::new("http://127.0.0.1:1".to_string(), None, None).unwrap(),
+        );
+        let base = BaseContract::new(Arc::clone(&rpc));
+        let hash = B256::repeat_byte(9);
+        let pinned = base.at_canonical_block(hash);
+
+        for height in [None, Some(10), Some(11)] {
+            let request = rpc.construct_eth_call(MULTICALL3_ADDRESS, &[0], height);
+            let bound = pinned.pin_request(request.clone());
+            assert_eq!(
+                bound["params"][1],
+                serde_json::json!({"blockHash":hash,"requireCanonical":true})
+            );
+            assert_eq!(base.pin_request(request.clone()), request);
+        }
+    }
 
     #[rstest]
     fn contract_call_chunks_preserves_order_across_chunk_boundary() {

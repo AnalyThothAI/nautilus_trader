@@ -31,8 +31,7 @@ use nautilus_model::defi::{
     Block, DexType, Pool, PoolIdentifier, PoolLiquidityUpdate, PoolSwap, SharedChain, SharedDex,
     SharedPool, Token,
     data::{PoolFeeCollect, PoolFeeProtocolCollect, PoolFeeProtocolUpdate, PoolFlash},
-    pool_analysis::{position::PoolPosition, snapshot::PoolSnapshot},
-    tick_map::tick::PoolTick,
+    pool_analysis::snapshot::PoolSnapshot,
 };
 use sqlx::postgres::PgConnectOptions;
 
@@ -45,6 +44,7 @@ use crate::{
     events::initialize::InitializeEvent,
 };
 
+pub mod canonical;
 pub mod consistency;
 pub mod copy;
 pub mod database;
@@ -156,6 +156,22 @@ impl BlockchainCache {
     pub async fn initialize_database(&mut self, pg_connect_options: PgConnectOptions) {
         let database = BlockchainCacheDatabase::init(pg_connect_options).await;
         self.database = Some(database);
+    }
+
+    /// Removes mutable branch metadata before a new epoch is hydrated.
+    ///
+    /// Snapshot requests and updater buffers belong to their native owners and must also be
+    /// discarded by the caller. This method never upgrades an existing writer's captured epoch.
+    pub fn invalidate_canonical_suffix(&mut self, ancestor: u64) {
+        self.block_timestamps
+            .retain(|number, _| *number <= ancestor);
+        self.block_hashes.retain(|number, _| *number <= ancestor);
+        self.pools.retain(|_, pool| pool.creation_block <= ancestor);
+        for pool in self.pools.values_mut() {
+            let pool = Arc::make_mut(pool);
+            pool.initial_tick = None;
+            pool.initial_sqrt_price_x96 = None;
+        }
     }
 
     /// Returns whether a persistent database is attached to the cache.
@@ -336,7 +352,7 @@ impl BlockchainCache {
     }
 
     /// Loads tokens from the database into the in-memory cache.
-    async fn load_tokens(&mut self) -> anyhow::Result<()> {
+    pub(crate) async fn load_tokens(&mut self) -> anyhow::Result<()> {
         if let Some(database) = &self.database {
             let (tokens, invalid_tokens) = tokio::try_join!(
                 database.load_tokens(Arc::clone(&self.chain)),
@@ -545,11 +561,11 @@ impl BlockchainCache {
     /// Returns an error if adding the block to the database fails, or if the
     /// block hash is not valid 32-byte hex.
     pub async fn add_block(&mut self, block: Block) -> anyhow::Result<()> {
-        // Populate in-memory first so the timestamp resolves even if persistence fails
-        self.cache_block_metadata(&block)?;
+        Self::parse_block_hash(&block.hash)?;
         if let Some(database) = &self.database {
             database.add_block(self.chain.chain_id, &block).await?;
         }
+        self.cache_block_metadata(&block)?;
         Ok(())
     }
 
@@ -938,42 +954,6 @@ impl BlockchainCache {
             database
                 .add_pool_snapshot(self.chain.chain_id, dex, pool_identifier, snapshot)
                 .await?;
-
-            let positions: Vec<(PoolIdentifier, PoolPosition)> = snapshot
-                .positions
-                .iter()
-                .map(|pos| (*pool_identifier, pos.clone()))
-                .collect();
-
-            if !positions.is_empty() {
-                database
-                    .add_pool_positions_batch(
-                        self.chain.chain_id,
-                        snapshot.block_position.number,
-                        snapshot.block_position.transaction_index,
-                        snapshot.block_position.log_index,
-                        &positions,
-                    )
-                    .await?;
-            }
-
-            let ticks: Vec<(PoolIdentifier, &PoolTick)> = snapshot
-                .ticks
-                .iter()
-                .map(|tick| (*pool_identifier, tick))
-                .collect();
-
-            if !ticks.is_empty() {
-                database
-                    .add_pool_ticks_batch(
-                        self.chain.chain_id,
-                        snapshot.block_position.number,
-                        snapshot.block_position.transaction_index,
-                        snapshot.block_position.log_index,
-                        &ticks,
-                    )
-                    .await?;
-            }
         }
 
         Ok(())
@@ -1205,7 +1185,7 @@ impl BlockchainCache {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::{
         str::FromStr,
         sync::Arc,
@@ -1219,7 +1199,11 @@ mod tests {
     use nautilus_model::defi::{
         AmmType, Block, Blockchain, Chain, Dex, PoolProfiler, SharedChain, SharedDex, Token,
         data::{DexPoolData, block::BlockPosition},
-        pool_analysis::snapshot::{PoolAnalytics, PoolSnapshot, PoolState},
+        pool_analysis::{
+            position::PoolPosition,
+            snapshot::{PoolAnalytics, PoolSnapshot, PoolState},
+        },
+        tick_map::tick::PoolTick,
     };
     use rstest::rstest;
     use sqlx::{
@@ -1328,6 +1312,12 @@ mod tests {
         )
         .await?;
 
+        sqlx::query(AssertSqlSafe(format!(
+            "INSERT INTO {}.pool_event_block (chain_id, number, timestamp) VALUES (1, 42, '1700000000000000000')",
+            schema.name,
+        )))
+        .execute(&schema.admin_pool)
+        .await?;
         database.ensure_pool_event_block_hash_schema().await?;
         database
             .add_pool_event_blocks_batch(
@@ -1426,7 +1416,7 @@ mod tests {
         )
         .await?;
         // Asymmetric values (4, 6) catch a token0/token1 column swap.
-        let update = PoolFeeProtocolUpdate::new(
+        let mut update = PoolFeeProtocolUpdate::new(
             Arc::clone(&chain),
             Arc::clone(&dex),
             instrument_id,
@@ -1440,6 +1430,7 @@ mod tests {
             ts,
             ts,
         );
+        update.block_hash = Some(format!("0x{:064x}", update.block));
         database
             .add_pool_fee_protocol_updates_batch(chain.chain_id, std::slice::from_ref(&update))
             .await?;
@@ -1490,7 +1481,7 @@ mod tests {
         database
             .add_pool_event_blocks_batch(chain.chain_id, &[test_block(13, ts)])
             .await?;
-        let update = PoolFeeProtocolUpdate::new(
+        let mut update = PoolFeeProtocolUpdate::new(
             Arc::clone(&chain),
             Arc::clone(&dex),
             instrument_id,
@@ -1504,6 +1495,7 @@ mod tests {
             ts,
             ts,
         );
+        update.block_hash = Some(format!("0x{:064x}", update.block));
         database
             .add_pool_fee_protocol_updates_batch(chain.chain_id, std::slice::from_ref(&update))
             .await?;
@@ -1555,7 +1547,7 @@ mod tests {
         )
         .await?;
         // Asymmetric amounts (111, 222) catch a token0/token1 column swap.
-        let collect = PoolFeeProtocolCollect::new(
+        let mut collect = PoolFeeProtocolCollect::new(
             Arc::clone(&chain),
             Arc::clone(&dex),
             instrument_id,
@@ -1571,6 +1563,7 @@ mod tests {
             ts,
             ts,
         );
+        collect.block_hash = Some(format!("0x{:064x}", collect.block));
         database
             .add_pool_fee_protocol_collect_batch(chain.chain_id, std::slice::from_ref(&collect))
             .await?;
@@ -2000,7 +1993,8 @@ mod tests {
                 Vec::new(),
                 Vec::new(),
                 PoolAnalytics::default(),
-                BlockPosition::new(block, "0xabc".to_string(), 0, 0),
+                BlockPosition::new(block, "0xabc".to_string(), 0, 0)
+                    .with_block_hash(Some(format!("0x{block:064x}"))),
                 ts,
                 ts,
             );
@@ -2119,7 +2113,8 @@ mod tests {
                 100,
             )],
             PoolAnalytics::default(),
-            BlockPosition::new(100, "0xabc".to_string(), 0, 0),
+            BlockPosition::new(100, "0xabc".to_string(), 0, 0)
+                .with_block_hash(Some(format!("0x{:064x}", 100))),
             ts,
             ts,
         );
@@ -2176,7 +2171,7 @@ mod tests {
                 200,
                 200,
                 200,
-                Some("on_chain".to_string()),
+                Some("replay".to_string()),
             )
         {
             anyhow::bail!("unexpected upserted snapshot state: {observed:?}");
@@ -2294,7 +2289,11 @@ mod tests {
 
         // Persist an `invalid` verdict at the watermark the profiler will report.
         let ts = UnixNanos::from(1_700_000_000_000_000_000);
-        let block_position = BlockPosition::new(200, "0xabc".to_string(), 0, 0);
+        core.cache
+            .add_pool_event_blocks_batch(vec![test_block(200, ts)])
+            .await?;
+        let block_position = BlockPosition::new(200, "0xabc".to_string(), 0, 0)
+            .with_block_hash(Some(format!("0x{:064x}", 200)));
         let snapshot = PoolSnapshot::new(
             instrument_id,
             PoolState::default(),
@@ -2358,23 +2357,23 @@ mod tests {
         Ok(())
     }
 
-    struct PoolEventSyncFixture {
-        cache: BlockchainCache,
-        schema: TestSchema,
-        chain: SharedChain,
-        dex: SharedDex,
-        pool: Pool,
+    pub(crate) struct PoolEventSyncFixture {
+        pub(crate) cache: BlockchainCache,
+        pub(crate) schema: TestSchema,
+        pub(crate) chain: SharedChain,
+        pub(crate) dex: SharedDex,
+        pub(crate) pool: Pool,
     }
 
     impl PoolEventSyncFixture {
-        fn database(&self) -> &BlockchainCacheDatabase {
+        pub(crate) fn database(&self) -> &BlockchainCacheDatabase {
             self.cache
                 .database
                 .as_ref()
                 .expect("cache database must be set")
         }
 
-        async fn events(&self, to_block: u64) -> anyhow::Result<Vec<DexPoolData>> {
+        pub(crate) async fn events(&self, to_block: u64) -> anyhow::Result<Vec<DexPoolData>> {
             self.database()
                 .stream_pool_events(
                     Arc::clone(&self.chain),
@@ -2389,7 +2388,7 @@ mod tests {
         }
     }
 
-    async fn pool_event_sync_fixture() -> anyhow::Result<Option<PoolEventSyncFixture>> {
+    pub(crate) async fn pool_event_sync_fixture() -> anyhow::Result<Option<PoolEventSyncFixture>> {
         let Some((database, schema)) = connect_cache_test_database().await? else {
             return Ok(None);
         };
@@ -2429,7 +2428,7 @@ mod tests {
     fn protocol_fee_events(
         fixture: &PoolEventSyncFixture,
     ) -> (PoolFeeProtocolUpdate, PoolFeeProtocolCollect) {
-        let update = PoolFeeProtocolUpdate::new(
+        let mut update = PoolFeeProtocolUpdate::new(
             Arc::clone(&fixture.chain),
             Arc::clone(&fixture.dex),
             fixture.pool.instrument_id,
@@ -2443,7 +2442,8 @@ mod tests {
             UnixNanos::from(1_700_000_012_000_000_000),
             UnixNanos::from(1_700_000_012_000_000_000),
         );
-        let collect = PoolFeeProtocolCollect::new(
+        update.block_hash = Some(format!("0x{:064x}", update.block));
+        let mut collect = PoolFeeProtocolCollect::new(
             Arc::clone(&fixture.chain),
             Arc::clone(&fixture.dex),
             fixture.pool.instrument_id,
@@ -2459,6 +2459,7 @@ mod tests {
             UnixNanos::from(1_700_000_013_000_000_000),
             UnixNanos::from(1_700_000_013_000_000_000),
         );
+        collect.block_hash = Some(format!("0x{:064x}", collect.block));
         (update, collect)
     }
 
@@ -2491,6 +2492,10 @@ mod tests {
         let Some(mut admin_pool) =
             connect_cache_test_pool(connect_options.clone(), &config.username).await
         else {
+            anyhow::ensure!(
+                std::env::var_os("POSTGRES_PORT").is_none(),
+                "Explicitly configured PostgreSQL test service is unavailable"
+            );
             return Ok(None);
         };
         let schema_name = cache_test_schema_name();
@@ -2520,6 +2525,13 @@ mod tests {
         )
         .await?;
 
+        database.ensure_canonical_schema().await?;
+        database
+            .seed_chain(&Chain::new(Blockchain::Ethereum, 1))
+            .await?;
+        database
+            .seed_chain(&Chain::new(Blockchain::Arbitrum, 42161))
+            .await?;
         Ok(Some((
             database,
             TestSchema {
@@ -2573,13 +2585,13 @@ mod tests {
         }
     }
 
-    struct TestSchema {
-        admin_pool: PgPool,
-        name: String,
+    pub(crate) struct TestSchema {
+        pub(crate) admin_pool: PgPool,
+        pub(crate) name: String,
     }
 
     impl TestSchema {
-        async fn cleanup(self) -> anyhow::Result<()> {
+        pub(crate) async fn cleanup(self) -> anyhow::Result<()> {
             drop_cache_test_schema(&self.admin_pool, &self.name).await?;
             self.admin_pool.close().await;
             Ok(())
@@ -2597,6 +2609,8 @@ mod tests {
             format!("CREATE DOMAIN {schema}.U256 AS NUMERIC(78, 0)"),
             format!("CREATE DOMAIN {schema}.U160 AS NUMERIC(49, 0)"),
             format!("CREATE DOMAIN {schema}.U128 AS NUMERIC(39, 0)"),
+            format!("CREATE DOMAIN {schema}.I128 AS NUMERIC(39, 0)"),
+            format!("CREATE DOMAIN {schema}.I256 AS NUMERIC(78, 0)"),
             format!(
                 r#"
                 CREATE TABLE {schema}."chain" (
@@ -2938,6 +2952,19 @@ mod tests {
         .bind("2000000")
         .execute(pool)
         .await?;
+        sqlx::query(AssertSqlSafe(format!(
+            "INSERT INTO {schema}.pool_event_identity (chain_id, transaction_hash, log_index,
+                event_family, pool_identifier, block, transaction_index,
+                observed_block_hash, observed_timestamp)
+             VALUES ($1, $2, 0, 'swap', $3, $4, 0, $5,
+                (SELECT timestamp FROM {schema}.pool_event_block WHERE chain_id = $1 AND number = $4))"
+        )))
+        .bind(chain_id as i32)
+        .bind("0x000000000000000000000000000000000000000000000000000000000000000c")
+        .bind(pool_identifier.as_ref())
+        .bind(block as i64)
+        .bind(format!("0x{block:064x}"))
+        .execute(pool).await?;
         Ok(())
     }
 
@@ -3054,5 +3081,1040 @@ mod tests {
             timestamp,
             Some(Blockchain::Arbitrum),
         )
+    }
+
+    mod canonical_recovery {
+        use nautilus_model::defi::data::{
+            PoolLiquidityUpdateType, block::BLOCK_SCOPED_SNAPSHOT_INDEX, canonical::CanonicalAnchor,
+        };
+
+        use super::*;
+        use crate::cache::canonical::{CanonicalPoolCoverage, CanonicalRecoveryState};
+
+        fn coverage(fixture: &PoolEventSyncFixture) -> CanonicalPoolCoverage {
+            CanonicalPoolCoverage {
+                dex: DexType::UniswapV3,
+                pool: fixture.pool.pool_identifier,
+                families: [
+                    "initialize",
+                    "swap",
+                    "mint",
+                    "burn",
+                    "collect",
+                    "flash",
+                    "fee_protocol_update",
+                    "fee_protocol_collect",
+                ]
+                .into_iter()
+                .map(String::from)
+                .collect(),
+            }
+        }
+
+        fn block(number: u64) -> Block {
+            let mut block = test_block(
+                number,
+                UnixNanos::from(1_700_000_000_000_000_000 + number * 12_000_000_000),
+            );
+            block.parent_hash = format!("0x{:064x}", number.saturating_sub(1));
+            block
+        }
+
+        fn target(anchor: CanonicalAnchor, block: &Block) -> CanonicalAnchor {
+            CanonicalAnchor {
+                number: block.number,
+                block_hash: B256::from_str(&block.hash).unwrap(),
+                ..anchor
+            }
+        }
+
+        fn snapshot(fixture: &PoolEventSyncFixture, block: &Block) -> PoolSnapshot {
+            let owner = address!("0000000000000000000000000000000000000001");
+            let state = PoolState {
+                price_sqrt_ratio_x96: U160::from(1_u128 << 96),
+                liquidity: 100,
+                ..Default::default()
+            };
+            PoolSnapshot::new(
+                fixture.pool.instrument_id,
+                state,
+                vec![PoolPosition::new(owner, -10, 10, 100)],
+                vec![
+                    PoolTick::new(-10, 100, 100, U256::ZERO, U256::ZERO, true, block.number),
+                    PoolTick::new(10, 100, -100, U256::ZERO, U256::ZERO, true, block.number),
+                ],
+                PoolAnalytics::default(),
+                BlockPosition::new(
+                    block.number,
+                    block.hash.clone(),
+                    BLOCK_SCOPED_SNAPSHOT_INDEX,
+                    BLOCK_SCOPED_SNAPSHOT_INDEX,
+                )
+                .with_block_hash(Some(block.hash.clone())),
+                block.timestamp,
+                block.timestamp,
+            )
+        }
+
+        async fn bootstrap(
+            fixture: &PoolEventSyncFixture,
+        ) -> anyhow::Result<(CanonicalAnchor, BlockchainCacheDatabase)> {
+            let ancestor = block(10);
+            let anchor = fixture
+                .database()
+                .begin_canonical_recovery(fixture.chain.chain_id, None, &ancestor)
+                .await?;
+            let writer = fixture.database().canonical_writer(anchor);
+            let snapshot = snapshot(fixture, &ancestor);
+            writer
+                .add_pool_snapshot(
+                    fixture.chain.chain_id,
+                    &DexType::UniswapV3,
+                    &fixture.pool.pool_identifier,
+                    &snapshot,
+                )
+                .await?;
+            writer
+                .set_pool_snapshot_validation_state_for_snapshot(
+                    fixture.chain.chain_id,
+                    &fixture.pool.pool_identifier,
+                    &snapshot,
+                    "on_chain",
+                )
+                .await?;
+            writer
+                .complete_canonical_pool_batch(anchor, anchor, &coverage(fixture), 1)
+                .await?;
+            writer
+                .finish_canonical_recovery(anchor, &[coverage(fixture)])
+                .await?;
+            Ok((anchor, writer))
+        }
+
+        #[tokio::test]
+        #[expect(
+            clippy::panic_in_result_fn,
+            reason = "assertions define the recovery contract"
+        )]
+        async fn completion_requires_hash_bound_snapshot_and_every_zero_event_family()
+        -> anyhow::Result<()> {
+            let Some(fixture) = pool_event_sync_fixture().await? else {
+                return Ok(());
+            };
+            let ancestor = block(10);
+            let anchor = fixture
+                .database()
+                .begin_canonical_recovery(fixture.chain.chain_id, None, &ancestor)
+                .await?;
+            let writer = fixture.database().canonical_writer(anchor);
+            let coverage = coverage(&fixture);
+            assert!(
+                writer
+                    .finish_canonical_recovery(anchor, std::slice::from_ref(&coverage))
+                    .await
+                    .is_err()
+            );
+            writer
+                .add_pool_snapshot(
+                    fixture.chain.chain_id,
+                    &coverage.dex,
+                    &coverage.pool,
+                    &snapshot(&fixture, &ancestor),
+                )
+                .await?;
+            assert!(
+                writer
+                    .complete_canonical_pool_batch(anchor, anchor, &coverage, 1)
+                    .await
+                    .is_err()
+            );
+            writer
+                .set_pool_snapshot_validation_state_for_snapshot(
+                    fixture.chain.chain_id,
+                    &coverage.pool,
+                    &snapshot(&fixture, &ancestor),
+                    "on_chain",
+                )
+                .await?;
+            writer
+                .complete_canonical_pool_batch(anchor, anchor, &coverage, 1)
+                .await?;
+            writer
+                .finish_canonical_recovery(anchor, std::slice::from_ref(&coverage))
+                .await?;
+
+            let next_block = block(11);
+            let next = target(anchor, &next_block);
+            writer
+                .authenticate_canonical_block(next, &next_block)
+                .await?;
+            writer
+                .add_pool_event_blocks_batch(fixture.chain.chain_id, &[next_block])
+                .await?;
+            let mut partial = coverage.clone();
+            partial.families.retain(|family| family != "flash");
+            writer
+                .complete_canonical_pool_batch(anchor, next, &partial, 1)
+                .await?;
+            assert!(
+                writer
+                    .finish_canonical_recovery(next, std::slice::from_ref(&coverage))
+                    .await
+                    .is_err()
+            );
+            assert_eq!(
+                fixture
+                    .database()
+                    .canonical_state(fixture.chain.chain_id)
+                    .await?,
+                Some(CanonicalRecoveryState {
+                    anchor,
+                    recovering: false
+                })
+            );
+            writer
+                .complete_canonical_pool_batch(anchor, next, &coverage, 1)
+                .await?;
+            writer
+                .finish_canonical_recovery(next, std::slice::from_ref(&coverage))
+                .await?;
+            assert!(fixture.events(11).await?.is_empty());
+
+            let mut wrong_parent = block(12);
+            wrong_parent.parent_hash = block(9).hash;
+            let wrong_target = target(anchor, &wrong_parent);
+            writer
+                .add_pool_event_blocks_batch(
+                    fixture.chain.chain_id,
+                    std::slice::from_ref(&wrong_parent),
+                )
+                .await?;
+            assert!(
+                writer
+                    .authenticate_canonical_block(wrong_target, &wrong_parent)
+                    .await
+                    .is_err()
+            );
+            assert!(
+                writer
+                    .complete_canonical_pool_batch(next, wrong_target, &coverage, 1)
+                    .await
+                    .is_err()
+            );
+            assert!(
+                writer
+                    .complete_canonical_pool_batch(anchor, anchor, &coverage, 1)
+                    .await
+                    .is_err()
+            );
+            assert!(
+                writer
+                    .update_pool_event_sync(
+                        fixture.chain.chain_id,
+                        &coverage.dex,
+                        &coverage.pool,
+                        &["flash"],
+                        12,
+                        Some(1)
+                    )
+                    .await
+                    .is_err()
+            );
+            fixture.schema.cleanup().await?;
+            Ok(())
+        }
+
+        #[tokio::test]
+        #[expect(
+            clippy::panic_in_result_fn,
+            reason = "assertions define the recovery contract"
+        )]
+        async fn recovery_waits_for_writers_and_fences_delayed_jobs_after_reconnect()
+        -> anyhow::Result<()> {
+            let Some(fixture) = pool_event_sync_fixture().await? else {
+                return Ok(());
+            };
+            let (anchor, writer) = bootstrap(&fixture).await?;
+            let held = writer.begin_chain_write(fixture.chain.chain_id).await?;
+            let owner = fixture.database().clone();
+            let recovery = tokio::spawn(async move {
+                owner
+                    .begin_canonical_recovery(anchor.chain_id, Some(anchor), &block(10))
+                    .await
+            });
+            let mut recovery = Box::pin(recovery);
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(20), &mut recovery)
+                    .await
+                    .is_err()
+            );
+            held.commit().await?;
+            let new_anchor = recovery.await??;
+            assert_eq!(new_anchor.epoch, anchor.epoch + 1);
+            assert!(
+                writer
+                    .begin_canonical_recovery(anchor.chain_id, Some(new_anchor), &block(10))
+                    .await
+                    .is_err()
+            );
+            assert!(
+                writer
+                    .add_pool_event_blocks_batch(anchor.chain_id, &[block(11)])
+                    .await
+                    .is_err()
+            );
+            assert!(
+                fixture
+                    .database()
+                    .add_pool_event_blocks_batch(anchor.chain_id, &[block(11)])
+                    .await
+                    .is_err()
+            );
+
+            let restarted = BlockchainCacheDatabase::connect(
+                fixture.database().pool.connect_options().as_ref().clone(),
+            )
+            .await?;
+            assert_eq!(
+                restarted.canonical_state(anchor.chain_id).await?,
+                Some(CanonicalRecoveryState {
+                    anchor: new_anchor,
+                    recovering: true
+                })
+            );
+            let new_writer = restarted.canonical_writer(new_anchor);
+            new_writer
+                .add_pool_event_blocks_batch(anchor.chain_id, &[block(11)])
+                .await?;
+            assert!(
+                new_writer
+                    .finish_canonical_recovery(
+                        target(new_anchor, &block(11)),
+                        &[coverage(&fixture)]
+                    )
+                    .await
+                    .is_err()
+            );
+            restarted.pool.close().await;
+            fixture.schema.cleanup().await?;
+            Ok(())
+        }
+
+        #[tokio::test]
+        #[expect(
+            clippy::panic_in_result_fn,
+            reason = "assertions define the recovery contract"
+        )]
+        async fn duplicate_payload_and_mutable_height_cannot_relabel_observed_events()
+        -> anyhow::Result<()> {
+            let Some(fixture) = pool_event_sync_fixture().await? else {
+                return Ok(());
+            };
+            let source = block(11);
+            let mut swap = expected_swap(&fixture);
+            swap.ts_event = source.timestamp;
+            swap.ts_init = source.timestamp;
+            swap.block_hash = Some(source.hash.clone());
+            fixture
+                .database()
+                .add_pool_event_blocks_batch(fixture.chain.chain_id, std::slice::from_ref(&source))
+                .await?;
+            fixture
+                .database()
+                .add_pool_swaps_copy(fixture.chain.chain_id, std::slice::from_ref(&swap))
+                .await?;
+            fixture
+                .database()
+                .add_pool_swaps_batch(fixture.chain.chain_id, std::slice::from_ref(&swap))
+                .await?;
+            let mut conflict = swap.clone();
+            conflict.amount0 -= I256::ONE;
+            assert!(
+                fixture
+                    .database()
+                    .add_pool_swaps_batch(fixture.chain.chain_id, &[conflict])
+                    .await
+                    .is_err()
+            );
+            let mut other_branch = source.clone();
+            other_branch.hash = format!("0x{:064x}", 0xbb_u64);
+            assert!(
+                fixture
+                    .database()
+                    .add_pool_event_blocks_batch(
+                        fixture.chain.chain_id,
+                        std::slice::from_ref(&other_branch)
+                    )
+                    .await
+                    .is_err()
+            );
+            assert!(
+                fixture
+                    .database()
+                    .add_block(fixture.chain.chain_id, &other_branch)
+                    .await
+                    .is_err()
+            );
+
+            // Reproduce the legacy corrupted-height state directly, bypassing the safe writer
+            sqlx::query(AssertSqlSafe(format!(
+                "UPDATE {}.pool_event_block SET hash = $1 WHERE chain_id = $2 AND number = 11",
+                fixture.schema.name
+            )))
+            .bind(other_branch.hash)
+            .bind(fixture.chain.chain_id as i32)
+            .execute(&fixture.schema.admin_pool)
+            .await?;
+            assert_eq!(fixture.events(11).await?, vec![DexPoolData::Swap(swap)]);
+            fixture.schema.cleanup().await?;
+            Ok(())
+        }
+
+        #[tokio::test]
+        #[expect(
+            clippy::panic_in_result_fn,
+            reason = "assertions define the recovery contract"
+        )]
+        async fn snapshot_child_failure_rolls_back_header_positions_and_validation()
+        -> anyhow::Result<()> {
+            let Some(fixture) = pool_event_sync_fixture().await? else {
+                return Ok(());
+            };
+            let (anchor, writer) = bootstrap(&fixture).await?;
+            let original = snapshot(&fixture, &block(10));
+            writer
+                .add_pool_snapshot(
+                    anchor.chain_id,
+                    &DexType::UniswapV3,
+                    &fixture.pool.pool_identifier,
+                    &original,
+                )
+                .await?;
+            assert_eq!(
+                writer
+                    .get_pool_snapshot_validation_state(
+                        anchor.chain_id,
+                        &fixture.pool.pool_identifier,
+                        10,
+                        BLOCK_SCOPED_SNAPSHOT_INDEX,
+                        BLOCK_SCOPED_SNAPSHOT_INDEX
+                    )
+                    .await?
+                    .as_deref(),
+                Some("on_chain")
+            );
+            sqlx::query(AssertSqlSafe(format!(
+                "ALTER TABLE {}.pool_tick ADD CONSTRAINT reject_test_tick CHECK (tick_value <> 777)",
+                fixture.schema.name))).execute(&fixture.schema.admin_pool).await?;
+            let mut changed = original.clone();
+            changed.state.liquidity = 200;
+            changed.positions[0].liquidity = 200;
+            changed.ticks[1].value = 777;
+            assert!(
+                writer
+                    .add_pool_snapshot(
+                        anchor.chain_id,
+                        &DexType::UniswapV3,
+                        &fixture.pool.pool_identifier,
+                        &changed
+                    )
+                    .await
+                    .is_err()
+            );
+            assert_eq!(
+                writer
+                    .load_latest_valid_pool_snapshot(anchor.chain_id, &fixture.pool.pool_identifier)
+                    .await?,
+                Some(original)
+            );
+            assert_eq!(
+                writer
+                    .get_pool_snapshot_validation_state(
+                        anchor.chain_id,
+                        &fixture.pool.pool_identifier,
+                        10,
+                        BLOCK_SCOPED_SNAPSHOT_INDEX,
+                        BLOCK_SCOPED_SNAPSHOT_INDEX
+                    )
+                    .await?
+                    .as_deref(),
+                Some("on_chain")
+            );
+            fixture.schema.cleanup().await?;
+            Ok(())
+        }
+
+        #[tokio::test]
+        #[expect(
+            clippy::panic_in_result_fn,
+            reason = "assertions define the recovery contract"
+        )]
+        async fn delayed_snapshot_validation_cannot_certify_replaced_content() -> anyhow::Result<()>
+        {
+            let Some(fixture) = pool_event_sync_fixture().await? else {
+                return Ok(());
+            };
+            let (anchor, writer) = bootstrap(&fixture).await?;
+            let original = snapshot(&fixture, &block(10));
+            let mut changed = original.clone();
+            changed.state.liquidity = 200;
+            writer
+                .add_pool_snapshot(
+                    anchor.chain_id,
+                    &DexType::UniswapV3,
+                    &fixture.pool.pool_identifier,
+                    &changed,
+                )
+                .await?;
+            assert!(
+                writer
+                    .set_pool_snapshot_validation_state_for_snapshot(
+                        anchor.chain_id,
+                        &fixture.pool.pool_identifier,
+                        &original,
+                        "on_chain"
+                    )
+                    .await
+                    .is_err()
+            );
+            assert!(
+                writer
+                    .set_pool_snapshot_validation_state(
+                        anchor.chain_id,
+                        &fixture.pool.pool_identifier,
+                        10,
+                        BLOCK_SCOPED_SNAPSHOT_INDEX,
+                        BLOCK_SCOPED_SNAPSHOT_INDEX,
+                        "on_chain"
+                    )
+                    .await
+                    .is_err()
+            );
+            assert_eq!(
+                writer
+                    .get_pool_snapshot_validation_state(
+                        anchor.chain_id,
+                        &fixture.pool.pool_identifier,
+                        10,
+                        BLOCK_SCOPED_SNAPSHOT_INDEX,
+                        BLOCK_SCOPED_SNAPSHOT_INDEX
+                    )
+                    .await?
+                    .as_deref(),
+                Some("replay")
+            );
+            changed.ticks.reverse();
+            writer
+                .set_pool_snapshot_validation_state_for_snapshot(
+                    anchor.chain_id,
+                    &fixture.pool.pool_identifier,
+                    &changed,
+                    "on_chain",
+                )
+                .await?;
+            fixture.schema.cleanup().await?;
+            Ok(())
+        }
+
+        #[tokio::test]
+        #[expect(
+            clippy::panic_in_result_fn,
+            reason = "assertions define the recovery contract"
+        )]
+        async fn reorg_removes_every_event_family_and_snapshot_child_before_reinclusion()
+        -> anyhow::Result<()> {
+            let Some(fixture) = pool_event_sync_fixture().await? else {
+                return Ok(());
+            };
+            let (anchor, writer) = bootstrap(&fixture).await?;
+            let source = block(11);
+            let next = target(anchor, &source);
+            writer.authenticate_canonical_block(next, &source).await?;
+            writer
+                .add_pool_event_blocks_batch(anchor.chain_id, std::slice::from_ref(&source))
+                .await?;
+            let mut swap = expected_swap(&fixture);
+            swap.block_hash = Some(source.hash.clone());
+            swap.ts_event = source.timestamp;
+            swap.ts_init = source.timestamp;
+            let owner = address!("0000000000000000000000000000000000000001");
+            let mut liquidity = PoolLiquidityUpdate::new(
+                Arc::clone(&fixture.chain),
+                Arc::clone(&fixture.dex),
+                fixture.pool.instrument_id,
+                fixture.pool.pool_identifier,
+                PoolLiquidityUpdateType::Mint,
+                11,
+                format!("0x{:064x}", 101),
+                0,
+                1,
+                Some(owner),
+                owner,
+                100,
+                U256::from(50),
+                U256::from(60),
+                -10,
+                10,
+                source.timestamp,
+                source.timestamp,
+            );
+            liquidity.block_hash = Some(source.hash.clone());
+            let mut collect = PoolFeeCollect::new(
+                Arc::clone(&fixture.chain),
+                Arc::clone(&fixture.dex),
+                fixture.pool.instrument_id,
+                fixture.pool.pool_identifier,
+                11,
+                format!("0x{:064x}", 102),
+                0,
+                2,
+                owner,
+                2,
+                3,
+                -10,
+                10,
+                source.timestamp,
+                source.timestamp,
+            );
+            collect.block_hash = Some(source.hash.clone());
+            let mut flash = PoolFlash::new(
+                Arc::clone(&fixture.chain),
+                Arc::clone(&fixture.dex),
+                fixture.pool.instrument_id,
+                fixture.pool.pool_identifier,
+                11,
+                format!("0x{:064x}", 103),
+                0,
+                3,
+                source.timestamp,
+                source.timestamp,
+                owner,
+                owner,
+                U256::from(10),
+                U256::from(20),
+                U256::from(11),
+                U256::from(21),
+            );
+            flash.block_hash = Some(source.hash.clone());
+            let (mut protocol_update, mut protocol_collect) = protocol_fee_events(&fixture);
+            protocol_update.block = 11;
+            protocol_update.block_hash = Some(source.hash.clone());
+            protocol_update.ts_event = source.timestamp;
+            protocol_collect.block = 11;
+            protocol_collect.block_hash = Some(source.hash.clone());
+            protocol_collect.ts_event = source.timestamp;
+            writer
+                .add_pool_swaps_batch(anchor.chain_id, std::slice::from_ref(&swap))
+                .await?;
+            writer
+                .add_pool_liquidity_updates_copy(anchor.chain_id, &[liquidity])
+                .await?;
+            writer
+                .copy_pool_fee_collects_batch(anchor.chain_id, &[collect])
+                .await?;
+            writer
+                .add_pool_flash_batch(anchor.chain_id, &[flash])
+                .await?;
+            writer
+                .add_pool_fee_protocol_updates_batch(anchor.chain_id, &[protocol_update])
+                .await?;
+            writer
+                .add_pool_fee_protocol_collect_batch(anchor.chain_id, &[protocol_collect])
+                .await?;
+            writer
+                .add_pool_snapshot(
+                    anchor.chain_id,
+                    &DexType::UniswapV3,
+                    &fixture.pool.pool_identifier,
+                    &snapshot(&fixture, &source),
+                )
+                .await?;
+            writer
+                .complete_canonical_pool_batch(anchor, next, &coverage(&fixture), 1)
+                .await?;
+            writer
+                .finish_canonical_recovery(next, &[coverage(&fixture)])
+                .await?;
+            assert_eq!(fixture.events(11).await?.len(), 6);
+
+            let recovered = fixture
+                .database()
+                .begin_canonical_recovery(anchor.chain_id, Some(next), &block(10))
+                .await?;
+            assert!(fixture.events(11).await?.is_empty());
+
+            for (table, field) in [
+                ("pool_snapshot", "block"),
+                ("pool_position", "snapshot_block"),
+                ("pool_tick", "snapshot_block"),
+                ("pool_event_identity", "block"),
+                ("pool_event_block", "number"),
+                ("canonical_block", "number"),
+                ("block", "number"),
+            ] {
+                let remaining: i64 = sqlx::query_scalar(AssertSqlSafe(format!(
+                    "SELECT COUNT(*) FROM {}.{table} WHERE chain_id = $1 AND {field} > 10",
+                    fixture.schema.name
+                )))
+                .bind(anchor.chain_id as i32)
+                .fetch_one(&fixture.schema.admin_pool)
+                .await?;
+                assert_eq!(remaining, 0, "retained suffix in {table}");
+            }
+            let sync = fixture
+                .database()
+                .get_pool_event_sync_state(
+                    anchor.chain_id,
+                    &DexType::UniswapV3,
+                    &fixture.pool.pool_identifier,
+                )
+                .await?;
+            assert!(sync.family_blocks.iter().all(|(_, block)| *block == 10));
+            let new_writer = fixture.database().canonical_writer(recovered);
+            let mut new_block = source;
+            new_block.hash = format!("0x{:064x}", 0xbb_u64);
+            let new_target = target(recovered, &new_block);
+            new_writer
+                .authenticate_canonical_block(new_target, &new_block)
+                .await?;
+            new_writer
+                .add_pool_event_blocks_batch(anchor.chain_id, std::slice::from_ref(&new_block))
+                .await?;
+            swap.block_hash = Some(new_block.hash);
+            swap.transaction_index = 7;
+            new_writer
+                .add_pool_swaps_batch(anchor.chain_id, std::slice::from_ref(&swap))
+                .await?;
+            new_writer
+                .complete_canonical_pool_batch(recovered, new_target, &coverage(&fixture), 1)
+                .await?;
+            new_writer
+                .finish_canonical_recovery(new_target, &[coverage(&fixture)])
+                .await?;
+            assert_eq!(fixture.events(11).await?, vec![DexPoolData::Swap(swap)]);
+            fixture.schema.cleanup().await?;
+            Ok(())
+        }
+
+        #[tokio::test]
+        #[expect(
+            clippy::panic_in_result_fn,
+            reason = "assertions define the recovery contract"
+        )]
+        async fn legacy_validation_cannot_certify_a_canonical_bootstrap() -> anyhow::Result<()> {
+            let Some(fixture) = pool_event_sync_fixture().await? else {
+                return Ok(());
+            };
+            let ancestor = block(10);
+            let stored = snapshot(&fixture, &ancestor);
+            fixture
+                .database()
+                .add_pool_event_blocks_batch(
+                    fixture.chain.chain_id,
+                    std::slice::from_ref(&ancestor),
+                )
+                .await?;
+            fixture
+                .database()
+                .add_pool_snapshot(
+                    fixture.chain.chain_id,
+                    &DexType::UniswapV3,
+                    &fixture.pool.pool_identifier,
+                    &stored,
+                )
+                .await?;
+            fixture
+                .database()
+                .set_pool_snapshot_validation_state(
+                    fixture.chain.chain_id,
+                    &fixture.pool.pool_identifier,
+                    10,
+                    BLOCK_SCOPED_SNAPSHOT_INDEX,
+                    BLOCK_SCOPED_SNAPSHOT_INDEX,
+                    "on_chain",
+                )
+                .await?;
+            let anchor = fixture
+                .database()
+                .begin_canonical_recovery(fixture.chain.chain_id, None, &ancestor)
+                .await?;
+            let writer = fixture.database().canonical_writer(anchor);
+            assert_eq!(
+                writer
+                    .get_pool_snapshot_validation_state_for_snapshot(
+                        anchor.chain_id,
+                        &fixture.pool.pool_identifier,
+                        &stored
+                    )
+                    .await?,
+                None
+            );
+            assert!(
+                writer
+                    .complete_canonical_pool_batch(anchor, anchor, &coverage(&fixture), 1)
+                    .await
+                    .is_err()
+            );
+            writer
+                .set_pool_snapshot_validation_state_for_snapshot(
+                    anchor.chain_id,
+                    &fixture.pool.pool_identifier,
+                    &stored,
+                    "on_chain",
+                )
+                .await?;
+            writer
+                .complete_canonical_pool_batch(anchor, anchor, &coverage(&fixture), 1)
+                .await?;
+            writer
+                .finish_canonical_recovery(anchor, &[coverage(&fixture)])
+                .await?;
+            fixture.schema.cleanup().await?;
+            Ok(())
+        }
+
+        #[tokio::test]
+        #[expect(
+            clippy::panic_in_result_fn,
+            reason = "assertions define the recovery contract"
+        )]
+        async fn interruption_between_pools_cannot_advance_or_skip_recovery() -> anyhow::Result<()>
+        {
+            let Some(mut fixture) = pool_event_sync_fixture().await? else {
+                return Ok(());
+            };
+            let mut second = fixture.pool.clone();
+            second.address = address!("0000000000000000000000000000000000000002");
+            second.pool_identifier = PoolIdentifier::from_address(second.address);
+            second.instrument_id = Pool::create_instrument_id(
+                fixture.chain.name,
+                &fixture.dex,
+                second.pool_identifier.as_str(),
+            );
+            fixture.cache.add_pool(second.clone()).await?;
+            let ancestor = block(10);
+            let anchor = fixture
+                .database()
+                .begin_canonical_recovery(fixture.chain.chain_id, None, &ancestor)
+                .await?;
+            let writer = fixture.database().canonical_writer(anchor);
+            let required = [
+                coverage(&fixture),
+                CanonicalPoolCoverage {
+                    pool: second.pool_identifier,
+                    ..coverage(&fixture)
+                },
+            ];
+
+            for (index, covered) in required.iter().enumerate() {
+                let mut stored = snapshot(&fixture, &ancestor);
+                if index == 1 {
+                    stored.instrument_id = second.instrument_id;
+                }
+                writer
+                    .add_pool_snapshot(anchor.chain_id, &covered.dex, &covered.pool, &stored)
+                    .await?;
+                writer
+                    .set_pool_snapshot_validation_state_for_snapshot(
+                        anchor.chain_id,
+                        &covered.pool,
+                        &stored,
+                        "on_chain",
+                    )
+                    .await?;
+                writer
+                    .complete_canonical_pool_batch(anchor, anchor, covered, 1)
+                    .await?;
+            }
+            writer.finish_canonical_recovery(anchor, &required).await?;
+            let block = block(11);
+            let next = target(anchor, &block);
+            writer.authenticate_canonical_block(next, &block).await?;
+            writer
+                .add_pool_event_blocks_batch(anchor.chain_id, &[block])
+                .await?;
+            writer
+                .complete_canonical_pool_batch(anchor, next, &required[0], 1)
+                .await?;
+            assert!(
+                writer
+                    .finish_canonical_recovery(next, &required)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(
+                writer.canonical_state(anchor.chain_id).await?,
+                Some(CanonicalRecoveryState {
+                    anchor,
+                    recovering: false
+                })
+            );
+            let restarted = BlockchainCacheDatabase::connect(
+                fixture.database().pool.connect_options().as_ref().clone(),
+            )
+            .await?;
+            let recovered = restarted
+                .begin_canonical_recovery(anchor.chain_id, Some(anchor), &ancestor)
+                .await?;
+            assert_eq!(
+                restarted.canonical_state(anchor.chain_id).await?,
+                Some(CanonicalRecoveryState {
+                    anchor: recovered,
+                    recovering: true
+                })
+            );
+
+            for covered in &required {
+                let state = restarted
+                    .get_pool_event_sync_state(anchor.chain_id, &covered.dex, &covered.pool)
+                    .await?;
+                assert_eq!(state.family_blocks.len(), covered.families.len());
+                assert!(
+                    state
+                        .family_blocks
+                        .iter()
+                        .all(|(_, number)| *number == ancestor.number)
+                );
+            }
+            assert_eq!(
+                restarted.canonical_block_hash(anchor.chain_id, 11).await?,
+                None
+            );
+            assert!(
+                writer
+                    .complete_canonical_pool_batch(anchor, next, &required[1], 1)
+                    .await
+                    .is_err()
+            );
+            let fresh = restarted.canonical_writer(recovered);
+            for covered in &required {
+                fresh
+                    .complete_canonical_pool_batch(recovered, recovered, covered, 1)
+                    .await?;
+            }
+            fresh
+                .finish_canonical_recovery(recovered, &required)
+                .await?;
+            restarted.pool.close().await;
+            fixture.schema.cleanup().await?;
+            Ok(())
+        }
+
+        #[tokio::test]
+        #[expect(
+            clippy::panic_in_result_fn,
+            reason = "assertions define the recovery contract"
+        )]
+        async fn historical_headers_cannot_authorize_ancestors_or_canonical_coverage()
+        -> anyhow::Result<()> {
+            let Some(fixture) = pool_event_sync_fixture().await? else {
+                return Ok(());
+            };
+            let (anchor, writer) = bootstrap(&fixture).await?;
+            let historical = block(9);
+            let next = block(11);
+            writer
+                .add_pool_event_blocks_batch(anchor.chain_id, &[historical.clone(), next.clone()])
+                .await?;
+            assert_eq!(writer.canonical_block_hash(anchor.chain_id, 9).await?, None);
+            assert_eq!(
+                writer.canonical_block_hash(anchor.chain_id, 11).await?,
+                None
+            );
+            assert!(
+                fixture
+                    .database()
+                    .begin_canonical_recovery(anchor.chain_id, Some(anchor), &historical)
+                    .await
+                    .is_err()
+            );
+            let target = target(anchor, &next);
+            assert!(
+                writer
+                    .complete_canonical_pool_batch(anchor, target, &coverage(&fixture), 1)
+                    .await
+                    .is_err()
+            );
+            writer.authenticate_canonical_block(target, &next).await?;
+            writer
+                .complete_canonical_pool_batch(anchor, target, &coverage(&fixture), 1)
+                .await?;
+            writer
+                .finish_canonical_recovery(target, &[coverage(&fixture)])
+                .await?;
+            assert_eq!(
+                writer.canonical_block_hash(anchor.chain_id, 11).await?,
+                Some(target.block_hash)
+            );
+            fixture.schema.cleanup().await?;
+            Ok(())
+        }
+
+        #[tokio::test]
+        #[expect(
+            clippy::panic_in_result_fn,
+            reason = "assertions define the recovery contract"
+        )]
+        async fn legacy_event_is_never_authenticated_by_its_current_height_hash()
+        -> anyhow::Result<()> {
+            let Some(fixture) = pool_event_sync_fixture().await? else {
+                return Ok(());
+            };
+            let source = block(11);
+            fixture
+                .database()
+                .add_pool_event_blocks_batch(fixture.chain.chain_id, &[block(10), source])
+                .await?;
+            insert_pool_swap_event(
+                &fixture.schema.admin_pool,
+                &fixture.schema.name,
+                fixture.chain.chain_id,
+                &fixture.pool.pool_identifier,
+                11,
+            )
+            .await?;
+            sqlx::query(AssertSqlSafe(format!(
+                "DELETE FROM {}.pool_event_identity",
+                fixture.schema.name
+            )))
+            .execute(&fixture.schema.admin_pool)
+            .await?;
+            assert!(fixture.events(11).await.is_err());
+            assert_eq!(
+                fixture
+                    .database()
+                    .canonical_block_hash(fixture.chain.chain_id, 10)
+                    .await?,
+                None
+            );
+            let anchor = fixture
+                .database()
+                .begin_canonical_recovery(fixture.chain.chain_id, None, &block(10))
+                .await?;
+            assert_eq!(
+                fixture
+                    .database()
+                    .canonical_block_hash(fixture.chain.chain_id, 10)
+                    .await?,
+                Some(anchor.block_hash)
+            );
+            assert_eq!(
+                fixture
+                    .database()
+                    .canonical_block_hash(fixture.chain.chain_id, 11)
+                    .await?,
+                None
+            );
+            assert!(fixture.events(11).await?.is_empty());
+            let writer = fixture.database().canonical_writer(anchor);
+            assert!(
+                writer
+                    .finish_canonical_recovery(anchor, &[coverage(&fixture)])
+                    .await
+                    .is_err()
+            );
+            fixture.schema.cleanup().await?;
+            Ok(())
+        }
     }
 }

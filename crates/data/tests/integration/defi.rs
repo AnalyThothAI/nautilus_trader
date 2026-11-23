@@ -27,7 +27,7 @@ use nautilus_common::{
         data::DataCommand,
         defi::{
             DefiRequestCommand, DefiSubscribeCommand, DefiUnsubscribeCommand, PoolSnapshotResponse,
-            SubscribePoolSwaps, UnsubscribePoolSwaps,
+            RequestPoolSnapshot, SubscribePoolSwaps, UnsubscribePoolSwaps,
         },
     },
     msgbus::{self, MessageBus, TypedIntoHandler, switchboard::MessagingSwitchboard},
@@ -45,6 +45,8 @@ use nautilus_model::{
 use rstest::rstest;
 
 use crate::common::{defi::make_initialized_pool_and_swap, mocks::MockDataClient};
+
+mod canonical;
 
 #[rstest]
 #[case::first_subscriber_retires_first(0)]
@@ -111,7 +113,10 @@ fn test_failed_final_client_unsubscribe_releases_updater() {
             None,
             false,
             false,
-            Box::new(FailingUnsubscribeClient { client_id }),
+            Box::new(FailingUnsubscribeClient {
+                client_id,
+                recorder: Rc::clone(&fixture.recorders[0]),
+            }),
         ),
         None,
     );
@@ -293,6 +298,7 @@ impl PoolShape {
 /// Accepts DeFi subscriptions and rejects every DeFi unsubscribe.
 struct FailingUnsubscribeClient {
     client_id: ClientId,
+    recorder: Rc<RefCell<Vec<DataCommand>>>,
 }
 
 impl DataClient for FailingUnsubscribeClient {
@@ -327,6 +333,13 @@ impl DataClient for FailingUnsubscribeClient {
 
     fn unsubscribe_pool_swaps(&mut self, _cmd: &UnsubscribePoolSwaps) -> anyhow::Result<()> {
         anyhow::bail!("injected unsubscribe failure")
+    }
+
+    fn request_pool_snapshot(&self, request: RequestPoolSnapshot) -> anyhow::Result<()> {
+        self.recorder.borrow_mut().push(DataCommand::DefiRequest(
+            DefiRequestCommand::PoolSnapshot(request),
+        ));
+        Ok(())
     }
 }
 
@@ -551,9 +564,8 @@ impl DefiFixture {
         self.engine.borrow_mut().process(&response);
     }
 
-    /// Answers the first snapshot request after the pool arrives, then subscribes a second
-    /// actor, which builds its profiler from the cached pool. Returns whether the answer
-    /// installed a profiler.
+    /// Answers a retired request, then supplies a complete snapshot to the new subscription.
+    /// Returns whether the retired response incorrectly installed a profiler.
     fn answer_first_request_then_resubscribe(&mut self) -> bool {
         let snapshot = self.snapshot();
         self.engine
@@ -563,15 +575,25 @@ impl DefiFixture {
         self.respond(self.snapshot_requests(0)[0], snapshot);
         let installed_by_answer = self.has_profiler();
         self.subscribe(1, PoolShape::Swaps, self.client_ids[0]);
+        self.answer_latest_request();
         installed_by_answer
     }
 
     /// Publishes a swap after every previously applied event and reports whether the
     /// engine's pool updater applied it to the cached profiler.
     fn updater_applies_swap(&mut self) -> bool {
+        // Subscription ownership tests supply the requested complete snapshot before probing the
+        // updater. Metadata alone no longer initializes an empty profiler.
+        self.answer_latest_request();
         let block = self.swap.block + 1;
         self.publish_swap_at(block);
         self.profiler_last_block() == Some(block)
+    }
+
+    fn answer_latest_request(&self) {
+        if let Some(request_id) = self.snapshot_requests(0).last() {
+            self.respond(*request_id, self.snapshot());
+        }
     }
 
     fn publish_swap_at(&mut self, block: u64) {

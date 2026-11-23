@@ -13,25 +13,47 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-//! Message handler that maintains the `Pool` state stored in the global [`Cache`].
-//!
-//! The handler is functionally equivalent to `BookUpdater` but for DeFi liquidity
-//! pools. Whenever a [`PoolSwap`] or [`PoolLiquidityUpdate`] is published on the
-//! message bus the handler looks up the corresponding `Pool` instance in the
-//! cache and applies the change in-place (for now we only update the `ts_init`
-//! timestamp so that consumers can tell the pool has been touched).
+//! Applies pool events to the native cache and reports whether state changed.
+//! Ordinary data subscriptions use typed message handlers. Canonical batches call the same
+//! updater directly and only publish after every pool and completeness watermark is consistent.
 
 use std::{cell::RefCell, rc::Rc};
 
 use nautilus_common::{cache::Cache, msgbus::Handler};
 use nautilus_model::{
     defi::{
-        PoolFeeCollect, PoolFlash, PoolLiquidityUpdate, PoolLiquidityUpdateType, PoolProfiler,
-        PoolSwap,
+        PoolFeeCollect, PoolFlash, PoolLiquidityUpdate, PoolSwap,
+        data::{DexPoolData, canonical::CanonicalAnchor},
     },
     identifiers::InstrumentId,
 };
 use ustr::Ustr;
+
+/// The outcome of applying one complete canonical pool batch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CanonicalBatchReceipt {
+    /// The state identity covered by this receipt.
+    pub anchor: CanonicalAnchor,
+    /// Newly applied native events.
+    pub applied: usize,
+    /// Events already covered by an identical previously completed batch.
+    pub duplicates: usize,
+    /// The complete managed pool universe.
+    pub pools: Vec<InstrumentId>,
+}
+
+/// The state transition produced by an individual native pool event.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PoolApplyOutcome {
+    /// The profiler accepted a new event.
+    Applied,
+    /// The last applied position already covers this identical event identity.
+    Duplicate,
+    /// No profiler is available for this event.
+    MissingProfiler,
+    /// The event could not safely update the profiler.
+    Rejected(String),
+}
 
 /// Handles [`PoolSwap`]s and [`PoolLiquidityUpdate`]s for a single AMM pool.
 #[derive(Debug)]
@@ -58,63 +80,102 @@ impl PoolUpdater {
         self.id
     }
 
-    /// Handles a pool swap event.
+    /// Applies one pool event and distinguishes failure from native duplicate suppression.
+    #[must_use]
+    pub fn apply(&self, event: &DexPoolData) -> PoolApplyOutcome {
+        if event.instrument_id() != self.instrument_id {
+            return PoolApplyOutcome::Rejected("Pool event instrument mismatch".to_string());
+        }
+
+        let mut cache = self.cache.borrow_mut();
+        let Some(profiler) = cache.pool_profiler_mut(&self.instrument_id) else {
+            return PoolApplyOutcome::MissingProfiler;
+        };
+
+        let (pool_identifier, dex) = match event {
+            DexPoolData::Swap(event) => (event.pool_identifier, &event.dex),
+            DexPoolData::LiquidityUpdate(event) => (event.pool_identifier, &event.dex),
+            DexPoolData::FeeCollect(event) => (event.pool_identifier, &event.dex),
+            DexPoolData::FeeProtocolUpdate(event) => (event.pool_identifier, &event.dex),
+            DexPoolData::FeeProtocolCollect(event) => (event.pool_identifier, &event.dex),
+            DexPoolData::Flash(event) => (event.pool_identifier, &event.dex),
+        };
+
+        if pool_identifier != profiler.pool.pool_identifier
+            || event.chain_id() != profiler.pool.chain.chain_id
+            || dex != &profiler.pool.dex
+        {
+            return PoolApplyOutcome::Rejected("Pool event metadata mismatch".to_string());
+        }
+
+        if let Some(previous) = &profiler.last_processed_event {
+            let before = (
+                previous.number,
+                previous.transaction_index,
+                previous.log_index,
+            );
+            let position = (
+                event.block_number(),
+                event.transaction_index(),
+                event.log_index(),
+            );
+
+            if position < before {
+                return PoolApplyOutcome::Rejected("Out-of-order pool event".to_string());
+            }
+
+            if position == before {
+                if previous.transaction_hash != event.transaction_hash()
+                    || previous.block_hash.as_deref() != event.block_hash()
+                {
+                    return PoolApplyOutcome::Rejected(
+                        "Conflicting pool event identity".to_string(),
+                    );
+                }
+
+                return PoolApplyOutcome::Duplicate;
+            }
+        }
+
+        match profiler.process(event) {
+            Ok(()) => PoolApplyOutcome::Applied,
+            Err(e) => PoolApplyOutcome::Rejected(e.to_string()),
+        }
+    }
+
+    /// Handles a pool swap event on the legacy typed subscription path.
     pub fn handle_pool_swap(&self, swap: &PoolSwap) {
-        if let Some(pool_profiler) = self
-            .cache
-            .borrow_mut()
-            .pool_profiler_mut(&self.instrument_id)
-            && let Err(e) = pool_profiler.process_swap(swap)
-        {
-            log::error!("Failed to process pool swap: {e}");
-        }
+        self.report(self.apply(&DexPoolData::Swap(swap.clone())));
     }
 
-    /// Handles a pool liquidity update event.
+    /// Handles a pool liquidity update on the legacy typed subscription path.
     pub fn handle_pool_liquidity_update(&self, update: &PoolLiquidityUpdate) {
-        if let Some(pool_profiler) = self
-            .cache
-            .borrow_mut()
-            .pool_profiler_mut(&self.instrument_id)
-            && let Err(e) = process_pool_liquidity_update(pool_profiler, update)
-        {
-            log::error!("Failed to process pool liquidity update: {e}");
-        }
+        self.report(self.apply(&DexPoolData::LiquidityUpdate(update.clone())));
     }
 
-    /// Handles a pool fee collect event.
+    /// Handles a fee collection on the legacy typed subscription path.
     pub fn handle_pool_fee_collect(&self, event: &PoolFeeCollect) {
-        if let Some(pool_profiler) = self
-            .cache
-            .borrow_mut()
-            .pool_profiler_mut(&self.instrument_id)
-            && let Err(e) = pool_profiler.process_collect(event)
-        {
-            log::error!("Failed to process pool fee collect: {e}");
-        }
+        self.report(self.apply(&DexPoolData::FeeCollect(event.clone())));
     }
 
-    /// Handles a pool flash event.
+    /// Handles a flash event on the legacy typed subscription path.
     pub fn handle_pool_flash(&self, event: &PoolFlash) {
-        if let Some(pool_profiler) = self
-            .cache
-            .borrow_mut()
-            .pool_profiler_mut(&self.instrument_id)
-            && let Err(e) = pool_profiler.process_flash(event)
-        {
-            log::error!("Failed to process pool flash: {e}");
-        }
+        self.report(self.apply(&DexPoolData::Flash(event.clone())));
     }
-}
 
-fn process_pool_liquidity_update(
-    pool_profiler: &mut PoolProfiler,
-    update: &PoolLiquidityUpdate,
-) -> anyhow::Result<()> {
-    match update.kind {
-        PoolLiquidityUpdateType::Mint => pool_profiler.process_mint(update),
-        PoolLiquidityUpdateType::Burn => pool_profiler.process_burn(update),
-        _ => anyhow::bail!("Unsupported liquidity update operation {}", update.kind),
+    fn report(&self, outcome: PoolApplyOutcome) {
+        match outcome {
+            PoolApplyOutcome::Applied | PoolApplyOutcome::Duplicate => {}
+            PoolApplyOutcome::MissingProfiler => {
+                log::error!("No profiler available for {}", self.instrument_id);
+            }
+            PoolApplyOutcome::Rejected(e) => {
+                log::error!(
+                    "Failed to process pool event for {}: {e}",
+                    self.instrument_id
+                );
+            }
+        }
     }
 }
 
