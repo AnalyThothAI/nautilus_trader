@@ -2906,6 +2906,8 @@ mod tests {
             latency::{LatencyModelHandle, StaticLatencyModel},
         },
     };
+    #[cfg(feature = "defi")]
+    use nautilus_model::defi::{Pool, SharedChain};
     use nautilus_model::{
         data::{
             CustomData, CustomDataTrait, Data, DataType, IndexPriceUpdate, InstrumentClose,
@@ -3322,13 +3324,10 @@ mod tests {
     }
 
     #[cfg(feature = "defi")]
-    fn observed_canonical_pool() -> (
-        nautilus_model::defi::SharedChain,
-        nautilus_model::defi::Pool,
-    ) {
+    fn observed_canonical_pool() -> (SharedChain, Pool) {
         use std::sync::Arc;
 
-        use nautilus_model::defi::{AmmType, Chain, Dex, DexType, Pool, PoolIdentifier, Token};
+        use nautilus_model::defi::{AmmType, Chain, Dex, DexType, PoolIdentifier, Token};
 
         let chain = Arc::new(Chain::from_chain_id(42161).unwrap().clone());
         let dex = Arc::new(Dex::new(
