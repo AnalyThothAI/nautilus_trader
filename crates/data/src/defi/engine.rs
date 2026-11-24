@@ -1241,6 +1241,23 @@ impl DataEngine {
     }
 
     pub(crate) fn clear_pool_updaters(&mut self) {
+        let chains = self.cache().borrow().canonical_chain_ids();
+        let ts_init = self.clock().borrow().timestamp_ns();
+
+        // Reset removes updater ownership, so even complete canonical state loses trust
+        for chain_id in chains {
+            let epoch = self.cache().borrow().canonical_epoch(chain_id);
+
+            if let Some(epoch) = epoch {
+                self.invalidate_canonical_state(&CanonicalStateInvalidated {
+                    chain_id,
+                    epoch,
+                    reason: "Canonical pool updater state was reset".to_string(),
+                    ts_init,
+                });
+            }
+        }
+
         let updaters: Vec<_> = self.pool_updaters.drain().collect();
         for (instrument_id, updater) in updaters {
             Self::unsubscribe_pool_updater_topics(instrument_id, updater);
@@ -1251,19 +1268,20 @@ impl DataEngine {
     }
 
     pub(crate) fn abandon_pool_snapshots(&mut self) {
-        let chains = self.cache().borrow().canonical_chain_ids();
+        let pending = self
+            .pool_snapshot_pending
+            .values()
+            .filter_map(|request| request.canonical_anchor)
+            .map(|anchor| (anchor.chain_id, anchor.epoch))
+            .collect::<BTreeSet<_>>();
         let ts_init = self.clock().borrow().timestamp_ns();
 
-        for chain_id in chains {
-            let epoch = self
-                .cache()
-                .borrow()
-                .canonical_epoch(chain_id)
-                .expect("Canonical chain was selected above");
+        // A closed session cannot complete hydration, but does not undo a complete checkpoint
+        for (chain_id, epoch) in pending {
             self.invalidate_canonical_state(&CanonicalStateInvalidated {
                 chain_id,
                 epoch,
-                reason: "Data session ended before canonical continuation".to_string(),
+                reason: "Data session ended during canonical hydration".to_string(),
                 ts_init,
             });
         }

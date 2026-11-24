@@ -183,6 +183,251 @@ fn source_bootstrap_uses_recorded_request_identity_through_native_ingress() {
 }
 
 #[rstest]
+#[case::hydrated_checkpoint(false)]
+#[case::complete_zero_event_block(true)]
+#[tokio::test]
+#[expect(clippy::await_holding_refcell_ref)] // Single-threaded native engine
+async fn disconnect_preserves_complete_canonical_universe(#[case] advance: bool) {
+    let fixture = DefiFixture::new(false);
+    let observer = ObserverGuard::start(&fixture);
+    let initial = anchor(1, 1000);
+    let pools = pool_universe(&fixture);
+    fixture
+        .engine
+        .borrow_mut()
+        .process_defi_data(DefiData::CanonicalBootstrap(CanonicalPoolBootstrap {
+            anchor: initial,
+            pools: pools.clone(),
+            client_id: fixture.client_ids[0],
+            ts_init: UnixNanos::from(1000),
+        }));
+
+    for entry in &pools {
+        let mut state = snapshot(&fixture, initial);
+        state.instrument_id = entry.pool.instrument_id;
+        respond(&fixture, entry.request_id, initial, state);
+    }
+
+    let complete_through = if advance {
+        let mut next = batch(&fixture, anchor(1, 1001));
+        next.pools = pools.iter().map(|entry| entry.pool.instrument_id).collect();
+        fixture
+            .engine
+            .borrow_mut()
+            .process_defi_data(DefiData::CanonicalBatch(next.clone()));
+        next.anchor
+    } else {
+        initial
+    };
+    let invalidations = observer.observations.borrow().invalidations;
+    fixture.engine.borrow_mut().disconnect().await.unwrap();
+
+    // Repeated responses from the ended session cannot publish another readiness notification
+    for entry in &pools {
+        let mut state = snapshot(&fixture, initial);
+        state.instrument_id = entry.pool.instrument_id;
+        respond(&fixture, entry.request_id, initial, state);
+    }
+
+    let engine = fixture.engine.borrow();
+    let cache = engine.cache().borrow();
+    let frozen = cache.canonical_pool_snapshots(complete_through).unwrap();
+    assert_eq!(frozen.len(), 3);
+    assert_eq!(observer.observations.borrow().ready, vec![initial]);
+    assert_eq!(observer.observations.borrow().invalidations, invalidations);
+    assert_eq!(
+        observer.observations.borrow().batches,
+        if advance {
+            vec![complete_through]
+        } else {
+            vec![]
+        }
+    );
+
+    for entry in &pools {
+        let id = entry.pool.instrument_id;
+        assert_eq!(
+            cache.pool_state_health(&id),
+            Some(&PoolStateHealth::Ready { complete_through })
+        );
+        assert_eq!(
+            cache
+                .pool_profiler(&id)
+                .unwrap()
+                .last_processed_event
+                .as_ref()
+                .unwrap()
+                .number,
+            initial.number
+        );
+    }
+}
+
+#[rstest]
+#[case::all_pending(0)]
+#[case::partially_hydrated(2)]
+#[tokio::test]
+#[expect(clippy::await_holding_refcell_ref)] // Single-threaded native engine
+async fn disconnect_invalidates_incomplete_canonical_universe(#[case] completed: usize) {
+    let fixture = DefiFixture::new(false);
+    let observer = ObserverGuard::start(&fixture);
+    let initial = anchor(1, 1000);
+    let pools = pool_universe(&fixture);
+    fixture
+        .engine
+        .borrow_mut()
+        .process_defi_data(DefiData::CanonicalBootstrap(CanonicalPoolBootstrap {
+            anchor: initial,
+            pools: pools.clone(),
+            client_id: fixture.client_ids[0],
+            ts_init: UnixNanos::from(1000),
+        }));
+
+    for entry in pools.iter().take(completed) {
+        let mut state = snapshot(&fixture, initial);
+        state.instrument_id = entry.pool.instrument_id;
+        respond(&fixture, entry.request_id, initial, state);
+    }
+
+    let invalidations = observer.observations.borrow().invalidations;
+    fixture.engine.borrow_mut().disconnect().await.unwrap();
+
+    for entry in &pools {
+        let mut state = snapshot(&fixture, initial);
+        state.instrument_id = entry.pool.instrument_id;
+        respond(&fixture, entry.request_id, initial, state);
+    }
+
+    let engine = fixture.engine.borrow();
+    let cache = engine.cache().borrow();
+    assert!(cache.canonical_pool_snapshots(initial).is_err());
+    assert!(observer.observations.borrow().ready.is_empty());
+    assert_eq!(
+        observer.observations.borrow().invalidations,
+        invalidations + 1
+    );
+
+    for entry in pools {
+        assert!(cache.pool_profiler(&entry.pool.instrument_id).is_none());
+        assert!(matches!(
+            cache.pool_state_health(&entry.pool.instrument_id),
+            Some(PoolStateHealth::Dirty { anchor, .. }) if *anchor == initial
+        ));
+    }
+}
+
+#[rstest]
+#[tokio::test]
+#[expect(clippy::await_holding_refcell_ref)] // Single-threaded native engine
+async fn new_bootstrap_after_disconnect_fences_old_epoch() {
+    let fixture = DefiFixture::new(false);
+    let initial = anchor(1, 1000);
+    let old_pools = pool_universe(&fixture);
+    let old_bootstrap = CanonicalPoolBootstrap {
+        anchor: initial,
+        pools: old_pools.clone(),
+        client_id: fixture.client_ids[0],
+        ts_init: UnixNanos::from(1000),
+    };
+    fixture
+        .engine
+        .borrow_mut()
+        .process_defi_data(DefiData::CanonicalBootstrap(old_bootstrap.clone()));
+
+    for entry in &old_pools {
+        let mut state = snapshot(&fixture, initial);
+        state.instrument_id = entry.pool.instrument_id;
+        respond(&fixture, entry.request_id, initial, state);
+    }
+
+    fixture.engine.borrow_mut().disconnect().await.unwrap();
+    let recovered = anchor(2, 1000);
+    let pools = pool_universe(&fixture);
+    fixture
+        .engine
+        .borrow_mut()
+        .process_defi_data(DefiData::CanonicalBootstrap(CanonicalPoolBootstrap {
+            anchor: recovered,
+            pools: pools.clone(),
+            client_id: fixture.client_ids[0],
+            ts_init: UnixNanos::from(2000),
+        }));
+
+    for entry in &old_pools {
+        let mut state = snapshot(&fixture, initial);
+        state.instrument_id = entry.pool.instrument_id;
+        respond(&fixture, entry.request_id, initial, state);
+    }
+
+    let mut obsolete = batch(&fixture, anchor(1, 1001));
+    obsolete.pools = pools.iter().map(|entry| entry.pool.instrument_id).collect();
+    fixture
+        .engine
+        .borrow_mut()
+        .process_defi_data(DefiData::CanonicalBatch(obsolete));
+    fixture
+        .engine
+        .borrow_mut()
+        .process_defi_data(DefiData::CanonicalBootstrap(old_bootstrap));
+    fixture
+        .engine
+        .borrow_mut()
+        .process_defi_data(DefiData::CanonicalInvalidation(CanonicalStateInvalidated {
+            chain_id: initial.chain_id,
+            epoch: initial.epoch,
+            reason: "Late failure from the ended session".to_string(),
+            ts_init: UnixNanos::from(3000),
+        }));
+
+    for entry in &pools {
+        let engine = fixture.engine.borrow();
+        let cache = engine.cache().borrow();
+        assert!(cache.pool_profiler(&entry.pool.instrument_id).is_none());
+        assert_eq!(
+            cache.pool_state_health(&entry.pool.instrument_id),
+            Some(&PoolStateHealth::Hydrating {
+                anchor: recovered,
+                request_id: entry.request_id,
+            })
+        );
+    }
+
+    for (index, entry) in pools.iter().enumerate() {
+        let mut state = snapshot(&fixture, recovered);
+        state.instrument_id = entry.pool.instrument_id;
+        respond(&fixture, entry.request_id, recovered, state);
+        assert_eq!(
+            fixture
+                .engine
+                .borrow()
+                .cache()
+                .borrow()
+                .canonical_pool_snapshots(recovered)
+                .is_ok(),
+            index + 1 == pools.len()
+        );
+    }
+
+    let mut next = batch(&fixture, anchor(2, 1001));
+    next.pools = pools.iter().map(|entry| entry.pool.instrument_id).collect();
+    fixture
+        .engine
+        .borrow_mut()
+        .process_defi_data(DefiData::CanonicalBatch(next.clone()));
+    assert_eq!(
+        fixture
+            .engine
+            .borrow()
+            .cache()
+            .borrow()
+            .canonical_pool_snapshots(next.anchor)
+            .unwrap()
+            .len(),
+        3
+    );
+}
+
+#[rstest]
 fn reset_invalidates_canonical_trust_before_a_later_subscription() {
     let fixture = DefiFixture::new(true);
     hydrate(&fixture, anchor(1, 1000));
