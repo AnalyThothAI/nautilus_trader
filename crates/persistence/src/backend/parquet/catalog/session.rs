@@ -14,49 +14,71 @@
 
 use std::{
     cmp::Reverse,
-    collections::{BinaryHeap, VecDeque},
+    collections::{BinaryHeap, HashMap, VecDeque},
 };
 
 use datafusion::physical_plan::SendableRecordBatchStream;
 use futures::{Stream, StreamExt};
 use nautilus_core::UnixNanos;
-use nautilus_model::data::HasTsInit;
-use nautilus_serialization::arrow::DecodeTypedFromRecordBatch;
+use nautilus_model::data::{CustomData, HasTsInit};
+use nautilus_serialization::arrow::{DecodeTypedFromRecordBatch, custom::CustomDataDecoder};
 
 pub(super) type TypedPages<T> = Box<dyn Iterator<Item = anyhow::Result<Vec<T>>> + Send>;
 
 pub(super) struct MergedPages<T> {
-    sources: Vec<TypedPages<T>>,
+    sources: Vec<Option<TypedPages<T>>>,
     buffers: Vec<VecDeque<T>>,
     heads: BinaryHeap<Reverse<(UnixNanos, usize)>>,
+    unopened: VecDeque<(UnixNanos, usize)>,
+    lower_bounds: Vec<UnixNanos>,
+    last_timestamps: Vec<Option<UnixNanos>>,
     page_size: usize,
-    initialized: bool,
     finished: bool,
 }
 
 impl<T: HasTsInit> MergedPages<T> {
     pub(super) fn new(sources: Vec<TypedPages<T>>, page_size: usize) -> Self {
+        Self::with_lower_bounds(
+            sources
+                .into_iter()
+                .map(|source| (UnixNanos::default(), source))
+                .collect(),
+            page_size,
+        )
+    }
+
+    // Native catalog filenames give each source a lower bound. Delay opening later files
+    // until they can contain the next row, including equality at a timestamp boundary.
+    pub(super) fn with_lower_bounds(
+        sources: Vec<(UnixNanos, TypedPages<T>)>,
+        page_size: usize,
+    ) -> Self {
+        let lower_bounds: Vec<_> = sources.iter().map(|(lower, _)| *lower).collect();
+        let mut unopened: Vec<_> = lower_bounds
+            .iter()
+            .enumerate()
+            .map(|(index, lower)| (*lower, index))
+            .collect();
+        unopened.sort_unstable();
         Self {
             buffers: (0..sources.len()).map(|_| VecDeque::new()).collect(),
-            sources,
+            last_timestamps: vec![None; sources.len()],
+            sources: sources
+                .into_iter()
+                .map(|(_, source)| Some(source))
+                .collect(),
             heads: BinaryHeap::new(),
+            unopened: unopened.into(),
+            lower_bounds,
             page_size: page_size.max(1),
-            initialized: false,
             finished: false,
         }
     }
 
     fn read_page(&mut self) -> anyhow::Result<Option<Vec<T>>> {
-        if !self.initialized {
-            self.initialized = true;
-
-            for index in 0..self.sources.len() {
-                self.advance(index)?;
-            }
-        }
-
         let mut page = Vec::with_capacity(self.page_size);
         while page.len() < self.page_size {
+            self.open_sources()?;
             let Some(Reverse((_, index))) = self.heads.pop() else {
                 break;
             };
@@ -72,16 +94,54 @@ impl<T: HasTsInit> MergedPages<T> {
         Ok((!page.is_empty()).then_some(page))
     }
 
+    fn open_sources(&mut self) -> anyhow::Result<()> {
+        while let Some(&(lower, index)) = self.unopened.front() {
+            if self
+                .heads
+                .peek()
+                .is_some_and(|Reverse((ts, _))| *ts < lower)
+            {
+                break;
+            }
+
+            self.unopened.pop_front();
+            self.advance(index)?;
+        }
+        Ok(())
+    }
+
     fn advance(&mut self, index: usize) -> anyhow::Result<()> {
         while self.buffers[index].is_empty() {
-            match self.sources[index].next() {
+            let Some(source) = self.sources[index].as_mut() else {
+                return Ok(());
+            };
+
+            match source.next() {
                 Some(page) => self.buffers[index].extend(page?),
-                None => return Ok(()),
+                None => {
+                    // Drop exhausted tasks, DataFusion contexts and page allocations promptly.
+                    self.sources[index] = None;
+                    self.buffers[index] = VecDeque::new();
+                    return Ok(());
+                }
             }
         }
 
         let row = self.buffers[index].front().expect("source has a row");
-        self.heads.push(Reverse((row.ts_init(), index)));
+        anyhow::ensure!(
+            row.ts_init() >= self.lower_bounds[index],
+            "Catalog row timestamp {} precedes source lower bound {}",
+            row.ts_init(),
+            self.lower_bounds[index],
+        );
+        let ts_init = row.ts_init();
+        anyhow::ensure!(
+            self.last_timestamps[index].is_none_or(|previous| ts_init >= previous),
+            "Catalog source timestamp {ts_init} regresses from {:?}",
+            self.last_timestamps[index],
+        );
+        self.last_timestamps[index] = Some(ts_init);
+        self.heads.push(Reverse((ts_init, index)));
         Ok(())
     }
 }
@@ -106,6 +166,40 @@ impl<T: HasTsInit> Iterator for MergedPages<T> {
             }
         }
     }
+}
+
+// The factory runs only when its source can contribute the next merged row. In particular,
+// constructing a query must not start every file's bounded background prefetch at once.
+pub(super) fn deferred_pages<T, F>(factory: F) -> TypedPages<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> anyhow::Result<TypedPages<T>> + Send + 'static,
+{
+    let mut factory = Some(factory);
+    let mut pages: Option<TypedPages<T>> = None;
+    Box::new(std::iter::from_fn(move || {
+        if let Some(factory) = factory.take() {
+            match factory() {
+                Ok(source) => pages = Some(source),
+                Err(e) => return Some(Err(e)),
+            }
+        }
+        pages.as_mut()?.next()
+    }))
+}
+
+pub(super) fn decode_custom_pages(
+    stream: SendableRecordBatchStream,
+    metadata: HashMap<String, String>,
+) -> impl Stream<Item = anyhow::Result<Vec<CustomData>>> {
+    futures::stream::try_unfold((stream, metadata), |(mut stream, metadata)| async move {
+        let Some(batch) = stream.next().await else {
+            return Ok(None);
+        };
+
+        let rows = CustomDataDecoder::decode_custom_batch(&metadata, &batch?)?;
+        Ok(Some((rows, (stream, metadata))))
+    })
 }
 
 pub(super) fn decode_typed_pages<T>(
@@ -141,6 +235,26 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
+
+    #[rstest]
+    #[case::within_page(vec![vec![10_u64, 9]])]
+    #[case::across_pages(vec![vec![10_u64], vec![9]])]
+    fn merged_pages_reject_source_timestamp_regression(#[case] timestamps: Vec<Vec<u64>>) {
+        let source: TypedPages<QuoteTick> = Box::new(timestamps.into_iter().map(|page| {
+            Ok(page
+                .into_iter()
+                .map(|ts_init| QuoteTick {
+                    ts_init: ts_init.into(),
+                    ..quote_audusd()
+                })
+                .collect())
+        }));
+        let mut merged = MergedPages::new(vec![source], 1);
+        let error = merged.next().unwrap().unwrap_err();
+        assert!(error.to_string().contains("Catalog source timestamp"));
+        assert!(error.to_string().contains("regresses"));
+        assert!(merged.next().is_none());
+    }
 
     #[rstest]
     #[case::stream_error(false)]

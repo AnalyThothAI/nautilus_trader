@@ -2002,10 +2002,10 @@ impl LiveNode {
                 log::error!("Failed to finalize node after callback failure: {stop_err}");
                 // Python converts the outer display message, so preserve both diagnostics there.
                 let diagnostic = format!("{e}; {stop_err}");
-                return Err(anyhow::Error::new(e).context(diagnostic));
+                return Err(e.context(diagnostic));
             }
 
-            return Err(e.into());
+            return Err(e);
         }
 
         // Handle events that arrived during finalize_stop
@@ -3559,6 +3559,8 @@ fn render_client_statuses(rows: Vec<ClientStatus>) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "defi")]
+    mod observed_head;
     mod report_acceptance;
     mod shutdown;
 

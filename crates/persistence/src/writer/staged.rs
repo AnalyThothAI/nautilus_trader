@@ -291,12 +291,12 @@ where
     }
 
     fn stage_any(&mut self, message: &dyn Any) -> anyhow::Result<bool> {
-        let result = self.staged().write_any(message);
-        if let Err(e) = &result {
-            let _ = self.staged().error_tx.send(e.to_string());
-        }
+        self.staged().write_any(message)
+    }
 
-        result
+    fn record_write_error(&mut self, error: &anyhow::Error) {
+        // The bus subscriber cannot return an error to its publisher
+        let _ = self.staged().error_tx.send(format!("{error:#}"));
     }
 
     fn flush_staging(&mut self) -> anyhow::Result<()> {
@@ -694,6 +694,7 @@ fn prepare_promotion_paths(
 #[cfg(test)]
 mod tests {
     use std::{
+        fmt::Debug,
         sync::{
             Arc,
             atomic::{AtomicU64, Ordering},
@@ -756,6 +757,108 @@ mod tests {
     }
 
     impl StagedPromotionBackend for RecordingBackend {}
+
+    #[derive(Clone, Copy, Debug)]
+    enum WriteFailure {
+        Staging,
+        MarkNonEmpty,
+        PeriodicPromotion,
+    }
+
+    struct WriteFailureSink {
+        staged: StagedFeatherWriter<RecordingBackend>,
+        failure: WriteFailure,
+    }
+
+    impl Debug for WriteFailureSink {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct(stringify!(WriteFailureSink))
+                .field("failure", &self.failure)
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl StagedWriter for WriteFailureSink {
+        type Backend = RecordingBackend;
+
+        fn staged(&mut self) -> &mut StagedFeatherWriter<Self::Backend> {
+            &mut self.staged
+        }
+
+        fn mark_non_empty(&mut self) -> anyhow::Result<()> {
+            if matches!(self.failure, WriteFailure::MarkNonEmpty) {
+                anyhow::bail!("run metadata failed");
+            }
+            Ok(())
+        }
+
+        fn maybe_promote(&mut self) -> anyhow::Result<()> {
+            if matches!(self.failure, WriteFailure::PeriodicPromotion) {
+                anyhow::bail!("periodic promotion failed");
+            }
+            Ok(())
+        }
+
+        fn wait_for_promotions(&mut self) -> anyhow::Result<Vec<FeatherConversionSummary>> {
+            anyhow::ensure!(
+                self.staged.promotion_driver.wait()?.is_empty(),
+                "Injected promotion failure unexpectedly produced a promoted file"
+            );
+            Ok(Vec::new())
+        }
+
+        fn promote_on_flush(&self) -> bool {
+            false
+        }
+        fn promote_on_close(&self) -> bool {
+            false
+        }
+        fn promote_now(&mut self) -> anyhow::Result<Vec<FeatherConversionSummary>> {
+            Ok(Vec::new())
+        }
+        fn record_completed(&mut self) {}
+    }
+
+    #[rstest]
+    #[case::staging(WriteFailure::Staging)]
+    #[case::metadata(WriteFailure::MarkNonEmpty)]
+    #[case::promotion(WriteFailure::PeriodicPromotion)]
+    fn bus_write_failures_reach_existing_pending_error_channel(#[case] failure: WriteFailure) {
+        use crate::writer::traits::StreamingSink;
+
+        let directory = TempDir::new().unwrap();
+        let storage =
+            create_storage_backend_from_path(directory.path().to_str().unwrap(), None).unwrap();
+        let source = FeatherSessionSource::new(storage.clone(), Environment::Live, "run-failure");
+        let staged = StagedFeatherWriter::<RecordingBackend>::new(
+            storage,
+            &source,
+            WriterClock::Test(Arc::new(AtomicU64::new(0))),
+            RotationConfig::NoRotation,
+            None,
+            Some(0),
+            None,
+        )
+        .unwrap();
+        let mut sink = WriteFailureSink { staged, failure };
+        if matches!(failure, WriteFailure::Staging) {
+            sink.staged
+                .staging
+                .client
+                .tx
+                .send(StagingMessage::Stop)
+                .unwrap();
+        }
+
+        let error = StreamingSink::write_any(&mut sink, &quote_at(1)).unwrap_err();
+        let pending = if matches!(failure, WriteFailure::Staging) {
+            PromotionSink::take_pending_error(&mut sink).unwrap_err()
+        } else {
+            StreamingSink::flush(&mut sink).unwrap_err()
+        };
+        assert_eq!(pending.to_string(), format!("{error:#}"));
+        PromotionSink::take_pending_error(&mut sink).unwrap();
+    }
 
     #[rstest]
     #[case::ready(false)]

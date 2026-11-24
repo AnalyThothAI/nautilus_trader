@@ -159,6 +159,8 @@ pub(crate) trait PromotionSink: Send {
 
     fn take_pending_error(&mut self) -> anyhow::Result<()>;
 
+    fn record_write_error(&mut self, error: &anyhow::Error);
+
     fn should_promote_on_flush(&self) -> bool;
 
     fn should_promote_on_close(&self) -> bool;
@@ -173,9 +175,17 @@ where
     T: PromotionSink + std::fmt::Debug,
 {
     fn write_data(&mut self, data: Data) -> anyhow::Result<()> {
-        self.stage_data(data)?;
-        self.mark_run_non_empty()?;
-        self.maybe_promote_by_period()
+        let result = (|| {
+            self.stage_data(data)?;
+            self.mark_run_non_empty()?;
+            self.maybe_promote_by_period()
+        })();
+
+        if let Err(e) = &result {
+            self.record_write_error(e);
+        }
+
+        result
     }
 
     fn write_batch(&mut self, data: Vec<Data>) -> anyhow::Result<()> {
@@ -183,20 +193,36 @@ where
             return Ok(());
         }
 
-        self.stage_batch(data)?;
-        self.mark_run_non_empty()?;
-        self.maybe_promote_by_period()
+        let result = (|| {
+            self.stage_batch(data)?;
+            self.mark_run_non_empty()?;
+            self.maybe_promote_by_period()
+        })();
+
+        if let Err(e) = &result {
+            self.record_write_error(e);
+        }
+
+        result
     }
 
     fn write_any(&mut self, message: &dyn Any) -> anyhow::Result<bool> {
-        let handled = self.stage_any(message)?;
+        let result = (|| {
+            let handled = self.stage_any(message)?;
 
-        if handled {
-            self.mark_run_non_empty()?;
-            self.maybe_promote_by_period()?;
+            if handled {
+                self.mark_run_non_empty()?;
+                self.maybe_promote_by_period()?;
+            }
+
+            Ok(handled)
+        })();
+
+        if let Err(e) = &result {
+            self.record_write_error(e);
         }
 
-        Ok(handled)
+        result
     }
 
     fn flush(&mut self) -> anyhow::Result<()> {
@@ -1171,6 +1197,10 @@ pub(crate) mod tests {
         fn take_pending_error(&mut self) -> anyhow::Result<()> {
             self.calls.push("take_pending_error");
             Ok(())
+        }
+
+        fn record_write_error(&mut self, _error: &anyhow::Error) {
+            unreachable!()
         }
 
         fn should_promote_on_flush(&self) -> bool {

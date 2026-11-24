@@ -89,10 +89,9 @@ use nautilus_model::{
     instruments::{Instrument, InstrumentAny},
 };
 use nautilus_serialization::arrow::{
-    ArrowSchemaProvider, DecodeDataFromRecordBatch, DecodeTypedFromRecordBatch,
-    EncodeToRecordBatch, catalog_display::catalog_record_batch_to_display,
-    custom::CustomDataDecoder, display::instrument::encode_instruments,
-    record_batch_without_identifier_column,
+    ArrowSchemaProvider, DecodeTypedFromRecordBatch, EncodeToRecordBatch,
+    catalog_display::catalog_record_batch_to_display, custom::CustomDataDecoder,
+    display::instrument::encode_instruments, record_batch_without_identifier_column,
 };
 use object_store::{ObjectStore, ObjectStoreExt, path::Path as ObjectPath};
 use serde::Serialize;
@@ -132,6 +131,9 @@ mod query;
 mod session;
 mod store;
 mod write;
+
+#[cfg(test)]
+mod custom_tests;
 
 // Re-export public items from sibling modules so historical
 // `crate::backend::parquet::catalog::...` imports continue to resolve.
@@ -432,11 +434,11 @@ impl ParquetDataCatalog {
     pub(crate) fn clear_session_tables(&mut self) {
         self.session.clear_registered_tables();
     }
-}
 
-impl CatalogReader for ParquetDataCatalog {
-    fn fork_query_catalog(&self) -> anyhow::Result<Option<DataCatalog>> {
-        Ok(Some(Box::new(Self {
+    // A query owns its DataFusion registrations and shares only the object-store client.
+    // Deferred custom file readers can outlive the catalog that created their session.
+    fn fork_for_query(&self) -> Self {
+        Self {
             base_path: self.base_path.clone(),
             original_uri: self.original_uri.clone(),
             object_store: self.object_store.clone(),
@@ -444,9 +446,26 @@ impl CatalogReader for ParquetDataCatalog {
             batch_size: self.batch_size,
             compression: self.compression,
             max_row_group_size: self.max_row_group_size,
-        })))
+        }
+    }
+}
+
+impl CatalogReader for ParquetDataCatalog {
+    fn fork_query_catalog(&self) -> anyhow::Result<Option<DataCatalog>> {
+        Ok(Some(Box::new(self.fork_for_query())))
     }
 
+    /// Streams timestamp-aligned batches, opening custom files when their interval is reached.
+    ///
+    /// Custom files must contain nondecreasing `ts_init` values within their declared filename
+    /// interval. The session reports a timestamp regression or invalid lower bound as an error.
+    /// Use the collected `query_batch` or `query_custom_data_dynamic` APIs when unordered custom
+    /// files must be sorted after loading. Complete equal-timestamp groups may exceed `chunk_size`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if query setup fails. The returned session propagates file, decoding, and
+    /// timestamp-order errors when the affected page is read.
     fn query_batch_session(
         &mut self,
         query: &CatalogQuery,
@@ -463,9 +482,15 @@ impl CatalogReader for ParquetDataCatalog {
                         )?;
                         Ok(Box::new(TypedDataBatchSession::new(pages, chunk_size)) as DataBatchQueryResult)
                     },)+
+                    NautilusDataType::Custom { type_name } => {
+                        let pages = self.query_custom_pages(
+                            type_name, query.identifiers.as_deref(), query.start, query.end,
+                            query.where_clause.as_deref(), None,
+                        )?;
+                        Ok(Box::new(TypedDataBatchSession::new(pages, chunk_size)) as DataBatchQueryResult)
+                    },
                     _ => match self.query_batch(query)? {
                         DataBatch::Instrument(data) => Ok(Box::new(TypedDataBatchSession::from_vec(data.as_ref().to_vec(), chunk_size))),
-                        DataBatch::Custom(data) => Ok(Box::new(TypedDataBatchSession::from_vec(data.as_ref().to_vec(), chunk_size))),
                         _ => anyhow::bail!("Unsupported Parquet query family"),
                     },
                 }

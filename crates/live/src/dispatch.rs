@@ -13,14 +13,12 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-use nautilus_common::{
-    actor::{self, CallbackDispatchError},
-    live::dst,
-};
+use nautilus_common::{actor, live::dst, observation::check_data_observation_error};
 
 const CALLBACK_DRAIN_BUDGET: usize = 64;
 
-pub(crate) async fn drain_callbacks() -> Result<bool, CallbackDispatchError> {
+pub(crate) async fn drain_callbacks() -> anyhow::Result<bool> {
+    check_data_observation_error()?;
     let pending = actor::drain_callbacks(CALLBACK_DRAIN_BUDGET)?;
     if pending {
         dst::task::yield_now().await;
@@ -31,6 +29,8 @@ pub(crate) async fn drain_callbacks() -> Result<bool, CallbackDispatchError> {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use nautilus_common::actor::CallbackDispatchError;
+
     use super::*;
 
     pub(crate) fn latch_callback_failure() {

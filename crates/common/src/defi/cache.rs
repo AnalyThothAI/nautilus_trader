@@ -21,9 +21,9 @@ use ahash::{AHashMap, AHashSet};
 use nautilus_core::UUID4;
 use nautilus_model::{
     defi::{
-        Pool, PoolProfiler, SharedPool, currency,
+        Blockchain, Chain, Pool, PoolProfiler, SharedPool, currency,
         data::{
-            block::{BLOCK_SCOPED_SNAPSHOT_INDEX, BlockPosition},
+            block::{BLOCK_SCOPED_SNAPSHOT_INDEX, Block, BlockPosition},
             canonical::CanonicalAnchor,
         },
         pool_analysis::{PoolSnapshot, validation::validate_pool_profiler},
@@ -35,7 +35,7 @@ use nautilus_model::{
 };
 use ustr::Ustr;
 
-use crate::cache::Cache;
+use crate::{cache::Cache, observation::ObservationKey};
 
 /// Identifies a DeFi currency conflict that prevents dependent state from being published.
 #[derive(Debug, thiserror::Error)]
@@ -51,6 +51,7 @@ pub(crate) struct DefiCache {
     pool_profilers: AHashMap<InstrumentId, PoolProfiler>,
     pool_health: AHashMap<InstrumentId, PoolStateHealth>,
     canonical_epochs: AHashMap<u32, u64>,
+    observed_blocks: AHashMap<Blockchain, (Block, ObservationKey)>,
 }
 
 /// Trust state of a pool managed by complete canonical batches.
@@ -132,6 +133,46 @@ impl InstrumentMigration {
 }
 
 impl Cache {
+    /// Records the native consuming observation of the latest block for its chain.
+    ///
+    /// The current head's first observation and complete original header survive duplicate inputs.
+    /// A different hash replaces the head, including a reorg to a previously observed hash. This
+    /// bounded cache is an ingress fact; it does not assert canonical pool readiness.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the block has no chain or the observation sequence is zero.
+    pub fn add_observed_block(&mut self, block: Block, at: ObservationKey) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            at.sequence > 0,
+            "Observed block requires a positive ingress sequence"
+        );
+        let chain = block
+            .chain
+            .ok_or_else(|| anyhow::anyhow!("Observed block requires a chain"))?;
+
+        if self
+            .defi
+            .observed_blocks
+            .get(&chain)
+            .is_some_and(|(head, _)| head.hash == block.hash)
+        {
+            return Ok(());
+        }
+        self.defi.observed_blocks.insert(chain, (block, at));
+        Ok(())
+    }
+
+    /// Returns the original latest head and its first native consuming observation for a chain.
+    ///
+    /// Unobserved historical data does not populate this entry. Returns `None` for an unknown
+    /// chain or before any observed block has been consumed. Cache reset clears the entry.
+    #[must_use]
+    pub fn latest_observed_block(&self, chain_id: u32) -> Option<(Block, ObservationKey)> {
+        let chain = Chain::from_chain_id(chain_id)?;
+        self.defi.observed_blocks.get(&chain.name).cloned()
+    }
+
     /// Registers the authoritative execution-store check for a blockchain client.
     ///
     /// The check covers active swap intents for an instrument, including when the cache uses another store.
@@ -623,5 +664,6 @@ impl DefiCache {
         self.pool_profilers.clear();
         self.pool_health.clear();
         self.canonical_epochs.clear();
+        self.observed_blocks.clear();
     }
 }

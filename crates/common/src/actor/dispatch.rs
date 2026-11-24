@@ -30,6 +30,8 @@ use std::{
 
 use ahash::AHashMap;
 
+use crate::observation::{DataObservationScope, ObservationKey, current_data_observation};
+
 const MAX_PENDING: usize = 65_536;
 const MAX_KNOWN_BYTES: usize = 64 * 1024 * 1024;
 const MAX_CHAIN: usize = 1_048_576;
@@ -169,6 +171,7 @@ pub(super) fn reserve<T: 'static>(heap_bytes: usize) -> Option<Admission<T>> {
                 .set(accounting.reservations.get() + 1);
 
             let slot = Rc::new(Slot {
+                observation: current_data_observation(),
                 state: RefCell::new(SlotState::Reserved),
                 chain,
                 bytes,
@@ -273,6 +276,7 @@ pub(super) fn drain(budget: usize) -> Result<DrainResult, DispatchError> {
         };
 
         let _chain = ChainScope::enter(Some(slot.chain.clone()));
+        let _observation = DataObservationScope::enter(slot.observation);
         let pending = std::mem::replace(&mut *slot.state.borrow_mut(), SlotState::Reserved);
         match pending {
             SlotState::Reserved => {
@@ -341,6 +345,7 @@ pub(super) fn retain(bytes: usize) -> Option<RetainedStorage> {
             accounting.count.set(accounting.count.get() + 1);
             accounting.bytes.set(accounting.bytes.get() + bytes);
             Some(RetainedStorage {
+                observation: current_data_observation(),
                 chain,
                 accounting,
                 bytes,
@@ -355,6 +360,7 @@ pub(super) fn record_failure(error: DispatchError) {
 }
 
 pub(super) struct RetainedStorage {
+    observation: Option<ObservationKey>,
     chain: Rc<Chain>,
     accounting: Rc<Accounting>,
     bytes: usize,
@@ -363,6 +369,7 @@ pub(super) struct RetainedStorage {
 impl RetainedStorage {
     pub(super) fn with_chain<T>(&self, run: impl FnOnce() -> T) -> T {
         let _scope = ChainScope::enter(Some(self.chain.clone()));
+        let _observation = DataObservationScope::enter(self.observation);
         run()
     }
 
@@ -465,6 +472,7 @@ enum SlotState {
 }
 
 struct Slot {
+    observation: Option<ObservationKey>,
     chain: Rc<Chain>,
     state: RefCell<SlotState>,
     bytes: usize,
@@ -577,12 +585,16 @@ impl Drop for Chain {
 }
 
 pub(crate) struct ChainContext {
+    observation: Option<ObservationKey>,
     chain: Option<Rc<Chain>>,
 }
 
 impl ChainContext {
     pub(crate) const fn independent() -> Self {
-        Self { chain: None }
+        Self {
+            chain: None,
+            observation: None,
+        }
     }
 
     pub(crate) fn capture() -> Self {
@@ -610,11 +622,15 @@ impl ChainContext {
             .ok()
             .flatten();
 
-        Self { chain }
+        Self {
+            chain,
+            observation: current_data_observation(),
+        }
     }
 
     pub(crate) fn with_chain<T>(&self, run: impl FnOnce() -> T) -> T {
         let _scope = ChainScope::enter(self.chain.clone());
+        let _observation = DataObservationScope::enter(self.observation);
         run()
     }
 }
@@ -808,6 +824,55 @@ mod tests {
     fn record(value: &mut (Rc<RefCell<Vec<u32>>>, u32)) -> bool {
         value.0.borrow_mut().push(value.1);
         true
+    }
+
+    #[rstest]
+    fn deferred_callbacks_keep_their_ingress_observation() {
+        clear().unwrap();
+        let observed = Rc::new(RefCell::new(Vec::new()));
+
+        for sequence in [1, 2] {
+            let _scope = DataObservationScope::recorded(ObservationKey {
+                sequence,
+                ts_observed: 100.into(),
+            })
+            .unwrap();
+            let output = observed.clone();
+            reserve(0).unwrap().commit(output, |output| {
+                output
+                    .borrow_mut()
+                    .push(current_data_observation().unwrap().sequence);
+                true
+            });
+        }
+        assert_eq!(current_data_observation(), None);
+        assert_eq!(super::drain_at_boundary(1).unwrap().delivered, 1);
+        assert_eq!(current_data_observation(), None);
+        assert_eq!(super::drain_at_boundary(1).unwrap().delivered, 1);
+        assert_eq!(*observed.borrow(), [1, 2]);
+        clear().unwrap();
+    }
+
+    #[rstest]
+    fn retained_and_command_contexts_restore_observation_without_leaking() {
+        clear().unwrap();
+        let key = ObservationKey {
+            sequence: 7,
+            ts_observed: 100.into(),
+        };
+        let (retained, context) = {
+            let _scope = DataObservationScope::recorded(key).unwrap();
+            let retained = retain(0).unwrap();
+            let context = retained.with_chain(ChainContext::capture);
+            (retained, context)
+        };
+        assert_eq!(current_data_observation(), None);
+        retained.with_chain(|| assert_eq!(current_data_observation(), Some(key)));
+        context.with_chain(|| assert_eq!(current_data_observation(), Some(key)));
+        assert_eq!(current_data_observation(), None);
+        drop(context);
+        drop(retained);
+        clear().unwrap();
     }
 
     #[rstest]

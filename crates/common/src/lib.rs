@@ -147,6 +147,7 @@ pub mod greeks;
 pub mod logging;
 pub mod messages;
 pub mod msgbus;
+pub mod observation;
 pub mod providers;
 pub mod runner;
 pub mod serialization;

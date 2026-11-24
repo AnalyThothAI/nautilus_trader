@@ -38,10 +38,13 @@ use nautilus_common::{
         logging_clock_set_realtime_mode, logging_clock_set_static_mode,
         logging_clock_set_static_time,
     },
+    messages::DataEvent,
+    observation::{DataObservationScope, ObservationKey, ObservedDataEvent},
     runner::{
         SyncDataCommandSender, SyncTradingCommandSender, clear_command_queues,
-        data_cmd_queue_is_empty, drain_data_cmd_queue, drain_trading_cmd_queue,
-        replace_data_cmd_sender, replace_exec_cmd_sender, trading_cmd_queue_is_empty,
+        data_cmd_queue_is_empty, dispatch_data_event, drain_data_cmd_queue,
+        drain_trading_cmd_queue, replace_data_cmd_sender, replace_exec_cmd_sender,
+        trading_cmd_queue_is_empty,
     },
     timer::{TimeEvent, TimeEventCallback},
 };
@@ -49,7 +52,7 @@ use nautilus_core::{
     DurationNanos, UUID4, UnixNanos, datetime::unix_nanos_to_iso8601,
     string::formatting::Separable, time::nanos_since_unix_epoch,
 };
-use nautilus_data::client::DataClientAdapter;
+use nautilus_data::{client::DataClientAdapter, replay::ObservedDataIterator};
 use nautilus_execution::models::{fill::FillModelHandle, latency::LatencyModelHandle};
 use nautilus_model::{
     accounts::{Account, AccountAny},
@@ -108,6 +111,7 @@ pub struct BacktestEngine {
     has_book_data: AHashSet<InstrumentId>,
     has_book_processed: AHashSet<InstrumentId>,
     data_iterator: BacktestDataIterator,
+    observed_data: Option<ObservedDataIterator>,
     data_len: usize,
     data_stream_counter: usize,
     ts_first: Option<UnixNanos>,
@@ -177,6 +181,7 @@ impl BacktestEngine {
             has_book_data: AHashSet::new(),
             has_book_processed: AHashSet::new(),
             data_iterator: BacktestDataIterator::new(),
+            observed_data: None,
             data_len: 0,
             data_stream_counter: 0,
             ts_first: None,
@@ -278,6 +283,10 @@ impl BacktestEngine {
     /// Returns an error if the venue is already registered, initializing the simulated exchange
     /// fails, or registering its execution client fails.
     pub fn add_venue(&mut self, config: SimulatedVenueConfig) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.observed_data.is_none(),
+            "Observed decision replay does not simulate execution venues"
+        );
         // `routing` and `frozen_account` flow to the exec client, so capture
         // them before the config is consumed by the exchange constructor.
         let venue = config.venue;
@@ -451,6 +460,11 @@ impl BacktestEngine {
         validate: bool,
         sort: bool,
     ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.observed_data.is_none(),
+            "Historical data cannot be mixed with observed replay"
+        );
+
         if sort {
             data.sort_by_key(HasTsInit::ts_init);
         }
@@ -479,6 +493,10 @@ impl BacktestEngine {
         validate: bool,
         sort: bool,
     ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.observed_data.is_none(),
+            "Historical data cannot be mixed with observed replay"
+        );
         let stream_name = self.register_added_data(
             (0..data.len()).filter_map(|index| data.get(index)),
             client_id,
@@ -488,6 +506,98 @@ impl BacktestEngine {
         self.sorted = sort;
 
         Ok(())
+    }
+
+    /// Adds original inputs in their recorded consuming order for read-only decision replay.
+    ///
+    /// This opt-in mode keeps source timestamps unchanged, sets native clocks to `ts_observed`,
+    /// and uses the ordinary `DataEngine` and registered components. Native timer callbacks are
+    /// disabled: decision timers must have emitted typed data through the live `DataEvent` channel,
+    /// and those observed deadline inputs are replayed here exactly once. Arbitrary timer-driven
+    /// strategies and simulated execution venues are outside this mode's contract.
+    ///
+    /// Catalog partitions can be added in any order before consumption. Across streaming calls,
+    /// retain this engine and supply the next contiguous observations without reset.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if input is empty or duplicated, historical replay or simulated venues
+    /// are configured, a native payload is malformed, or the observed stream has already failed.
+    pub fn add_data_observations(
+        &mut self,
+        observations: Vec<ObservedDataEvent>,
+        client_id: Option<ClientId>,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.run_finished.is_none(),
+            "Observed decision replay has already ended"
+        );
+        anyhow::ensure!(
+            self.venues.is_empty(),
+            "Observed decision replay does not simulate execution venues"
+        );
+        anyhow::ensure!(
+            self.observed_data.is_some() || (self.data_len == 0 && self.run_id.is_none()),
+            "Observed replay cannot follow historical data or a started historical run"
+        );
+        anyhow::ensure!(!observations.is_empty(), "Observation chunk was empty");
+        let first = observations
+            .iter()
+            .map(|entry| entry.key.ts_observed)
+            .min()
+            .ok_or_else(|| anyhow::anyhow!("Observation chunk was empty"))?;
+        let last = observations
+            .iter()
+            .map(|entry| entry.key.ts_observed)
+            .max()
+            .ok_or_else(|| anyhow::anyhow!("Observation chunk was empty"))?;
+        let count = observations.len();
+        let new_len = self
+            .data_len
+            .checked_add(count)
+            .ok_or_else(|| anyhow::anyhow!("Observed replay data count overflowed"))?;
+        let data = observations
+            .iter()
+            .filter_map(|entry| observed_data_ref(&entry.event));
+        if data.clone().next().is_some() {
+            self.validate_added_data(&data, false)?;
+        }
+
+        for item in data {
+            self.register_data_instrument(item);
+        }
+        #[cfg(feature = "defi")]
+        if observations.iter().any(|entry| {
+            matches!(
+                &entry.event,
+                DataEvent::DeFi(_)
+                    | DataEvent::PoolSnapshotResponse(_)
+                    | DataEvent::Data(Data::Defi(_))
+            )
+        }) {
+            self.add_defi_data_client_if_not_exists(client_id);
+        }
+        #[cfg(not(feature = "defi"))]
+        let _ = client_id;
+
+        self.observed_data
+            .get_or_insert_with(ObservedDataIterator::new)
+            .add_batch(observations)?;
+        self.data_len = new_len;
+        self.ts_first = Some(self.ts_first.map_or(first, |current| current.min(first)));
+        self.ts_last_data = Some(self.ts_last_data.map_or(last, |current| current.max(last)));
+        self.sorted = true;
+        Ok(())
+    }
+
+    /// Returns the last native ingress consumed by an observed decision replay.
+    ///
+    /// The run owner compares this identity with the recording manifest before sealing.
+    #[must_use]
+    pub fn last_data_observation(&self) -> Option<ObservationKey> {
+        self.observed_data
+            .as_ref()
+            .and_then(ObservedDataIterator::last_observation)
     }
 
     fn register_added_data<'a>(
@@ -763,7 +873,8 @@ impl BacktestEngine {
 
         if let Err(e) = self.run_impl(start, end, run_config_id, streaming) {
             let callback_error = actor::callback_failure();
-            if callback_error.is_some()
+            if self.observed_data.is_some()
+                || callback_error.is_some()
                 || e.is::<CallbackDispatchError>()
                 || self.funding_error.is_some()
                 || self.kernel.portfolio.borrow().balance_error().is_some()
@@ -805,7 +916,22 @@ impl BacktestEngine {
     ) -> anyhow::Result<()> {
         self.validate_run_data()?;
 
-        let start_ns = start.unwrap_or_else(|| self.ts_first.unwrap_or_default());
+        if self.observed_data.is_some() {
+            anyhow::ensure!(
+                self.run_finished.is_none(),
+                "Observed decision replay has already ended"
+            );
+            anyhow::ensure!(
+                !self.kernel.is_event_store_replay_configured(),
+                "Observed decision replay requires normal native component startup"
+            );
+        }
+
+        let start_ns = if self.observed_data.is_some() && self.run_id.is_some() {
+            self.last_ns
+        } else {
+            start.unwrap_or_else(|| self.ts_first.unwrap_or_default())
+        };
         let end_ns = end.unwrap_or_else(|| self.ts_last_data.unwrap_or(start_ns));
         anyhow::ensure!(start_ns <= end_ns, "start was > end");
         self.end_ns = end_ns;
@@ -826,7 +952,12 @@ impl BacktestEngine {
         }
 
         self.log_run();
-        self.replay_data(start_ns, end_ns, streaming)?;
+
+        if self.observed_data.is_some() {
+            self.replay_observed_data(start_ns, end_ns, streaming)?;
+        } else {
+            self.replay_data(start_ns, end_ns, streaming)?;
+        }
         self.finish_replay(end_ns, streaming)
     }
 
@@ -927,6 +1058,58 @@ impl BacktestEngine {
         }
 
         self.log_pre_run();
+        Ok(())
+    }
+
+    fn replay_observed_data(
+        &mut self,
+        start_ns: UnixNanos,
+        end_ns: UnixNanos,
+        streaming: bool,
+    ) -> anyhow::Result<()> {
+        loop {
+            let next = self
+                .observed_data
+                .as_mut()
+                .expect("observed mode selected")
+                .peek_key()?;
+            let Some(key) = next else {
+                break;
+            };
+            anyhow::ensure!(
+                key.ts_observed >= start_ns,
+                "Observed replay cannot skip initial observations before its start"
+            );
+
+            if key.ts_observed > end_ns {
+                anyhow::ensure!(
+                    streaming,
+                    "Observed replay end precedes an unconsumed observation"
+                );
+                break;
+            }
+
+            if self.kernel.is_shutdown_requested() || self.force_stop {
+                anyhow::bail!(
+                    "Observed replay stopped before observation {}",
+                    key.sequence
+                );
+            }
+
+            let observation = self
+                .observed_data
+                .as_mut()
+                .expect("observed mode selected")
+                .next_event()?
+                .expect("peeked observation exists");
+            Self::set_all_clocks_time(&self.collect_all_clocks(), key.ts_observed);
+            logging_clock_set_static_time(key.ts_observed.as_u64());
+            self.last_ns = key.ts_observed;
+            let _scope = DataObservationScope::recorded(key)?;
+            dispatch_data_event(observation.event);
+            self.drain_command_queues()?;
+            self.iteration += 1;
+        }
         Ok(())
     }
 
@@ -1096,6 +1279,12 @@ impl BacktestEngine {
     }
 
     fn finish_replay(&mut self, end_ns: UnixNanos, streaming: bool) -> anyhow::Result<()> {
+        if self.observed_data.is_some() {
+            // Recorded deadlines already passed through native data ingress. The historical
+            // timestamp finalizer also advances timers, so observed mode must bypass it.
+            return self.drain_command_queues();
+        }
+
         if !streaming || self.force_stop || self.kernel.is_shutdown_requested() {
             let ts_now = self.kernel.clock.borrow().timestamp_ns();
             self.finalize_timestamp(ts_now, SettlementScope::All)?;
@@ -1169,7 +1358,8 @@ impl BacktestEngine {
     pub fn end(&mut self) -> anyhow::Result<()> {
         let result = self.end_impl();
         if let Err(e) = &result
-            && (e.is::<CallbackDispatchError>()
+            && (self.observed_data.is_some()
+                || e.is::<CallbackDispatchError>()
                 || self.kernel.portfolio.borrow().balance_error().is_some()
                 || self
                     .venues
@@ -1182,6 +1372,10 @@ impl BacktestEngine {
     }
 
     fn end_impl(&mut self) -> anyhow::Result<()> {
+        if let Some(observed) = self.observed_data.as_mut() {
+            observed.clear_consumed()?;
+        }
+
         if let Some(error) = actor::callback_failure() {
             return Err(error.into());
         }
@@ -1311,6 +1505,10 @@ impl BacktestEngine {
     /// writer, or clearing callback ownership fails. The engine attempts the remaining cleanup
     /// steps before returning the first error.
     pub fn reset(&mut self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.observed_data.is_none(),
+            "Observed decision replay runs once; construct a fresh engine to replay again"
+        );
         log::debug!("Resetting");
 
         let mut reset_error = None;
@@ -1413,6 +1611,12 @@ impl BacktestEngine {
 
     /// Clear the engine's internal data stream. Does not clear instruments.
     pub fn clear_data(&mut self) {
+        if let Some(observed) = self.observed_data.as_mut()
+            && let Err(e) = observed.clear_consumed()
+        {
+            log::error!("Cannot clear observed replay data: {e:#}");
+            return;
+        }
         self.has_data.clear();
         self.has_book_data.clear();
         self.data_iterator = BacktestDataIterator::new();
@@ -1868,6 +2072,10 @@ impl BacktestEngine {
     }
 
     fn flush_accumulator_events(&mut self, ts_now: UnixNanos) -> anyhow::Result<()> {
+        if self.observed_data.is_some() {
+            // Deadline callbacks already entered the recorded DataEvent stream
+            return Ok(());
+        }
         // Bail after shutdown so handler-scheduled alerts do not fire post-stop
         if self.kernel.is_shutdown_requested() {
             self.accumulator.clear();
@@ -2570,6 +2778,15 @@ impl ClockSnapshot {
     }
 }
 
+fn observed_data_ref(event: &DataEvent) -> Option<DataRef<'_>> {
+    match event {
+        DataEvent::Data(data) => Some(DataRef::from(data)),
+        #[cfg(feature = "defi")]
+        DataEvent::DeFi(data) => Some(DataRef::Defi(data)),
+        _ => None,
+    }
+}
+
 fn format_optional_nanos(nanos: Option<UnixNanos>) -> String {
     nanos.map_or("None".to_string(), unix_nanos_to_iso8601)
 }
@@ -2689,8 +2906,13 @@ mod tests {
             latency::{LatencyModelHandle, StaticLatencyModel},
         },
     };
+    #[cfg(feature = "defi")]
+    use nautilus_model::defi::{Pool, SharedChain};
     use nautilus_model::{
-        data::{Data, IndexPriceUpdate, InstrumentClose, InstrumentStatus, QuoteTick},
+        data::{
+            CustomData, CustomDataTrait, Data, DataType, IndexPriceUpdate, InstrumentClose,
+            InstrumentStatus, QuoteTick,
+        },
         enums::{
             AccountType, BookType, ContingencyType, InstrumentCloseType, LiquiditySide,
             MarketStatus, MarketStatusAction, OmsType, OrderSide, OrderStatus, OrderType,
@@ -2738,6 +2960,785 @@ mod tests {
         config::{BacktestRunConfig, BacktestVenueConfig},
         node::BacktestNode,
     };
+
+    #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+    struct ObservedControl {
+        kind: String,
+        ts_init: UnixNanos,
+    }
+
+    impl HasTsInit for ObservedControl {
+        fn ts_init(&self) -> UnixNanos {
+            self.ts_init
+        }
+    }
+
+    impl CustomDataTrait for ObservedControl {
+        fn type_name(&self) -> &'static str {
+            "ObservedControl"
+        }
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+        fn ts_event(&self) -> UnixNanos {
+            self.ts_init
+        }
+        fn to_json(&self) -> anyhow::Result<String> {
+            Ok(serde_json::to_string(self)?)
+        }
+        fn clone_arc(&self) -> Arc<dyn CustomDataTrait> {
+            Arc::new(self.clone())
+        }
+        fn eq_arc(&self, other: &dyn CustomDataTrait) -> bool {
+            other.as_any().downcast_ref::<Self>() == Some(self)
+        }
+    }
+
+    fn observed_control(kind: &str) -> Data {
+        Data::Custom(CustomData::new(
+            Arc::new(ObservedControl {
+                kind: kind.to_string(),
+                ts_init: 50.into(),
+            }),
+            DataType::new("ObservedControl", None, None),
+        ))
+    }
+
+    #[derive(Debug, Default)]
+    struct ObservedOutcome {
+        started: usize,
+        stopped: usize,
+        timer_callbacks: usize,
+        delivered: Vec<(String, u64, u64, u64)>,
+        selected: Option<bool>,
+    }
+
+    #[derive(Debug)]
+    struct ObservedReplayStrategy {
+        core: StrategyCore,
+        outcome: Rc<RefCell<ObservedOutcome>>,
+        result_seen: bool,
+        invalid: bool,
+    }
+
+    impl DataActor for ObservedReplayStrategy {
+        fn on_start(&mut self) -> anyhow::Result<()> {
+            self.outcome.borrow_mut().started += 1;
+            self.subscribe_data(DataType::new("ObservedControl", None, None), None, None);
+            self.clock().set_time_alert_ns(
+                "observed-decision-deadline",
+                100.into(),
+                None,
+                Some(false),
+            )?;
+            Ok(())
+        }
+
+        fn on_data(&mut self, data: &CustomData) -> anyhow::Result<()> {
+            let input = data
+                .data
+                .as_any()
+                .downcast_ref::<ObservedControl>()
+                .unwrap();
+            let key = nautilus_common::observation::current_data_observation().unwrap();
+            {
+                let cache = self.cache();
+                let history = cache.custom_data_history(&data.data_type);
+                let cached = history
+                    .first()
+                    .unwrap()
+                    .data
+                    .as_any()
+                    .downcast_ref::<ObservedControl>()
+                    .unwrap();
+                anyhow::ensure!(cached == input, "Cached input differs from delivered input");
+            }
+            let now = self.clock().timestamp_ns();
+            anyhow::ensure!(
+                now == key.ts_observed,
+                "Clock differs from observation time"
+            );
+            self.outcome.borrow_mut().delivered.push((
+                input.kind.clone(),
+                key.sequence,
+                key.ts_observed.as_u64(),
+                input.ts_init.as_u64(),
+            ));
+
+            match input.kind.as_str() {
+                "result" => self.result_seen = true,
+                "reorg" => self.invalid = true,
+                "stop" => {
+                    self.outcome.borrow_mut().selected.get_or_insert(false);
+                }
+                "deadline" => {
+                    self.outcome
+                        .borrow_mut()
+                        .selected
+                        .get_or_insert(self.result_seen && !self.invalid);
+                }
+                _ => {}
+            }
+            Ok(())
+        }
+
+        fn on_time_event(&mut self, _event: &TimeEvent) -> anyhow::Result<()> {
+            self.outcome.borrow_mut().timer_callbacks += 1;
+            nautilus_common::live::runner::get_data_event_sender()
+                .send(DataEvent::Data(observed_control("deadline")))
+                .map_err(|e| anyhow::anyhow!("Deadline bridge closed: {e}"))?;
+            Ok(())
+        }
+
+        fn on_stop(&mut self) -> anyhow::Result<()> {
+            self.outcome.borrow_mut().stopped += 1;
+            Ok(())
+        }
+    }
+
+    nautilus_strategy!(ObservedReplayStrategy);
+
+    #[rstest]
+    #[case::result_before_deadline(vec!["ready", "result", "deadline"], true)]
+    #[case::result_after_deadline(vec!["ready", "deadline", "result"], false)]
+    #[case::reorg_before_deadline(vec!["ready", "result", "reorg", "deadline"], false)]
+    #[case::stop_before_deadline(vec!["ready", "result", "stop", "deadline"], false)]
+    fn observed_replay_preserves_native_strategy_decisions_at_same_timestamp(
+        #[case] inputs: Vec<&str>,
+        #[case] selected: bool,
+        #[values(false, true)] reverse_chunks: bool,
+    ) {
+        let outcome = Rc::new(RefCell::new(ObservedOutcome::default()));
+        let strategy = ObservedReplayStrategy {
+            core: StrategyCore::new(StrategyConfig::default()),
+            outcome: outcome.clone(),
+            result_seen: false,
+            invalid: false,
+        };
+        let mut engine = BacktestEngine::new(BacktestEngineConfig::default()).unwrap();
+        engine.add_strategy(strategy).unwrap();
+        let mut chunks = [Vec::new(), Vec::new()];
+        for (index, kind) in inputs.iter().enumerate() {
+            chunks[index % 2].push(ObservedDataEvent {
+                key: ObservationKey {
+                    sequence: index as u64 + 1,
+                    ts_observed: 100.into(),
+                },
+                event: DataEvent::Data(observed_control(kind)),
+            });
+        }
+
+        if reverse_chunks {
+            chunks.reverse();
+        }
+
+        for chunk in chunks {
+            engine.add_data_observations(chunk, None).unwrap();
+        }
+        engine.run(Some(99.into()), None, None, false).unwrap();
+        {
+            let actual = outcome.borrow();
+            assert_eq!(actual.started, 1);
+            assert_eq!(actual.stopped, 1);
+            assert_eq!(actual.timer_callbacks, 0);
+            assert_eq!(actual.selected, Some(selected));
+            assert_eq!(
+                actual.delivered,
+                inputs
+                    .iter()
+                    .enumerate()
+                    .map(|(index, kind)| (kind.to_string(), index as u64 + 1, 100, 50))
+                    .collect::<Vec<_>>()
+            );
+        }
+        assert!(engine.running_strategy_ids().is_empty());
+        assert!(engine.reset().is_err());
+        engine.dispose();
+    }
+
+    #[rstest]
+    fn observed_replay_continues_across_chunks_without_refiring_start_or_timers() {
+        let outcome = Rc::new(RefCell::new(ObservedOutcome::default()));
+        let strategy = ObservedReplayStrategy {
+            core: StrategyCore::new(StrategyConfig::default()),
+            outcome: outcome.clone(),
+            result_seen: false,
+            invalid: false,
+        };
+        let mut engine = BacktestEngine::new(BacktestEngineConfig::default()).unwrap();
+        engine.add_strategy(strategy).unwrap();
+        for (index, kind) in ["ready", "result", "deadline"].iter().enumerate() {
+            engine
+                .add_data_observations(
+                    vec![ObservedDataEvent {
+                        key: ObservationKey {
+                            sequence: index as u64 + 1,
+                            ts_observed: 100.into(),
+                        },
+                        event: DataEvent::Data(observed_control(kind)),
+                    }],
+                    None,
+                )
+                .unwrap();
+            engine.run(Some(99.into()), None, None, index < 2).unwrap();
+            engine.clear_data();
+        }
+        let actual = outcome.borrow();
+        assert_eq!(
+            (actual.started, actual.stopped, actual.timer_callbacks),
+            (1, 1, 0)
+        );
+        assert_eq!(actual.selected, Some(true));
+        assert_eq!(actual.delivered.len(), 3);
+        drop(actual);
+        engine.dispose();
+    }
+
+    #[rstest]
+    #[case::deadline_first(true)]
+    #[case::result_first(false)]
+    fn native_timer_bridge_recording_replays_identical_decisions(#[case] deadline_first: bool) {
+        use nautilus_common::{
+            live::runner::get_data_event_sender, observation::DataObservationRecorder,
+        };
+        use nautilus_live::runner::AsyncRunner;
+
+        let live_outcome = Rc::new(RefCell::new(ObservedOutcome::default()));
+        let mut live_engine = BacktestEngine::new(BacktestEngineConfig::default()).unwrap();
+        live_engine
+            .add_strategy(ObservedReplayStrategy {
+                core: StrategyCore::new(StrategyConfig::default()),
+                outcome: live_outcome.clone(),
+                result_seen: false,
+                invalid: false,
+            })
+            .unwrap();
+        let clocks = live_engine.collect_all_clocks();
+        live_engine
+            .initialize_run(99.into(), None, &clocks)
+            .unwrap();
+        live_engine.start_trader().unwrap();
+        let mut runner = AsyncRunner::new();
+        runner.bind_senders();
+        BacktestEngine::set_all_clocks_time(&live_engine.collect_all_clocks(), 100.into());
+        let recording = Rc::new(RefCell::new(Vec::new()));
+        let sink = recording.clone();
+        let recorder = DataObservationRecorder::install(
+            live_engine.kernel.clock.clone(),
+            move |key, event| {
+                let DataEvent::Data(data) = event else {
+                    anyhow::bail!("unexpected input");
+                };
+                sink.borrow_mut().push(ObservedDataEvent {
+                    key,
+                    event: DataEvent::Data(data.clone()),
+                });
+                Ok(())
+            },
+        )
+        .unwrap();
+        let sender = get_data_event_sender();
+        sender
+            .send(DataEvent::Data(observed_control("ready")))
+            .unwrap();
+        runner.flush_pending_data();
+
+        if !deadline_first {
+            sender
+                .send(DataEvent::Data(observed_control("result")))
+                .unwrap();
+        }
+        live_engine.flush_accumulator_events(100.into()).unwrap();
+
+        if deadline_first {
+            sender
+                .send(DataEvent::Data(observed_control("result")))
+                .unwrap();
+        }
+        runner.flush_pending_data();
+
+        while actor::drain_callbacks(1024).unwrap() {}
+        recorder.check_error().unwrap();
+        assert_eq!(recorder.last_observation().unwrap().sequence, 3);
+        drop(recorder);
+        BacktestEngine::init_command_senders();
+        live_engine.end().unwrap();
+        assert_eq!(live_outcome.borrow().timer_callbacks, 1);
+        let events = std::mem::take(&mut *recording.borrow_mut());
+        live_engine.dispose();
+        drop(runner);
+
+        let replay_outcome = Rc::new(RefCell::new(ObservedOutcome::default()));
+        let mut replay = BacktestEngine::new(BacktestEngineConfig::default()).unwrap();
+        replay
+            .add_strategy(ObservedReplayStrategy {
+                core: StrategyCore::new(StrategyConfig::default()),
+                outcome: replay_outcome.clone(),
+                result_seen: false,
+                invalid: false,
+            })
+            .unwrap();
+        replay.add_data_observations(events, None).unwrap();
+        replay.run(Some(99.into()), None, None, false).unwrap();
+        {
+            let live = live_outcome.borrow();
+            let actual = replay_outcome.borrow();
+            assert_eq!(live.selected, Some(!deadline_first));
+            assert_eq!(live.delivered.len(), 3);
+            assert_eq!(actual.selected, live.selected);
+            assert_eq!(actual.delivered, live.delivered);
+            assert_eq!(
+                (actual.started, actual.stopped, actual.timer_callbacks),
+                (1, 1, 0)
+            );
+        }
+        replay.dispose();
+    }
+
+    #[rstest]
+    fn observed_replay_refuses_silent_start_skips_and_mixed_history() {
+        let mut engine = BacktestEngine::new(BacktestEngineConfig::default()).unwrap();
+        engine
+            .add_data_observations(
+                vec![ObservedDataEvent {
+                    key: ObservationKey {
+                        sequence: 1,
+                        ts_observed: 100.into(),
+                    },
+                    event: DataEvent::Data(observed_control("ready")),
+                }],
+                None,
+            )
+            .unwrap();
+        assert!(
+            engine
+                .add_data(vec![observed_control("result")], None, false, true)
+                .is_err()
+        );
+        assert!(
+            engine
+                .run(Some(101.into()), Some(102.into()), None, false)
+                .is_err()
+        );
+        engine.dispose();
+    }
+
+    #[cfg(feature = "defi")]
+    fn observed_canonical_pool() -> (SharedChain, Pool) {
+        use std::sync::Arc;
+
+        use nautilus_model::defi::{AmmType, Chain, Dex, DexType, PoolIdentifier, Token};
+
+        let chain = Arc::new(Chain::from_chain_id(42161).unwrap().clone());
+        let dex = Arc::new(Dex::new(
+            (*chain).clone(),
+            DexType::UniswapV3,
+            "0x1F98431c8aD98523631AE4a59f267346ea31F984",
+            0,
+            AmmType::CLAMM,
+            "PoolCreated",
+            "Swap",
+            "Mint",
+            "Burn",
+            "Collect",
+        ));
+        let token0 = Token::new(
+            chain.clone(),
+            "0x25118290e6A5f4139381D072181157035864099d"
+                .parse()
+                .unwrap(),
+            "RAIN".to_string(),
+            "RAIN".to_string(),
+            18,
+        );
+        let token1 = Token::new(
+            chain.clone(),
+            "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1"
+                .parse()
+                .unwrap(),
+            "Wrapped Ether".to_string(),
+            "WETH".to_string(),
+            18,
+        );
+        let address = "0xd13040d4fe917EE704158CfCB3338dCd2838B245"
+            .parse()
+            .unwrap();
+        let pool = Pool::new(
+            chain.clone(),
+            dex,
+            address,
+            PoolIdentifier::from_address(address),
+            0,
+            token0,
+            token1,
+            Some(100),
+            Some(1),
+            UnixNanos::default(),
+        );
+        (chain, pool)
+    }
+
+    #[cfg(feature = "defi")]
+    #[rstest]
+    fn observed_replay_keeps_snapshot_request_identity_and_epoch_fencing() {
+        use nautilus_common::{defi::cache::PoolStateHealth, messages::defi::PoolSnapshotResponse};
+        use nautilus_model::defi::{
+            DefiData,
+            data::{
+                block::{BLOCK_SCOPED_SNAPSHOT_INDEX, BlockPosition},
+                canonical::{
+                    CanonicalAnchor, CanonicalPoolBootstrap, CanonicalPoolHydration,
+                    CanonicalStateInvalidated,
+                },
+            },
+            pool_analysis::{
+                PoolSnapshot,
+                snapshot::{PoolAnalytics, PoolState},
+            },
+        };
+
+        let (chain, pool) = observed_canonical_pool();
+        let instrument_id = pool.instrument_id;
+        let anchor = CanonicalAnchor {
+            chain_id: chain.chain_id,
+            epoch: 1,
+            number: 1000,
+            block_hash: format!("0x{}", "01".repeat(32)).parse().unwrap(),
+        };
+        let request_id = UUID4::new();
+        let client_id = ClientId::from("OBSERVED-CHAIN");
+        let snapshot = PoolSnapshot::new(
+            instrument_id,
+            PoolState {
+                price_sqrt_ratio_x96: "79228162514264337593543950336".parse().unwrap(),
+                current_tick: 0,
+                ..Default::default()
+            },
+            vec![],
+            vec![],
+            PoolAnalytics::default(),
+            BlockPosition::new(
+                anchor.number,
+                anchor.block_hash.to_string(),
+                BLOCK_SCOPED_SNAPSHOT_INDEX,
+                BLOCK_SCOPED_SNAPSHOT_INDEX,
+            )
+            .with_block_hash(Some(anchor.block_hash.to_string())),
+            50.into(),
+            50.into(),
+        );
+        let response =
+            PoolSnapshotResponse::new(request_id, snapshot.clone()).with_canonical_anchor(anchor);
+        let events = [
+            DataEvent::DeFi(DefiData::CanonicalBootstrap(CanonicalPoolBootstrap {
+                anchor,
+                pools: vec![CanonicalPoolHydration { pool, request_id }],
+                client_id,
+                ts_init: 50.into(),
+            })),
+            DataEvent::PoolSnapshotResponse(
+                PoolSnapshotResponse::new(UUID4::new(), snapshot).with_canonical_anchor(anchor),
+            ),
+            DataEvent::PoolSnapshotResponse(response.clone()),
+            DataEvent::DeFi(DefiData::CanonicalInvalidation(CanonicalStateInvalidated {
+                chain_id: anchor.chain_id,
+                epoch: 2,
+                reason: "observed reorg".to_string(),
+                ts_init: 50.into(),
+            })),
+            DataEvent::PoolSnapshotResponse(response),
+        ];
+        let mut engine = BacktestEngine::new(BacktestEngineConfig::default()).unwrap();
+
+        for (index, event) in events.into_iter().enumerate() {
+            let key = ObservationKey {
+                sequence: index as u64 + 1,
+                ts_observed: 100.into(),
+            };
+            engine
+                .add_data_observations(vec![ObservedDataEvent { key, event }], Some(client_id))
+                .unwrap();
+            engine.run(Some(99.into()), None, None, true).unwrap();
+            let cache = engine.kernel.cache.borrow();
+
+            match index {
+                0 | 1 => assert_eq!(
+                    cache.pool_state_health(&instrument_id),
+                    Some(&PoolStateHealth::Hydrating { anchor, request_id })
+                ),
+                2 => assert_eq!(
+                    cache.pool_state_health(&instrument_id),
+                    Some(&PoolStateHealth::Ready {
+                        complete_through: anchor
+                    })
+                ),
+                3 | 4 => assert!(matches!(
+                    cache.pool_state_health(&instrument_id),
+                    Some(PoolStateHealth::Dirty { .. })
+                )),
+                _ => unreachable!(),
+            }
+            drop(cache);
+            assert_eq!(engine.last_data_observation(), Some(key));
+            engine.clear_data();
+        }
+        engine.end().unwrap();
+        engine.dispose();
+    }
+
+    #[cfg(feature = "defi")]
+    #[rstest]
+    fn native_canonical_observations_replay_from_a_recorded_file() {
+        use std::{
+            fs::File,
+            io::{BufReader, Write},
+        };
+
+        use nautilus_common::{
+            defi::cache::PoolStateHealth, live::runner::get_data_event_sender,
+            messages::defi::PoolSnapshotResponse, observation::DataObservationRecorder,
+        };
+        use nautilus_live::runner::AsyncRunner;
+        use nautilus_model::defi::{
+            Block, DefiData, PoolFeeProtocolUpdate,
+            data::{
+                DexPoolData,
+                block::{BLOCK_SCOPED_SNAPSHOT_INDEX, BlockPosition},
+                canonical::{
+                    CanonicalAnchor, CanonicalPoolBatch, CanonicalPoolBootstrap,
+                    CanonicalPoolHydration, CanonicalStateInvalidated,
+                },
+            },
+            pool_analysis::{
+                PoolSnapshot,
+                snapshot::{PoolAnalytics, PoolState},
+            },
+        };
+
+        // The envelope stores the original native variant and every payload field.
+        // Unsupported input is an error at the actual recorder boundary.
+        #[derive(serde::Serialize, serde::Deserialize)]
+        enum RecordedEvent {
+            DeFi(DefiData),
+            PoolSnapshotResponse(PoolSnapshotResponse),
+        }
+
+        #[derive(serde::Serialize, serde::Deserialize)]
+        struct RecordedObservation {
+            key: ObservationKey,
+            event: RecordedEvent,
+        }
+
+        let (chain, pool) = observed_canonical_pool();
+        let instrument_id = pool.instrument_id;
+        let anchor = CanonicalAnchor {
+            chain_id: chain.chain_id,
+            epoch: 1,
+            number: 1000,
+            block_hash: format!("0x{}", "01".repeat(32)).parse().unwrap(),
+        };
+        let next = CanonicalAnchor {
+            number: 1001,
+            block_hash: format!("0x{}", "02".repeat(32)).parse().unwrap(),
+            ..anchor
+        };
+        let request_id = UUID4::new();
+        let client_id = ClientId::from("OBSERVED-CHAIN");
+        let snapshot = PoolSnapshot::new(
+            instrument_id,
+            PoolState {
+                price_sqrt_ratio_x96: "79228162514264337593543950336".parse().unwrap(),
+                current_tick: 0,
+                ..Default::default()
+            },
+            vec![],
+            vec![],
+            PoolAnalytics::default(),
+            BlockPosition::new(
+                anchor.number,
+                anchor.block_hash.to_string(),
+                BLOCK_SCOPED_SNAPSHOT_INDEX,
+                BLOCK_SCOPED_SNAPSHOT_INDEX,
+            )
+            .with_block_hash(Some(anchor.block_hash.to_string())),
+            50.into(),
+            50.into(),
+        );
+        let response =
+            PoolSnapshotResponse::new(request_id, snapshot.clone()).with_canonical_anchor(anchor);
+        let mut fee = PoolFeeProtocolUpdate::new(
+            chain.clone(),
+            pool.dex.clone(),
+            instrument_id,
+            pool.pool_identifier,
+            next.number,
+            format!("0x{}", "03".repeat(32)),
+            0,
+            0,
+            4,
+            4,
+            50.into(),
+            50.into(),
+        );
+        fee.block_hash = Some(next.block_hash.to_string());
+        let batch = CanonicalPoolBatch {
+            anchor: next,
+            block: Block::new(
+                next.block_hash.to_string(),
+                anchor.block_hash.to_string(),
+                next.number,
+                "0x0000000000000000000000000000000000000000".into(),
+                30_000_000,
+                21_000,
+                55.into(),
+                Some(chain.name),
+            )
+            .with_base_fee("7".parse().unwrap()),
+            pools: vec![instrument_id],
+            events: vec![DexPoolData::FeeProtocolUpdate(fee)],
+            ts_init: 50.into(),
+        };
+        let events = [
+            DataEvent::DeFi(DefiData::CanonicalBootstrap(CanonicalPoolBootstrap {
+                anchor,
+                pools: vec![CanonicalPoolHydration { pool, request_id }],
+                client_id,
+                ts_init: 50.into(),
+            })),
+            DataEvent::PoolSnapshotResponse(
+                PoolSnapshotResponse::new(UUID4::new(), snapshot).with_canonical_anchor(anchor),
+            ),
+            DataEvent::PoolSnapshotResponse(response.clone()),
+            DataEvent::DeFi(DefiData::CanonicalBatch(batch)),
+            DataEvent::DeFi(DefiData::CanonicalInvalidation(CanonicalStateInvalidated {
+                chain_id: anchor.chain_id,
+                epoch: 2,
+                reason: "observed reorg".to_string(),
+                ts_init: 50.into(),
+            })),
+            DataEvent::PoolSnapshotResponse(response),
+        ];
+
+        let directory = tempfile::TempDir::new().unwrap();
+        let path = directory.path().join("observations.jsonl");
+        let output = Rc::new(RefCell::new(File::create(&path).unwrap()));
+        let mut live = BacktestEngine::new(BacktestEngineConfig::default()).unwrap();
+        live.add_defi_data_client_if_not_exists(Some(client_id));
+        live.initialize_run(99.into(), None, &live.collect_all_clocks())
+            .unwrap();
+        live.start_trader().unwrap();
+        let mut runner = AsyncRunner::new();
+        runner.bind_senders();
+        BacktestEngine::set_all_clocks_time(&live.collect_all_clocks(), 100.into());
+        let file = output.clone();
+        let recorder =
+            DataObservationRecorder::install(live.kernel.clock.clone(), move |key, event| {
+                let event = match event {
+                    DataEvent::DeFi(data) => RecordedEvent::DeFi(data.clone()),
+                    DataEvent::PoolSnapshotResponse(response) => {
+                        RecordedEvent::PoolSnapshotResponse(response.clone())
+                    }
+                    _ => anyhow::bail!("Unexpected native canonical input"),
+                };
+                let mut file = file.borrow_mut();
+                serde_json::to_writer(&mut *file, &RecordedObservation { key, event })?;
+                file.write_all(b"\n")?;
+                file.flush()?;
+                Ok(())
+            })
+            .unwrap();
+        let mut original = Vec::new();
+        let sender = get_data_event_sender();
+        for event in events {
+            sender.send(event).unwrap();
+            runner.flush_pending_data();
+
+            while actor::drain_callbacks(1024).unwrap() {}
+            recorder.check_error().unwrap();
+            let cache = live.kernel.cache.borrow();
+            original.push((
+                cache.pool_state_health(&instrument_id).cloned(),
+                cache
+                    .pool_profiler(&instrument_id)
+                    .map(|profiler| profiler.state.fee_protocol),
+            ));
+        }
+        assert_eq!(recorder.last_observation().unwrap().sequence, 6);
+        output.borrow().sync_all().unwrap();
+        drop(recorder);
+        drop(output);
+        BacktestEngine::init_command_senders();
+        live.end().unwrap();
+        live.dispose();
+        drop(runner);
+        assert_eq!(
+            original[0].0,
+            Some(PoolStateHealth::Hydrating { anchor, request_id })
+        );
+        assert_eq!(original[1], original[0]);
+        assert_eq!(
+            original[2].0,
+            Some(PoolStateHealth::Ready {
+                complete_through: anchor
+            })
+        );
+        assert_eq!(
+            original[3],
+            (
+                Some(PoolStateHealth::Ready {
+                    complete_through: next
+                }),
+                Some(68)
+            )
+        );
+        assert!(matches!(original[4].0, Some(PoolStateHealth::Dirty { .. })));
+        assert_eq!(original[5], original[4]);
+
+        let input = BufReader::new(File::open(path).unwrap());
+        let mut replay = BacktestEngine::new(BacktestEngineConfig::default()).unwrap();
+        let mut replayed = Vec::new();
+
+        for entry in serde_json::Deserializer::from_reader(input).into_iter::<RecordedObservation>()
+        {
+            let RecordedObservation { key, event } = entry.unwrap();
+            assert_eq!(key.ts_observed.as_u64(), 100);
+            let event = match event {
+                RecordedEvent::DeFi(data) => {
+                    assert_eq!(data.ts_init().as_u64(), 50);
+                    if let DefiData::CanonicalBatch(batch) = &data {
+                        assert_eq!(batch.block.chain, Some(chain.name));
+                        assert_eq!(batch.block.number, next.number);
+                        assert_eq!(batch.block.timestamp.as_u64(), 55);
+                        assert_eq!(batch.block.base_fee_per_gas, Some("7".parse().unwrap()));
+                        assert_eq!(batch.events.len(), 1);
+                    }
+                    DataEvent::DeFi(data)
+                }
+                RecordedEvent::PoolSnapshotResponse(response) => {
+                    assert_eq!(response.canonical_anchor, Some(anchor));
+                    assert_eq!(response.data.ts_init.as_u64(), 50);
+                    DataEvent::PoolSnapshotResponse(response)
+                }
+            };
+            replay
+                .add_data_observations(vec![ObservedDataEvent { key, event }], Some(client_id))
+                .unwrap();
+            replay.run(Some(99.into()), None, None, true).unwrap();
+            let cache = replay.kernel.cache.borrow();
+            replayed.push((
+                cache.pool_state_health(&instrument_id).cloned(),
+                cache
+                    .pool_profiler(&instrument_id)
+                    .map(|profiler| profiler.state.fee_protocol),
+            ));
+            drop(cache);
+            assert_eq!(replay.last_data_observation(), Some(key));
+            replay.clear_data();
+        }
+        assert_eq!(replayed, original);
+        replay.end().unwrap();
+        replay.dispose();
+    }
 
     #[derive(Debug)]
     struct BacktestReplayKernelEventStore {

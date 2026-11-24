@@ -27,17 +27,17 @@ use nautilus_serialization::arrow::{
 };
 
 use super::{
-    ArrowSchemaProvider, Bar, CustomDataDecoder, Data, DecodeDataFromRecordBatch,
-    DecodeTypedFromRecordBatch, FundingRateUpdate, HasCatalogDataType, HasTsInit, HashMap,
-    INSTRUMENT_PATH_PREFIXES, InstrumentAny, InstrumentClose, NautilusDataType, OptionGreeks,
-    OrderBookDelta, OrderBookDepth, ParquetDataCatalog, Path, QuoteTick, RecordBatch, TradeTick,
-    UnixNanos, build_query, catalog_record_batch_to_display, datafusion,
-    decode_object_store_segment, extract_bar_type_instrument_id, extract_identifier_from_path,
-    extract_sql_safe_filename, filter_instruments_for_request_range, instrument_path_prefix,
+    Arc, ArrowSchemaProvider, Bar, CustomData, CustomDataDecoder, Data, DecodeTypedFromRecordBatch,
+    FundingRateUpdate, HasCatalogDataType, HasTsInit, HashMap, INSTRUMENT_PATH_PREFIXES,
+    InstrumentAny, InstrumentClose, NautilusDataType, OptionGreeks, OrderBookDelta, OrderBookDepth,
+    ParquetDataCatalog, Path, QuoteTick, RecordBatch, TradeTick, UnixNanos, build_query,
+    catalog_record_batch_to_display, datafusion, decode_object_store_segment,
+    extract_bar_type_instrument_id, extract_identifier_from_path, extract_sql_safe_filename,
+    filter_instruments_for_request_range, instrument_path_prefix,
     is_monotonically_increasing_by_init, make_object_store_path, make_sql_safe_identifier,
     parquet_data_path_prefix, parse_filename_timestamps, query_intersects_filename,
     read_parquet_from_object_store, read_parquet_schema_from_object_store,
-    session::{MergedPages, TypedPages, decode_typed_pages},
+    session::{MergedPages, TypedPages, decode_custom_pages, decode_typed_pages, deferred_pages},
     urisafe_instrument_id,
 };
 use crate::{
@@ -736,9 +736,50 @@ impl ParquetDataCatalog {
         files: Option<Vec<String>>,
         _optimize_file_loading: bool,
     ) -> anyhow::Result<Vec<Data>> {
-        self.clear_session_tables();
+        let sources =
+            self.query_custom_file_pages(type_name, identifiers, start, end, where_clause, files)?;
+        let mut data = Vec::new();
 
-        self.register_remote_object_store()?;
+        for (_, pages) in sources {
+            for page in pages {
+                data.extend(page?.into_iter().map(Data::Custom));
+            }
+        }
+        // Preserve the collected API's existing support for unordered custom files.
+        // Only streaming sessions require each file's timestamp order to be valid.
+        data.sort_by_key(HasTsInit::ts_init);
+        Ok(data)
+    }
+
+    // Keep one native decoder for both collected and streaming consumers. Only file
+    // descriptors are retained up front; Arrow pages are opened when their time can be next.
+    pub(super) fn query_custom_pages(
+        &mut self,
+        type_name: &str,
+        identifiers: Option<&[String]>,
+        start: Option<UnixNanos>,
+        end: Option<UnixNanos>,
+        where_clause: Option<&str>,
+        files: Option<Vec<String>>,
+    ) -> anyhow::Result<TypedPages<CustomData>> {
+        let sources =
+            self.query_custom_file_pages(type_name, identifiers, start, end, where_clause, files)?;
+        Ok(Box::new(MergedPages::with_lower_bounds(
+            sources,
+            self.batch_size,
+        )))
+    }
+
+    fn query_custom_file_pages(
+        &mut self,
+        type_name: &str,
+        identifiers: Option<&[String]>,
+        start: Option<UnixNanos>,
+        end: Option<UnixNanos>,
+        where_clause: Option<&str>,
+        files: Option<Vec<String>>,
+    ) -> anyhow::Result<Vec<(UnixNanos, TypedPages<CustomData>)>> {
+        self.clear_session_tables();
 
         let files = if let Some(f) = files {
             f.into_iter()
@@ -772,49 +813,68 @@ impl ParquetDataCatalog {
             )
         })?;
 
-        let mut all_data = Vec::new();
-
+        let template = Arc::new(self.fork_for_query());
+        let mut sources = Vec::with_capacity(files.len());
         for (index, file) in files.into_iter().enumerate() {
-            let object_path = self.to_object_path_parsed(&file)?;
+            // Unrecognized filenames have no useful lower bound, so they are opened
+            // before emitting rows. Never omit an external file to gain laziness.
+            let lower = parse_filename_timestamps(&file)
+                .map_or(UnixNanos::default(), |(first, _)| UnixNanos::from(first));
+            let template = Arc::clone(&template);
+            let lookup_metadata = lookup_metadata.clone();
+            let type_name = type_name.to_owned();
+            let where_clause = where_clause.map(str::to_owned);
+            let pages = deferred_pages(move || {
+                let mut catalog = template.fork_for_query();
+                // Custom payloads can be entire snapshots. Bound the Arrow scanner's
+                // pages as well as the merged row pages, before registering any tables.
+                catalog.session.session_ctx =
+                    ::datafusion::prelude::SessionContext::new_with_config(
+                        datafusion::session_config().with_batch_size(catalog.batch_size),
+                    );
+                catalog.register_remote_object_store()?;
+                let object_path = catalog.to_object_path_parsed(&file)?;
+                let mut decode_metadata = catalog.execute_async(|| async {
+                    let schema = read_parquet_schema_from_object_store(
+                        catalog.object_store.clone(),
+                        &object_path,
+                    )
+                    .await?;
+                    validate_catalog_schema(&schema)?;
+                    Ok::<HashMap<String, String>, anyhow::Error>(schema.metadata().clone())
+                })?;
+                decode_metadata.extend(lookup_metadata);
+                let identifier = extract_identifier_from_path(&file).ok_or_else(|| {
+                    anyhow::anyhow!("Cannot extract identifier from path '{file}'")
+                })?;
+                let safe_type_name = make_sql_safe_identifier(&type_name);
+                let safe_sql_identifier = make_sql_safe_identifier(identifier);
+                let safe_filename = extract_sql_safe_filename(&file);
+                let table_name = format!(
+                    "custom_{safe_type_name}_{safe_sql_identifier}_{safe_filename}_{index}"
+                );
+                let resolved_path = catalog.resolve_path_for_datafusion(&file);
+                let sql_query = build_query(&table_name, start, end, where_clause.as_deref());
 
-            let mut decode_metadata = self.execute_async(|| async {
-                let schema =
-                    read_parquet_schema_from_object_store(self.object_store.clone(), &object_path)
-                        .await?;
-                validate_catalog_schema(&schema)?;
-                Ok::<HashMap<String, String>, anyhow::Error>(schema.metadata().clone())
-            })?;
-
-            decode_metadata.extend(lookup_metadata.clone());
-            let identifier = extract_identifier_from_path(&file)
-                .ok_or_else(|| anyhow::anyhow!("Cannot extract identifier from path '{file}'"))?;
-            let safe_type_name = make_sql_safe_identifier(type_name);
-            let safe_sql_identifier = make_sql_safe_identifier(identifier);
-            let safe_filename = extract_sql_safe_filename(&file);
-            let table_name =
-                format!("custom_{safe_type_name}_{safe_sql_identifier}_{safe_filename}_{index}");
-            let resolved_path = self.resolve_path_for_datafusion(&file);
-            let sql_query = build_query(&table_name, start, end, where_clause);
-
-            // Use schemaless registration so DataFusion preserves the parquet file's
-            // schema metadata (e.g. `bar_type`) on output batches, since the
-            // explicit-schema variant strips per-batch metadata that decoders rely on.
-            let batches = self.session.collect_parquet_files_batches(
-                &table_name,
-                vec![resolved_path],
-                Some(&sql_query),
-            )?;
-
-            for batch in batches {
-                all_data.extend(CustomDataDecoder::decode_data_batch(
-                    &decode_metadata,
-                    batch,
-                )?);
-            }
+                // One file per stream retains its schema and CustomDataType metadata;
+                // merging Arrow rows first could misapply one file's identity to another.
+                let stream = catalog.session.parquet_files_batch_stream(
+                    &table_name,
+                    vec![resolved_path],
+                    Some(&sql_query),
+                )?;
+                let decoded = decode_custom_pages(stream, decode_metadata);
+                Ok(
+                    Box::new(datafusion::BlockingBatchStream::from_stream_with_runtime(
+                        decoded,
+                        &catalog.session.runtime,
+                    )) as TypedPages<CustomData>,
+                )
+            });
+            sources.push((lower, pages));
         }
 
-        all_data.sort_by_key(HasTsInit::ts_init);
-        Ok(all_data)
+        Ok(sources)
     }
 
     /// Queries all Parquet files for a specific data type and optional instrument IDs.
