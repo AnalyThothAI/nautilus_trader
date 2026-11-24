@@ -96,6 +96,11 @@ fn hydrate(fixture: &DefiFixture, anchor: CanonicalAnchor) {
     );
 }
 
+#[expect(clippy::await_holding_refcell_ref)] // Single-threaded native engine
+async fn disconnect(fixture: &DefiFixture) {
+    fixture.engine.borrow_mut().disconnect().await.unwrap();
+}
+
 fn health(fixture: &DefiFixture) -> Option<PoolStateHealth> {
     fixture
         .engine
@@ -186,7 +191,6 @@ fn source_bootstrap_uses_recorded_request_identity_through_native_ingress() {
 #[case::hydrated_checkpoint(false)]
 #[case::complete_zero_event_block(true)]
 #[tokio::test]
-#[expect(clippy::await_holding_refcell_ref)] // Single-threaded native engine
 async fn disconnect_preserves_complete_canonical_universe(#[case] advance: bool) {
     let fixture = DefiFixture::new(false);
     let observer = ObserverGuard::start(&fixture);
@@ -220,7 +224,7 @@ async fn disconnect_preserves_complete_canonical_universe(#[case] advance: bool)
         initial
     };
     let invalidations = observer.observations.borrow().invalidations;
-    fixture.engine.borrow_mut().disconnect().await.unwrap();
+    disconnect(&fixture).await;
 
     // Repeated responses from the ended session cannot publish another readiness notification
     for entry in &pools {
@@ -267,7 +271,6 @@ async fn disconnect_preserves_complete_canonical_universe(#[case] advance: bool)
 #[case::all_pending(0)]
 #[case::partially_hydrated(2)]
 #[tokio::test]
-#[expect(clippy::await_holding_refcell_ref)] // Single-threaded native engine
 async fn disconnect_invalidates_incomplete_canonical_universe(#[case] completed: usize) {
     let fixture = DefiFixture::new(false);
     let observer = ObserverGuard::start(&fixture);
@@ -290,7 +293,7 @@ async fn disconnect_invalidates_incomplete_canonical_universe(#[case] completed:
     }
 
     let invalidations = observer.observations.borrow().invalidations;
-    fixture.engine.borrow_mut().disconnect().await.unwrap();
+    disconnect(&fixture).await;
 
     for entry in &pools {
         let mut state = snapshot(&fixture, initial);
@@ -318,7 +321,6 @@ async fn disconnect_invalidates_incomplete_canonical_universe(#[case] completed:
 
 #[rstest]
 #[tokio::test]
-#[expect(clippy::await_holding_refcell_ref)] // Single-threaded native engine
 async fn new_bootstrap_after_disconnect_fences_old_epoch() {
     let fixture = DefiFixture::new(false);
     let initial = anchor(1, 1000);
@@ -340,7 +342,7 @@ async fn new_bootstrap_after_disconnect_fences_old_epoch() {
         respond(&fixture, entry.request_id, initial, state);
     }
 
-    fixture.engine.borrow_mut().disconnect().await.unwrap();
+    disconnect(&fixture).await;
     let recovered = anchor(2, 1000);
     let pools = pool_universe(&fixture);
     fixture
