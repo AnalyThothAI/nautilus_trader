@@ -114,6 +114,7 @@ pub(crate) struct OrderIdentity {
 struct OrderIdentityBinding {
     venue_order_id: Option<VenueOrderId>,
     submission_nonce: Option<i64>,
+    signed_ioc: Option<SignedIoc>,
     external_venue_ids: AHashSet<VenueOrderId>,
     create_resolution: CreateResolution,
     trigger_price: Option<Price>,
@@ -139,6 +140,14 @@ impl OrderIdentityBinding {
         self.create_resolution = CreateResolution::Confirmed;
         true
     }
+}
+
+/// Signed identity retained independently of the transient WebSocket ACK queue.
+#[derive(Debug, Clone)]
+pub(crate) struct SignedIoc {
+    pub(crate) nonce: i64,
+    pub(crate) api_key_index: u8,
+    pub(crate) tx_hash: String,
 }
 
 #[derive(Debug, Clone)]
@@ -417,7 +426,27 @@ impl OrderIdentity {
     }
 
     fn mark_submission(&self, nonce: i64) {
-        self.binding.lock().submission_nonce = Some(nonce);
+        let mut binding = self.binding.lock();
+        binding.submission_nonce = Some(nonce);
+        binding.signed_ioc = None;
+    }
+
+    fn mark_signed_ioc(&self, pending: &PendingSendTx) {
+        let mut binding = self.binding.lock();
+        binding.submission_nonce = Some(pending.nonce);
+        binding.signed_ioc = Some(SignedIoc {
+            nonce: pending.nonce,
+            api_key_index: pending.api_key_index,
+            tx_hash: pending.tx_hash.clone(),
+        });
+    }
+
+    pub(crate) fn signed_ioc(&self) -> Option<SignedIoc> {
+        let binding = self.binding.lock();
+        if binding.create_resolution == CreateResolution::Rejected {
+            return None;
+        }
+        binding.signed_ioc.clone()
     }
 
     fn bind_venue_order_id(&self, venue_order_id: VenueOrderId) -> bool {
@@ -1240,7 +1269,16 @@ impl WsDispatchState {
     /// milliseconds; sustained queue growth indicates a stuck WS read loop.
     pub(crate) fn enqueue_pending_sendtx(&self, pending: PendingSendTx) {
         for (order, _) in pending.kind.creates() {
-            self.mark_order_submission(&order.client_order_id(), pending.nonce);
+            if pending
+                .kind
+                .is_ioc_create_for(order.instrument_id(), order.client_order_id())
+            {
+                if let Some(identity) = self.order_identities.get(&order.client_order_id()) {
+                    identity.mark_signed_ioc(&pending);
+                }
+            } else {
+                self.mark_order_submission(&order.client_order_id(), pending.nonce);
+            }
         }
 
         if let PendingSendTxKind::Modify {
@@ -2884,11 +2922,17 @@ impl OrderReportLookup {
 
         if target_venue_index.is_none()
             && let Some(cloid) = client_order_id
-            && dispatch
-                .pending_sendtx
-                .lock()
-                .iter()
-                .any(|pending| pending.kind.is_ioc_create_for(instrument_id, *cloid))
+            && (dispatch
+                .order_identities
+                .get(cloid)
+                .is_some_and(|identity| {
+                    identity.instrument_id == instrument_id && identity.signed_ioc().is_some()
+                })
+                || dispatch
+                    .pending_sendtx
+                    .lock()
+                    .iter()
+                    .any(|pending| pending.kind.is_ioc_create_for(instrument_id, *cloid)))
         {
             anyhow::bail!("Lighter order report deferred pending the unanswered IOC receipt");
         }

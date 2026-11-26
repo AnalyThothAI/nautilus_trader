@@ -56,7 +56,10 @@ use nautilus_common::{
             SubmitOrderList,
         },
     },
-    msgbus::{self, InstrumentSubscription, TypedHandler, switchboard::get_instruments_pattern},
+    msgbus::{
+        self, InstrumentSubscription, MessagingSwitchboard, ShareableMessageHandler, TypedHandler,
+        switchboard::get_instruments_pattern,
+    },
 };
 use nautilus_core::{
     DurationNanos, UUID4, UnixNanos,
@@ -71,7 +74,7 @@ use nautilus_execution::reconciliation::{
 use nautilus_live::{
     ExecutionClientCore, ExecutionEventEmitter, SocketControlFactory,
     book::DEFAULT_BOOK_SNAPSHOT_TIMEOUT_SECS,
-    execution::failure::CommandFailure,
+    execution::{failure::CommandFailure, submission::SubmissionRecoveryExhausted},
     task::{TaskGroup, TaskGroupGuard, TaskJoinOutcome, TaskSlot, TaskSpawner, finish_task},
 };
 use nautilus_model::{
@@ -249,6 +252,9 @@ pub struct LighterExecutionClient {
     terminal_recovery_handle: TaskSlot<()>,
     terminal_producers_stopped: CancellationToken,
     fills_applied: Option<AppliedFillSubscription>,
+    retained_iocs: Arc<Mutex<BTreeSet<ClientOrderId>>>,
+    ioc_recovery: Arc<tokio::sync::Mutex<()>>,
+    recovery_exhausted: Option<RecoveryExhaustedSubscription>,
     ws_disconnect_handle: TaskSlot<Result<(), LighterWsError>>,
     ws_handler_retained: Arc<RetainedTaskSlot>,
     auth_refresh_handle: TaskSlot<()>,
@@ -385,6 +391,9 @@ impl LighterExecutionClient {
             terminal_recovery_handle: TaskSlot::new(),
             terminal_producers_stopped: CancellationToken::new(),
             fills_applied: None,
+            retained_iocs: Arc::default(),
+            ioc_recovery: Arc::default(),
+            recovery_exhausted: None,
             ws_disconnect_handle: TaskSlot::new(),
             ws_handler_retained: Arc::new(RetainedTaskSlot::new()),
             auth_refresh_handle: TaskSlot::new(),
@@ -627,6 +636,41 @@ impl LighterExecutionClient {
 
         msgbus::subscribe_order_events(ORDER_EVENTS_PATTERN.into(), handler.clone(), Some(10));
         self.fills_applied = Some(AppliedFillSubscription(handler));
+
+        let core = self.core.clone();
+        let retained = Arc::clone(&self.retained_iocs);
+        let exhausted =
+            ShareableMessageHandler::from_typed(move |event: &SubmissionRecoveryExhausted| {
+                if event.trader_id != core.trader_id
+                    || event.client_id.is_some_and(|id| id != core.client_id)
+                {
+                    return;
+                }
+                if core
+                    .cache()
+                    .order_ref(&event.client_order_id)
+                    .is_some_and(|order| {
+                        order
+                            .account_id()
+                            .map_or(event.client_id == Some(core.client_id), |id| {
+                                id == core.account_id
+                            })
+                            && order.instrument_id() == event.instrument_id
+                            && order.strategy_id() == event.strategy_id
+                            && (order.order_type() == OrderType::Market
+                                || order.time_in_force() == TimeInForce::Ioc)
+                            && !order.is_closed()
+                    })
+                {
+                    retained.lock().insert(event.client_order_id);
+                }
+            });
+        msgbus::subscribe_any(
+            MessagingSwitchboard::submission_recovery_exhausted_topic().into(),
+            exhausted.clone(),
+            None,
+        );
+        self.recovery_exhausted = Some(RecoveryExhaustedSubscription(exhausted));
     }
 
     fn begin_session_shutdown(&mut self) {
@@ -726,6 +770,23 @@ impl LighterExecutionClient {
 
         if self.session_tasks_finished() {
             self.fills_applied = None;
+            self.recovery_exhausted = None;
+        }
+
+        for (cloid, terminal) in self.dispatch.terminals_pending.lock().iter() {
+            if self
+                .dispatch
+                .order_identities
+                .get(cloid)
+                .is_some_and(|identity| {
+                    identity.signed_ioc().is_some()
+                        && identity.filled_qty() < terminal.order.filled_base_amount
+                })
+            {
+                self.shutdown_errors.push(format!(
+                    "Lighter IOC {cloid} still lacks its terminal trades"
+                ));
+            }
         }
 
         let stale = self.dispatch.take_pending_sendtx();
@@ -5755,13 +5816,33 @@ struct AckedOrderProbe {
 }
 
 impl AckedOrderProbe {
-    fn for_query(cmd: &QueryOrder, dispatch: &WsDispatchState) -> Option<Self> {
+    fn for_query(
+        cmd: &QueryOrder,
+        dispatch: &WsDispatchState,
+        cached: Option<OrderAny>,
+    ) -> Option<Self> {
         if cmd.venue_order_id.is_some()
             || dispatch
                 .lookup_venue_order_id(&cmd.client_order_id)
                 .is_some()
         {
             return None;
+        }
+
+        if let Some(order) = cached
+            && !order.is_closed()
+            && order.instrument_id() == cmd.instrument_id
+            && let Some(identity) = dispatch.order_identities.get(&cmd.client_order_id)
+            && let Some(signed) = identity.signed_ioc()
+        {
+            return Some(Self {
+                order: Box::new(order),
+                client_order_index: identity.client_order_index,
+                connection_epoch: None,
+                nonce: signed.nonce,
+                api_key_index: signed.api_key_index,
+                tx_hash: signed.tx_hash,
+            });
         }
 
         let queue = dispatch.pending_sendtx.lock();
@@ -6924,9 +7005,14 @@ impl ExecutionClient for LighterExecutionClient {
 
         let _ = order_shape_pending(&self.core, &self.dispatch, &cmd.client_order_id);
         let child_context = self.child_probe_context();
+        let cached = self
+            .core
+            .cache()
+            .order_owned(&cmd.client_order_id)
+            .filter(|order| order.account_id() == Some(core_account_id));
         self.spawn_task("query_order", async move {
             if let Some(context) = &child_context
-                && let Some(probe) = AckedOrderProbe::for_query(&cmd, &dispatch)
+                && let Some(probe) = AckedOrderProbe::for_query(&cmd, &dispatch, cached)
             {
                 return query_unanswered_create(&cmd, &probe, context).await;
             }
@@ -7133,6 +7219,7 @@ impl ExecutionClient for LighterExecutionClient {
         let command = cmd.clone();
         let collection_command = command.clone();
         let collection_context = child_context.clone();
+        self.recover_retained_iocs(cmd);
         Some(ExecutionReportTask::new(
             async move {
                 let sweep = client
@@ -7625,6 +7712,18 @@ impl ExecutionClient for LighterExecutionClient {
 #[derive(Debug)]
 struct AppliedFillSubscription(TypedHandler<OrderEventAny>);
 
+#[derive(Debug)]
+struct RecoveryExhaustedSubscription(ShareableMessageHandler);
+
+impl Drop for RecoveryExhaustedSubscription {
+    fn drop(&mut self) {
+        msgbus::unsubscribe_any(
+            MessagingSwitchboard::submission_recovery_exhausted_topic().into(),
+            &self.0,
+        );
+    }
+}
+
 impl Drop for AppliedFillSubscription {
     fn drop(&mut self) {
         msgbus::unsubscribe_order_events(ORDER_EVENTS_PATTERN.into(), &self.0);
@@ -7697,11 +7796,85 @@ fn fill_reports_for_mass_status(result: anyhow::Result<FillSweep>) -> anyhow::Re
 }
 
 impl LighterExecutionClient {
+    /// Continue recovery at the ordinary open-order sweep cadence after fast probes expire.
+    /// Only locally tracked, still-active signed IOC identities are eligible.
+    fn recover_retained_iocs(&self, cmd: &GenerateOrderStatusReports) {
+        if !cmd.open_only {
+            return;
+        }
+        let Ok(guard) = Arc::clone(&self.ioc_recovery).try_lock_owned() else {
+            return;
+        };
+        let Some(context) = self.child_probe_context() else {
+            return;
+        };
+        let cache = self.core.cache();
+        let mut retained = self.retained_iocs.lock();
+        retained.retain(|cloid| {
+            cache
+                .order_ref(cloid)
+                .is_some_and(|order| !order.is_closed())
+        });
+        let mut ids = retained.clone();
+        drop(retained);
+        ids.extend(self.dispatch.terminals_pending.lock().iter().filter_map(
+            |(cloid, terminal)| (terminal.attempts >= ACKED_ORDER_PROBE_ATTEMPTS).then_some(*cloid),
+        ));
+        let probes: Vec<_> = ids
+            .into_iter()
+            .filter_map(|cloid| {
+                let order = cache.order_ref(&cloid)?;
+                if order.is_closed()
+                    || order.account_id() != Some(self.core.account_id)
+                    || cmd
+                        .instrument_id
+                        .is_some_and(|id| id != order.instrument_id())
+                {
+                    return None;
+                }
+                let identity = self.dispatch.order_identities.get(&cloid)?;
+                let signed = identity.signed_ioc()?;
+                Some(AckedOrderProbe {
+                    order: Box::new(order.cloned()),
+                    client_order_index: identity.client_order_index,
+                    connection_epoch: None,
+                    nonce: signed.nonce,
+                    api_key_index: signed.api_key_index,
+                    tx_hash: signed.tx_hash,
+                })
+            })
+            .collect();
+        drop(cache);
+        if probes.is_empty() {
+            return;
+        }
+        self.spawn_task("retained IOC recovery", async move {
+            let _guard = guard;
+            for probe in probes {
+                let cmd = QueryOrder::new(
+                    probe.order.trader_id(), None, probe.order.strategy_id(),
+                    probe.order.instrument_id(), probe.order.client_order_id(), probe.order.venue_order_id(),
+                    UUID4::new(), context.clock.get_time_ns(), None, None,
+                );
+                tokio::select! {
+                    () = context.cancellation_token.cancelled() => return Ok(()),
+                    result = query_unanswered_create(&cmd, &probe, &context) => {
+                        if let Err(e) = result {
+                            log::warn!("Lighter IOC outcome unresolved for {}: {}", probe.order.client_order_id(), scrub_auth(&format!("{e:#}")));
+                        }
+                    }
+                }
+            }
+            Ok(())
+        });
+    }
+
     async fn collect_order_reports(
         &self,
         cmd: &GenerateOrderStatusReports,
         fills: Option<&[FillReport]>,
     ) -> anyhow::Result<Vec<OrderStatusReport>> {
+        self.recover_retained_iocs(cmd);
         let sweep = self.report_client().collect_order_status_reports(cmd).await;
         if let Some(context) = self.child_probe_context() {
             request_child_report_recoveries(&self.core, &context, &sweep, fills);
@@ -8657,17 +8830,41 @@ async fn query_unanswered_create(
     probe: &AckedOrderProbe,
     context: &AckedOrderProbeContext,
 ) -> anyhow::Result<()> {
-    if !context.dispatch.create_submission_is_pending(
-        &cmd.client_order_id,
-        probe.client_order_index,
-        probe.nonce,
-    ) {
+    let Some(identity) = context
+        .dispatch
+        .order_identities
+        .get(&cmd.client_order_id)
+        .map(|entry| entry.value().clone())
+    else {
+        return Ok(());
+    };
+    let signed_matches = identity.signed_ioc().is_some_and(|signed| {
+        signed.nonce == probe.nonce
+            && signed.api_key_index == probe.api_key_index
+            && signed.tx_hash == probe.tx_hash
+            && identity.client_order_index == probe.client_order_index
+            && identity.instrument_id == cmd.instrument_id
+    });
+    if identity.signed_ioc().is_some() && !signed_matches {
+        return Ok(());
+    }
+    if !signed_matches
+        && !context.dispatch.create_submission_is_pending(
+            &cmd.client_order_id,
+            probe.client_order_index,
+            probe.nonce,
+        )
+    {
         return Ok(());
     }
 
-    let ControlFlow::Break(Some(venue_order_id)) = probe_acked_create_tx(probe, context, 1).await?
-    else {
-        return Ok(());
+    let venue_order_id = if let Some(id) = identity.venue_order_id() {
+        id
+    } else {
+        let ControlFlow::Break(Some(id)) = probe_acked_create_tx(probe, context, 1).await? else {
+            return Ok(());
+        };
+        id
     };
 
     let lookup = OrderReportLookup::new(
@@ -8734,6 +8931,26 @@ async fn query_unanswered_create(
 
     if filled {
         dispatch_terminal_trades(&trades, cmd.client_order_id, venue_order_id, context);
+    } else {
+        let exhausted = context
+            .dispatch
+            .terminals_pending
+            .lock()
+            .get(&cmd.client_order_id)
+            .is_some_and(|terminal| terminal.attempts >= ACKED_ORDER_PROBE_ATTEMPTS);
+        if exhausted {
+            tokio::time::timeout(
+                TERMINAL_RECOVERY_TIMEOUT,
+                recover_terminal_trades(
+                    order.market_index,
+                    order.order_index,
+                    cmd.client_order_id,
+                    context,
+                ),
+            )
+            .await
+            .context("Lighter retained IOC terminal trades timed out")??;
+        }
     }
 
     Ok(())
@@ -11118,7 +11335,9 @@ fn release_terminal(
             return;
         }
 
-        if !force && identity.filled_qty() < terminal.order.filled_base_amount {
+        if identity.filled_qty() < terminal.order.filled_base_amount
+            && (!force || identity.signed_ioc().is_some())
+        {
             return;
         }
 

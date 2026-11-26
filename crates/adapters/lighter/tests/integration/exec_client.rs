@@ -3769,6 +3769,9 @@ async fn test_reconnect_checks_unanswered_create_receipt(
 #[case::delayed_history("delayed_history")]
 #[case::in_progress("in_progress")]
 #[case::reused_active_index("reused_active_index")]
+#[case::drained("drained")]
+#[case::retained("retained")]
+#[case::drained_unknown("drained_unknown")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_query_recovers_unanswered_ioc_on_connected_socket(#[case] scenario: &str) {
     let (addr, state) = start_server().await;
@@ -3784,7 +3787,7 @@ async fn test_query_recovers_unanswered_ioc_on_connected_socket(#[case] scenario
     receipt["to"]["u"] = json!(index);
     receipt["to"]["a"] = json!(TEST_ACCOUNT_INDEX);
 
-    let mut tx = if scenario == "unknown" {
+    let mut tx = if matches!(scenario, "unknown" | "drained_unknown") {
         json!({"code": 21500, "message": "transaction not found"})
     } else {
         json!({"status": 2, "event_info": receipt.to_string()})
@@ -3856,7 +3859,15 @@ async fn test_query_recovers_unanswered_ioc_on_connected_socket(#[case] scenario
         *state.inactive_orders_response.lock().await = Some(history);
     }
 
-    if scenario == "reused_active_index" {
+    if matches!(scenario, "drained" | "retained" | "drained_unknown") {
+        assert_eq!(client.dispatch.drain_pending_sendtx(epoch).len(), 1);
+        assert_eq!(client.dispatch.pending_sendtx_len(), 0);
+    }
+
+    if matches!(
+        scenario,
+        "reused_active_index" | "drained" | "retained" | "drained_unknown"
+    ) {
         let cmd = GenerateOrderStatusReport::new(
             UUID4::new(),
             UnixNanos::default(),
@@ -3888,10 +3899,41 @@ async fn test_query_recovers_unanswered_ioc_on_connected_socket(#[case] scenario
         );
     }
 
-    query_submitted_order(&client, cloid);
+    if scenario == "retained" {
+        let diagnostic = nautilus_live::execution::submission::SubmissionRecoveryExhausted {
+            trader_id: trader_id(),
+            client_id: Some(client_id()),
+            strategy_id: strategy_id(),
+            instrument_id: eth_perp_id(),
+            client_order_id: cloid,
+            source: nautilus_live::execution::submission::SubmissionRecoverySource::Inflight,
+            retry_count: 5,
+            ts_event: UnixNanos::default(),
+        };
+        nautilus_common::msgbus::publish_any(
+            nautilus_common::msgbus::MessagingSwitchboard::submission_recovery_exhausted_topic(),
+            &diagnostic,
+        );
+        assert!(client.retained_iocs.lock().contains(&cloid));
+        let cmd = GenerateOrderStatusReports::new(
+            UUID4::new(),
+            UnixNanos::default(),
+            true,
+            Some(eth_perp_id()),
+            None,
+            None,
+            None,
+            None,
+        );
+        // The slow recovery must run after the native budget expires, independently
+        // of the old ACK queue and without dispatching a new signed order.
+        drop(client.generate_order_status_reports_task(&cmd).unwrap());
+    } else {
+        query_submitted_order(&client, cloid);
+    }
     await_tx_calls(&state, 1 + usize::from(delayed_history)).await;
 
-    let recovered = !matches!(scenario, "unknown" | "wrong_nonce");
+    let recovered = !matches!(scenario, "unknown" | "wrong_nonce" | "drained_unknown");
     if recovered {
         let accepted = next_order_event(&mut rx, Duration::from_secs(3))
             .await
