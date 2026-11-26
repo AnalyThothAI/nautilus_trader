@@ -4282,6 +4282,223 @@ async fn test_query_unanswered_ioc_preserves_zero_fill_cancel_held_by_modify(
     client.disconnect().await.unwrap();
 }
 
+#[rstest]
+#[case::synthetic_enabled(true)]
+#[case::synthetic_disabled(false)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_native_ioc_position_coverage_before_original_fill(
+    #[case] generate_missing_orders: bool,
+) {
+    set_message_bus(Rc::new(RefCell::new(MessageBus::new(
+        trader_id(),
+        UUID4::new(),
+        None,
+        None,
+    ))));
+    let (addr, state) = start_server().await;
+    let (mut client, mut rx, cache) = build_client(addr);
+    client.connect().await.unwrap();
+    await_subscribe_count(&state, 4).await;
+    let (cloid, index, nonce) = submit_unanswered_ioc(&client, &mut rx, &cache, &state).await;
+    let venue_id = VenueOrderId::new("562947905631053");
+
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::default()));
+    let mut engine = ExecutionEngine::new(clock.clone(), cache.clone(), None);
+    let mut manager = ExecutionManager::new(
+        clock,
+        cache.clone(),
+        ExecutionManagerConfig {
+            generate_missing_orders,
+            position_check_threshold_ns: DurationNanos::ZERO,
+            ..ExecutionManagerConfig::default()
+        },
+    )
+    .unwrap();
+    manager.register_submission(
+        cache.borrow().order(&cloid).unwrap().init_event(),
+        Some(client_id()),
+    );
+    let now = UnixNanos::from(1_777_941_384_181_000_000);
+    let position = |qty| {
+        PositionStatusReport::new(
+            account_id(),
+            eth_perp_id(),
+            PositionSide::Long,
+            Quantity::from(qty),
+            now,
+            now,
+            None,
+            None,
+            Some(rust_decimal::Decimal::from_str_exact("2352.73").unwrap()),
+        )
+    };
+    let snapshot = position("0.0020");
+    client
+        .dispatch
+        .replace_position_snapshot(&[snapshot.clone()], &[], &[]);
+    let scoped = GeneratePositionStatusReports::new(
+        UUID4::new(),
+        now,
+        Some(eth_perp_id()),
+        None,
+        None,
+        None,
+        None,
+    );
+    let bulk = GeneratePositionStatusReports::new(UUID4::new(), now, None, None, None, None, None);
+    let sibling =
+        client
+            .registry
+            .insert(101, "BTC", crate::common::enums::LighterProductType::Perp);
+    let sibling_scope = GeneratePositionStatusReports::new(
+        UUID4::new(),
+        now,
+        Some(sibling),
+        None,
+        None,
+        None,
+        None,
+    );
+    for worker in [false, true] {
+        let own = generate_position_status_reports(&client, &scoped, worker).await;
+        let all = generate_position_status_reports(&client, &bulk, worker).await;
+        assert_eq!(own.is_ok(), all.is_ok());
+        assert!(
+            generate_position_status_reports(&client, &sibling_scope, worker)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        eprintln!(
+            "POSITION_COVERAGE pending_own={} pending_bulk={} sibling=true worker={worker}",
+            own.is_ok(),
+            all.is_ok()
+        );
+    }
+    let premature = manager.check_positions_consistency(&[&client]).await;
+    assert!(
+        !premature
+            .iter()
+            .any(|e| matches!(e, OrderEventAny::Filled(_))),
+        "must not synthesize a position while the signed IOC's original execution is unknown"
+    );
+    assert!(
+        cache
+            .borrow()
+            .positions_open(None, Some(&eth_perp_id()), None, Some(&account_id()), None)
+            .is_empty()
+    );
+
+    // Let the original receipt and history become available; no second send is allowed.
+    let mut receipt = load_json("http_create_order_receipt_event.json");
+    receipt["to"]["i"] = json!(venue_id.as_str().parse::<i64>().unwrap());
+    receipt["to"]["u"] = json!(index);
+    receipt["to"]["a"] = json!(TEST_ACCOUNT_INDEX);
+    state
+        .tx_responses_by_nonce
+        .lock()
+        .await
+        .insert(nonce, json!({"status":2,"event_info":receipt.to_string()}));
+    let mut terminal =
+        http_order_fixture(venue_id.as_str(), &index.to_string(), "canceled", "0.0020");
+    terminal["nonce"] = json!(nonce);
+    terminal["remaining_base_amount"] = json!("0.0030");
+    terminal["time_in_force"] = json!("immediate-or-cancel");
+    *state.account_orders_response.lock().await =
+        Some(http_orders_payload(&[terminal.clone()], None));
+    *state.inactive_orders_response.lock().await = Some(http_orders_payload(&[terminal], None));
+    let mut trade = http_trade_fixture(19_209_006_991, index);
+    trade["size"] = json!("0.0020");
+    trade["usd_amount"] = json!("4.70546");
+    *state.trades_response.lock().await = Some(json!({"code":200,"trades":[trade.clone()]}));
+    query_submitted_order(&client, cloid);
+    for expected in [
+        OrderStatus::Accepted,
+        OrderStatus::PartiallyFilled,
+        OrderStatus::Canceled,
+    ] {
+        let event = next_order_event(&mut rx, Duration::from_secs(5))
+            .await
+            .expect("original order event");
+        engine.process(&event);
+        assert_eq!(cache.borrow().order(&cloid).unwrap().status(), expected);
+    }
+    let order = cache.borrow().order(&cloid).unwrap().clone();
+    assert_eq!(order.trade_ids(), vec![&TradeId::from("19209006991")]);
+    assert_eq!(order.filled_qty(), Quantity::from("0.0020"));
+    let fills: Vec<_> = order
+        .events()
+        .into_iter()
+        .filter_map(|e| match e {
+            OrderEventAny::Filled(fill) => Some(fill),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(fills.len(), 1);
+    assert_eq!(fills[0].last_px, Price::from("2352.73"));
+    assert!(
+        fills[0]
+            .commission
+            .is_some_and(|fee| fee.as_decimal() > rust_decimal::Decimal::ZERO)
+    );
+    assert_eq!(
+        cache
+            .borrow()
+            .positions_open(None, Some(&eth_perp_id()), None, Some(&account_id()), None)
+            .iter()
+            .map(|p| p.signed_decimal_qty())
+            .sum::<rust_decimal::Decimal>(),
+        rust_decimal::Decimal::from_str_exact("0.0020").unwrap()
+    );
+    state.push_frame(&json!({
+        "type":"update/account_all_trades",
+        "channel":format!("account_all_trades:{TEST_ACCOUNT_INDEX}"),
+        "trades":{"0":[trade]},
+    }));
+    assert!(
+        next_event_matching(&mut rx, Duration::from_millis(400), |e| matches!(
+            e,
+            ExecutionEvent::Order(OrderEventAny::Filled(_))
+                | ExecutionEvent::Report(ExecutionReport::Fill(_))
+        ))
+        .await
+        .is_none()
+    );
+    for worker in [false, true] {
+        assert_eq!(
+            generate_position_status_reports(&client, &scoped, worker)
+                .await
+                .unwrap(),
+            vec![snapshot.clone()]
+        );
+        assert_eq!(
+            generate_position_status_reports(&client, &bulk, worker)
+                .await
+                .unwrap(),
+            vec![snapshot.clone()]
+        );
+    }
+    assert!(
+        manager
+            .check_positions_consistency(&[&client])
+            .await
+            .is_empty()
+    );
+    // A genuine venue-only position difference after the IOC is resolved follows the native policy.
+    client
+        .dispatch
+        .replace_position_snapshot(&[position("0.0030")], &[], &[]);
+    let external = manager.check_positions_consistency(&[&client]).await;
+    assert_eq!(
+        external
+            .iter()
+            .any(|e| matches!(e, OrderEventAny::Filled(_))),
+        generate_missing_orders
+    );
+    assert_eq!(state.send_txs().await.len(), 1);
+    client.disconnect().await.unwrap();
+}
+
 async fn submit_unanswered_ioc(
     client: &LighterExecutionClient,
     rx: &mut tokio::sync::mpsc::UnboundedReceiver<ExecutionEvent>,

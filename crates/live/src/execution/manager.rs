@@ -3972,27 +3972,6 @@ impl ExecutionManager {
             return None;
         }
 
-        // A venue snapshot can already include an active retained IOC's execution.
-        // Keep querying authoritative fills; defer only synthetic position adjustments.
-        {
-            let cache = self.cache.borrow();
-            let inflight = cache.orders_inflight_refs(
-                None,
-                Some(&instrument_id),
-                None,
-                Some(&account_id),
-                None,
-            );
-            let open =
-                cache.orders_open_refs(None, Some(&instrument_id), None, Some(&account_id), None);
-            if inflight.into_iter().chain(open).any(|order| {
-                order.time_in_force() == nautilus_model::enums::TimeInForce::Ioc
-                    && self.submission_retention_enabled(order.client_order_id(), None)
-            }) {
-                return None;
-            }
-        }
-
         let ts_now = self.clock.borrow().timestamp_ns();
 
         // Grace window measured on the monotonic `dst::time` clock; see `record_position_activity`
