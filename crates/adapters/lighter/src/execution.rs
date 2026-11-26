@@ -1376,6 +1376,9 @@ impl LighterExecutionClient {
                     msg_opt = ws_client.next_event() => {
                         match msg_opt {
                             Some(NautilusWsMessage::ExecutionReports(reports)) => {
+                                let trace_enabled = CreateSendTrace::enabled();
+                                let consumer_utc_ns = trace_enabled.then(CreateSendTrace::utc_ns).flatten();
+                                let mut report_timings = Vec::new();
                                 let mut order_count = 0_usize;
                                 let mut fill_count = 0_usize;
                                 let trader_id = emitter.trader_id();
@@ -1387,6 +1390,14 @@ impl LighterExecutionClient {
                                     match report {
                                         LighterExecutionReport::Order(order) => {
                                             order_count += 1;
+                                            if trace_enabled {
+                                                report_timings.push((
+                                                    order.client_order_index,
+                                                    order.market_index,
+                                                    order.transaction_time,
+                                                    order.status.is_terminal(),
+                                                ));
+                                            }
                                             dispatch_lighter_order(
                                                 &order,
                                                 &dispatch,
@@ -1423,6 +1434,18 @@ impl LighterExecutionClient {
                                 log::debug!(
                                     "Lighter execution batch: orders={order_count} fills={fill_count}",
                                 );
+                                // Preserve raw microsecond order timestamps; this is consumer
+                                // observation after WS handler decoding, not socket receive time.
+                                if !report_timings.is_empty() {
+                                    log::info!(
+                                        target: "nautilus_lighter::latency",
+                                        "P0_PRIVATE_ORDER_V1 {}",
+                                        serde_json::json!({
+                                            "consumer_utc_ns": consumer_utc_ns,
+                                            "reports": report_timings,
+                                        })
+                                    );
+                                }
                             }
                             Some(NautilusWsMessage::AccountTx { connection_epoch, txs }) => {
                                 if let Some(context) = &child_context {
@@ -1616,6 +1639,8 @@ impl LighterExecutionClient {
                                 }
                             }
                             Some(message @ (NautilusWsMessage::SendTxAck { .. } | NautilusWsMessage::SendTxBatchResult { .. })) => {
+                                let trace_enabled = CreateSendTrace::enabled();
+                                let ack_consumer_utc_ns = trace_enabled.then(CreateSendTrace::utc_ns).flatten();
                                 let account_index = credential_for_loop.as_ref().map(|c| c.account_index());
                                 let acked = match message {
                                     NautilusWsMessage::SendTxAck { connection_epoch, tx_hash, code } => {
@@ -1656,6 +1681,19 @@ impl LighterExecutionClient {
                                             pending_tasks: pending_tasks_for_loop.clone(),
                                         },
                                     );
+                                    if trace_enabled
+                                        && let PendingSendTxKind::Create { order, client_order_index } = &pending.kind
+                                    {
+                                        log::info!(
+                                            target: "nautilus_lighter::latency",
+                                            "P0_TX_ACK_V1 {}",
+                                            serde_json::json!({
+                                                "client_order_id": order.client_order_id().to_string(),
+                                                "client_order_index": client_order_index,
+                                                "consumer_utc_ns": ack_consumer_utc_ns,
+                                            })
+                                        );
+                                    }
                                 }
                             }
                             Some(NautilusWsMessage::SendTxRejected {
@@ -1975,11 +2013,19 @@ impl LighterExecutionClient {
         &self,
         plan: &CreateOrderPlan,
         credential: &Credential,
+        mut trace: Option<CreateSendTrace>,
     ) -> anyhow::Result<()> {
+        CreateSendTrace::mark(&mut trace, CreateSendMark::PlanReady);
+        if let Some(trace) = trace.as_mut() {
+            trace.market_index = Some(plan.market_index);
+        }
         let context = self.fanout_dispatch_context(credential)?;
+        CreateSendTrace::mark(&mut trace, CreateSendMark::SignStart);
         let prepared = context.sign_create_order(plan)?;
+        CreateSendTrace::mark(&mut trace, CreateSendMark::SignDone);
+        CreateSendTrace::mark(&mut trace, CreateSendMark::Spawn);
         self.spawn_task("submit_order", async move {
-            context.send_create_order(prepared).await;
+            context.send_create_order(prepared, trace).await;
             Ok(())
         });
 
@@ -3344,6 +3390,110 @@ async fn wait_for_tx_send_reservations(reservations: &[&TxSendReservation]) {
     first.sequencer.wait_for_turn(first.key, nonce).await;
 }
 
+// Research diagnostics: single CreateOrder only, no changes to order state or send policy.
+// The UTC anchors are for joins; the per-stage elapsed times use a monotonic clock.
+struct CreateSendTrace {
+    start: std::time::Instant,
+    start_utc_ns: Option<u64>,
+    command_ts_init_ns: u64,
+    market_index: Option<i64>,
+    marks_ns: [Option<u64>; 11],
+}
+
+struct CreateSendReturn {
+    elapsed_ns: Option<u64>,
+    utc_ns: Option<u64>,
+    ok: bool,
+}
+
+#[repr(usize)]
+enum CreateSendMark {
+    PlanReady,
+    SignStart,
+    SignDone,
+    Spawn,
+    FirstPoll,
+    SubmittedEmitted,
+    NonceWaitStart,
+    NonceReady,
+    QuotaWaitStart,
+    QuotaReady,
+    WsCall,
+}
+
+impl CreateSendTrace {
+    fn utc_ns() -> Option<u64> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?;
+        u64::try_from(now.as_nanos()).ok()
+    }
+
+    fn enabled() -> bool {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED
+            .get_or_init(|| std::env::var_os("XARB_P0_LATENCY").is_some_and(|value| value == "1"))
+    }
+
+    fn begin(command_ts_init_ns: u64) -> Option<Self> {
+        Self::enabled().then(|| Self {
+            start: std::time::Instant::now(),
+            start_utc_ns: Self::utc_ns(),
+            command_ts_init_ns,
+            market_index: None,
+            marks_ns: [None; 11],
+        })
+    }
+
+    fn elapsed_ns(&self) -> Option<u64> {
+        u64::try_from(self.start.elapsed().as_nanos()).ok()
+    }
+
+    fn mark(trace: &mut Option<Self>, mark: CreateSendMark) {
+        if let Some(trace) = trace.as_mut() {
+            trace.marks_ns[mark as usize] = trace.elapsed_ns();
+        }
+    }
+
+    fn emit(
+        self,
+        client_order_id: ClientOrderId,
+        client_order_index: i64,
+        instrument_id: InstrumentId,
+        connection_epoch: u64,
+        observation: CreateSendReturn,
+    ) {
+        // Only after the existing reservation release; never log signed data or credentials.
+        log::info!(
+            target: "nautilus_lighter::latency",
+            "P0_CREATE_SEND_V1 {}",
+            serde_json::json!({
+                "client_order_id": client_order_id.to_string(),
+                "client_order_index": client_order_index,
+                "market_index": self.market_index,
+                "instrument_id": instrument_id.to_string(),
+                "connection_epoch": connection_epoch,
+                "command_ts_init_ns": self.command_ts_init_ns,
+                "adapter_start_utc_ns": self.start_utc_ns,
+                "plan_ready_elapsed_ns": self.marks_ns[CreateSendMark::PlanReady as usize],
+                "sign_start_elapsed_ns": self.marks_ns[CreateSendMark::SignStart as usize],
+                "sign_done_elapsed_ns": self.marks_ns[CreateSendMark::SignDone as usize],
+                "spawn_elapsed_ns": self.marks_ns[CreateSendMark::Spawn as usize],
+                "first_poll_elapsed_ns": self.marks_ns[CreateSendMark::FirstPoll as usize],
+                "submitted_emitted_elapsed_ns": self.marks_ns[CreateSendMark::SubmittedEmitted as usize],
+                "nonce_wait_start_elapsed_ns": self.marks_ns[CreateSendMark::NonceWaitStart as usize],
+                "nonce_ready_elapsed_ns": self.marks_ns[CreateSendMark::NonceReady as usize],
+                "quota_wait_start_elapsed_ns": self.marks_ns[CreateSendMark::QuotaWaitStart as usize],
+                "quota_ready_elapsed_ns": self.marks_ns[CreateSendMark::QuotaReady as usize],
+                "ws_call_elapsed_ns": self.marks_ns[CreateSendMark::WsCall as usize],
+                "ws_return_elapsed_ns": observation.elapsed_ns,
+                "ws_return_utc_ns": observation.utc_ns,
+                "ws_return_ok": observation.ok,
+            })
+        );
+    }
+}
+
 struct PreparedCreateOrder {
     order: OrderAny,
     client_order_index: i64,
@@ -3964,7 +4114,12 @@ impl FanoutDispatchContext {
         })
     }
 
-    async fn send_create_order(&self, prepared: PreparedCreateOrder) {
+    async fn send_create_order(
+        &self,
+        prepared: PreparedCreateOrder,
+        mut trace: Option<CreateSendTrace>,
+    ) {
+        CreateSendTrace::mark(&mut trace, CreateSendMark::FirstPoll);
         let PreparedCreateOrder {
             order,
             client_order_index,
@@ -3978,9 +4133,14 @@ impl FanoutDispatchContext {
         let client_order_id = order.client_order_id();
 
         self.emitter.emit_order_submitted(&order);
+        CreateSendTrace::mark(&mut trace, CreateSendMark::SubmittedEmitted);
         log::debug!("Lighter submit_order: queueing CreateOrder tx for {client_order_id}");
+        CreateSendTrace::mark(&mut trace, CreateSendMark::NonceWaitStart);
         send_reservation.wait_for_turn().await;
+        CreateSendTrace::mark(&mut trace, CreateSendMark::NonceReady);
+        CreateSendTrace::mark(&mut trace, CreateSendMark::QuotaWaitStart);
         await_tx_quota(&self.tx_rate_limiter).await;
+        CreateSendTrace::mark(&mut trace, CreateSendMark::QuotaReady);
         self.dispatch.enqueue_pending_sendtx(PendingSendTx {
             batch_id: None,
             connection_epoch,
@@ -3994,11 +4154,18 @@ impl FanoutDispatchContext {
             tx_hash,
         });
 
-        if let Err(e) = self
+        CreateSendTrace::mark(&mut trace, CreateSendMark::WsCall);
+        let ws_result = self
             .ws_client
             .send_tx_on_connection(LighterTxType::CreateOrder as u8, tx_info, connection_epoch)
-            .await
-        {
+            .await;
+        // This is when the adapter observes the writer result, not the physical wire time.
+        let observation = trace.as_ref().map(|trace| CreateSendReturn {
+            elapsed_ns: trace.elapsed_ns(),
+            utc_ns: CreateSendTrace::utc_ns(),
+            ok: ws_result.is_ok(),
+        });
+        if let Err(e) = ws_result {
             let failure = classify_lighter_ws_command_failure("submit_order", &e);
             let reason = command_failure_reason(&failure);
             if matches!(&failure, CommandFailure::Ambiguous(_)) {
@@ -4022,6 +4189,15 @@ impl FanoutDispatchContext {
             }
         }
         send_reservation.release();
+        if let (Some(trace), Some(observation)) = (trace, observation) {
+            trace.emit(
+                client_order_id,
+                client_order_index,
+                order.instrument_id(),
+                connection_epoch,
+                observation,
+            );
+        }
     }
 
     fn sign_modify_order(
@@ -6808,6 +6984,7 @@ impl ExecutionClient for LighterExecutionClient {
     }
 
     fn submit_order(&self, cmd: SubmitOrder) -> anyhow::Result<()> {
+        let trace = CreateSendTrace::begin(cmd.ts_init.as_u64());
         let credential = self.credential.as_ref().ok_or_else(|| {
             anyhow::anyhow!("Lighter execution client cannot submit without credentials")
         })?;
@@ -6841,7 +7018,7 @@ impl ExecutionClient for LighterExecutionClient {
             }
         };
 
-        if let Err(e) = self.dispatch_create_order_plan(&plan, credential) {
+        if let Err(e) = self.dispatch_create_order_plan(&plan, credential, trace) {
             let reason = OrderDeniedReason::SubmitFailed {
                 detail: format!("Lighter submit_order failed: {e}"),
             };
