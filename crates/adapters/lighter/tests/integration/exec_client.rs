@@ -4335,7 +4335,7 @@ async fn test_native_ioc_position_coverage_before_original_fill(
     let snapshot = position("0.0020");
     client
         .dispatch
-        .replace_position_snapshot(&[snapshot.clone()], &[], &[]);
+        .replace_position_snapshot(std::slice::from_ref(&snapshot), &[], &[]);
     let scoped = GeneratePositionStatusReports::new(
         UUID4::new(),
         now,
