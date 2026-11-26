@@ -8724,10 +8724,20 @@ fn execution_instruments_pending(
     let cache = core.cache();
     let mut pending = AHashSet::new();
     dispatch.any_order_identity(|cloid, identity, retired| {
-        if (identity.has_inferred_fills()
-            && cache.order(cloid).map_or(!retired, |order| {
-                !order.is_closed() || inferred_reconciliation_trade_ids(&order).is_err()
-            }))
+        // A signed IOC may already affect the venue position before its original trades arrive.
+        // Withhold that instrument using the existing incomplete-coverage contract, and let
+        // the retained IOC recovery path resolve it independently of position reconciliation.
+        let unresolved_ioc = !retired
+            && identity.signed_ioc().is_some()
+            && cache
+                .order_ref(cloid)
+                .is_none_or(|order| !order.is_closed());
+
+        if unresolved_ioc
+            || (identity.has_inferred_fills()
+                && cache.order(cloid).map_or(!retired, |order| {
+                    !order.is_closed() || inferred_reconciliation_trade_ids(&order).is_err()
+                }))
             || dispatch.has_pending_modify(cloid)
             || dispatch.terminals_pending.lock().contains_key(cloid)
             || events.get(cloid).is_some_and(|deferred| {

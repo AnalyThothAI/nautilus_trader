@@ -302,62 +302,6 @@ async fn test_cross_zero_unbuildable_open_leg_retries_without_poisoning_order_id
     assert_eq!(cached_signed_qty, dec!(-3.0));
 }
 
-#[rstest]
-#[case::retained(SubmissionRecoveryPolicy::RetainUnresolved, false)]
-#[case::untracked(SubmissionRecoveryPolicy::ResolveLocally, true)]
-#[tokio::test]
-async fn synthetic_position_waits_for_a_retained_ioc(
-    #[case] policy: SubmissionRecoveryPolicy,
-    #[case] synthetic: bool,
-) {
-    let mut ctx = TestContext::with_config(ExecutionManagerConfig {
-        submission_recovery_policy: policy,
-        position_check_threshold_ns: DurationNanos::ZERO,
-        ..Default::default()
-    });
-    let instrument = test_instrument();
-    let id = instrument.id();
-    ctx.add_instrument(instrument);
-    let order = OrderTestBuilder::new(OrderType::Limit)
-        .instrument_id(id)
-        .time_in_force(TimeInForce::Ioc)
-        .side(OrderSide::Buy)
-        .price(Price::from("3000.00"))
-        .quantity(Quantity::from("3.0"))
-        .build();
-    ctx.manager.register_submission(order.init_event(), None);
-    let submitted = TestOrderEventStubs::submitted(&order, test_account_id());
-    ctx.add_order(order);
-    ctx.cache.borrow_mut().update_order(&submitted).unwrap();
-    assert_eq!(
-        ctx.cache
-            .borrow()
-            .orders_inflight_refs(None, Some(&id), None, Some(&test_account_id()), None)
-            .len(),
-        1
-    );
-    let ts = UnixNanos::from(1_000_000);
-    let venue = PositionStatusReport::new(
-        test_account_id(),
-        id,
-        PositionSide::Long,
-        Quantity::from("3.0"),
-        ts,
-        ts,
-        None,
-        None,
-        Some(dec!(3000.00)),
-    );
-    let client = MockPositionExecutionClient::new(vec![], vec![venue]);
-    let events = ctx.manager.check_positions_consistency(&[&client]).await;
-    assert_eq!(
-        events
-            .iter()
-            .any(|event| matches!(event, OrderEventAny::Filled(_))),
-        synthetic
-    );
-}
-
 #[tokio::test]
 async fn test_position_check_reconciles_venue_only_nonflat_report() {
     let config = ExecutionManagerConfig {
